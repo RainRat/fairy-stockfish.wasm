@@ -25,20 +25,39 @@
 
 namespace Stockfish {
 
-class Config : public std::map<std::string, std::string> {
+class Config {
 public:
-    Config::iterator find (const std::string& s) {
+    using MapType = std::map<std::string, std::string>;
+    using iterator = MapType::const_iterator;
+    using const_iterator = MapType::const_iterator;
+
+    Config() = default;
+
+    std::string& operator[](const std::string& key) {
+        return data[key];
+    }
+
+    size_t count(const std::string& key) const {
+        return data.count(key);
+    }
+
+    const_iterator find (const std::string& s) const {
         constexpr bool PrintOptions = false; // print config options?
         if (PrintOptions)
             std::cout << s << std::endl;
         consumedKeys.insert(s);
-        return std::map<std::string, std::string>::find(s);
+        return data.find(s);
     }
-    const std::set<std::string>& get_consumed_keys() {
+
+    const_iterator begin() const { return data.begin(); }
+    const_iterator end() const { return data.end(); }
+
+    const std::set<std::string>& get_consumed_keys() const {
         return consumedKeys;
     }
 private:
-    std::set<std::string> consumedKeys = {};
+    MapType data;
+    mutable std::set<std::string> consumedKeys = {};
 };
 
 template <bool DoCheck>
@@ -51,7 +70,24 @@ public:
 private:
     Config config;
     template <bool Current = true, class T> bool parse_attribute(const std::string& key, T& target);
-    template <bool Current = true, class T> bool parse_attribute(const std::string& key, T& target, std::string pieceToChar);
+    template <bool Current = true, class T> bool parse_attribute(const std::string& key, T& target, const Variant* v);
+
+    bool parse_piece_types(Variant* v);
+    bool parse_piece_values(Variant* v);
+    bool parse_legacy_attributes(Variant* v);
+    bool parse_official_options(Variant* v);
+    bool check_consistency(Variant* v);
+
+    template <typename T> bool require_attribute(bool enabled, const std::string& key, T& target);
+    template <typename T, typename U> bool require_attributes(bool enabled,
+                                                              const std::string& key1, T& target1,
+                                                              const std::string& key2, U& target2);
+    template <typename T> void parse_both_colors(const std::string& key, T& target);
+    template <typename T> void parse_both_colors_piece(const std::string& key, T& target, const Variant* v);
+    template <typename T> void parse_both_colors_with_overrides(const std::string& key, T& target);
+    template <typename T> void parse_both_colors_with_overrides_piece(const std::string& key, T& target, const Variant* v);
+    template <typename T> void parse_color_setting(const std::string& key, ColorSetting<T>& target);
+    template <typename T> void parse_color_setting_piece(const std::string& key, ColorSetting<T>& target, const Variant* v);
 };
 
 } // namespace Stockfish

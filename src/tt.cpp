@@ -36,18 +36,18 @@ TranspositionTable TT; // Our global transposition table
 void TTEntry::save(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev) {
 
   // Preserve any existing move for the same position
-  if (m || (uint16_t)k != key16)
-      move32 = (uint32_t)m;
+  if (m || TTKey(k) != keyTag)
+      storedMove = TTMove(m);
 
   // Overwrite less valuable entries (cheapest checks first)
   if (b == BOUND_EXACT
-      || (uint16_t)k != key16
+      || TTKey(k) != keyTag
       || d - DEPTH_OFFSET > depth8 - 4)
   {
       assert(d > DEPTH_OFFSET);
       assert(d < 256 + DEPTH_OFFSET);
 
-      key16     = (uint16_t)k;
+      keyTag    = TTKey(k);
       depth8    = (uint8_t)(d - DEPTH_OFFSET);
       genBound8 = (uint8_t)(TT.generation8 | uint8_t(pv) << 2 | b);
       value16   = (int16_t)v;
@@ -84,11 +84,6 @@ void TranspositionTable::resize(size_t mbSize) {
 //  in a multi-threaded way.
 
 void TranspositionTable::clear() {
-  #ifdef __EMSCRIPTEN__
-  // NOTE: Sometimes threaded TT initialization seems to fail (engine crash on startup), so here we simply initialize on main thread.
-  std::memset(table, 0, clusterCount * sizeof(Cluster));
-  return;
-  #endif
 
   std::vector<std::thread> threads;
 
@@ -125,10 +120,10 @@ void TranspositionTable::clear() {
 TTEntry* TranspositionTable::probe(const Key key, bool& found) const {
 
   TTEntry* const tte = first_entry(key);
-  const uint16_t key16 = (uint16_t)key;  // Use the low 16 bits as key inside the cluster
+  const TTKey keyTag = TTKey(key);  // Use a compact per-entry key inside the cluster
 
   for (int i = 0; i < ClusterSize; ++i)
-      if (tte[i].key16 == key16 || !tte[i].depth8)
+      if (tte[i].keyTag == keyTag || !tte[i].depth8)
       {
           tte[i].genBound8 = uint8_t(generation8 | (tte[i].genBound8 & (GENERATION_DELTA - 1))); // Refresh
 
@@ -157,11 +152,12 @@ TTEntry* TranspositionTable::probe(const Key key, bool& found) const {
 int TranspositionTable::hashfull() const {
 
   int cnt = 0;
-  for (int i = 0; i < 1000; ++i)
+  const size_t sampleCount = std::min(clusterCount, size_t(1000));
+  for (size_t i = 0; i < sampleCount; ++i)
       for (int j = 0; j < ClusterSize; ++j)
           cnt += table[i].entry[j].depth8 && (table[i].entry[j].genBound8 & GENERATION_MASK) == generation8;
 
-  return cnt / ClusterSize;
+  return sampleCount ? int((cnt * 1000) / (ClusterSize * sampleCount)) : 0;
 }
 
 } // namespace Stockfish

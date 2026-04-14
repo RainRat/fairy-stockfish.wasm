@@ -16,10 +16,13 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <istream>
+#include <sstream>
 #include <vector>
+#include <cctype>
 
 #include "position.h"
 #include "uci.h"
@@ -112,28 +115,56 @@ vector<string> setup_bench(const Position& current, istream& is) {
 
   vector<string> fens, list;
   string go, token, varname;
+  std::vector<std::string> args;
 
-  streampos args = is.tellg();
-  // Check whether the next token is a variant name
-  if ((is >> token) && variants.find(token) != variants.end())
+  while (is >> token)
+      args.push_back(token);
+
+  auto next_arg = [&args](size_t& idx, const std::string& fallback) {
+      return idx < args.size() ? args[idx++] : fallback;
+  };
+
+  size_t idx = 0;
+  if (!args.empty() && variants.has(args[0]))
   {
-      args = is.tellg();
-      varname = token;
+      varname = args[0];
+      idx = 1;
   }
   else
-  {
-      is.seekg(args);
       varname = string(Options["UCI_Variant"]);
+
+  const Variant* variant = variants.get(varname);
+  if (!variant)
+  {
+      std::cerr << "Unknown variant " << varname << std::endl;
+      exit(EXIT_FAILURE);
   }
-  const Variant* variant = variants.find(varname)->second;
 
   // Assign default values to missing arguments
-  string ttSize    = (is >> token) ? token : "16";
-  string threads   = (is >> token) ? token : "1";
-  string limit     = (is >> token) ? token : "13";
-  string fenFile   = (is >> token) ? token : "default";
-  string limitType = (is >> token) ? token : "depth";
-  string evalType  = (is >> token) ? token : "mixed";
+  string ttSize    = next_arg(idx, "16");
+  string threads   = next_arg(idx, "1");
+  string limit     = next_arg(idx, "13");
+  string fenFile   = next_arg(idx, "default");
+  string limitType = next_arg(idx, "depth");
+  string evalType  = next_arg(idx, "mixed");
+
+  auto is_uint = [](const string& s) {
+      return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; });
+  };
+  if (!is_uint(ttSize))
+      ttSize = "16";
+  if (!is_uint(threads))
+      threads = "1";
+  if (limitType != "eval" && !is_uint(limit))
+      limit = "13";
+  if (   limitType != "depth"
+      && limitType != "perft"
+      && limitType != "nodes"
+      && limitType != "movetime"
+      && limitType != "eval")
+      limitType = "depth";
+  if (evalType != "mixed" && evalType != "classical" && evalType != "NNUE")
+      evalType = "mixed";
 
   go = limitType == "eval" ? "eval" : "go " + limitType + " " + limit;
 
@@ -174,7 +205,12 @@ vector<string> setup_bench(const Position& current, istream& is) {
   size_t posCounter = 0;
 
   for (const string& fen : fens)
-      if (fen.find("setoption") != string::npos)
+  {
+      std::istringstream line(fen);
+      std::string command;
+      line >> command;
+
+      if (command == "setoption")
           list.emplace_back(fen);
       else
       {
@@ -186,6 +222,7 @@ vector<string> setup_bench(const Position& current, istream& is) {
           list.emplace_back(go);
           ++posCounter;
       }
+  }
 
   list.emplace_back("setoption name Use NNUE value true");
 

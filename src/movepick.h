@@ -21,6 +21,7 @@
 
 #include <array>
 #include <limits>
+#include <memory>
 #include <type_traits>
 
 #include "movegen.h"
@@ -145,8 +146,11 @@ public:
 private:
   template<PickType T, typename Pred> Move select(Pred);
   template<GenType> void score();
+  bool is_useless_potion(Move m) const;
+  ExtMove* prune_useless_potions(ExtMove* begin, ExtMove* end) const;
   ExtMove* begin() { return cur; }
   ExtMove* end() { return endMoves; }
+  static constexpr int MOVE_PICK_OVERFLOW_CAPACITY = MAX_MOVES * 4;
 
   const Position& pos;
   const ButterflyHistory* mainHistory;
@@ -161,7 +165,22 @@ private:
   Value threshold;
   Depth depth;
   int ply;
-  ExtMove moves[MAX_MOVES];
+  ExtMove* moveList;
+  ExtMove* quietListBegin = nullptr;
+  ExtMove* captureBaseEnd = nullptr;
+  ExtMove* quietBaseEnd = nullptr;
+  ExtMove* evasionBaseEnd = nullptr;
+  ExtMove* qcheckBaseEnd = nullptr;
+  bool capturePotionsDeferred = false;
+  bool quietPotionsDeferred = false;
+  bool evasionPotionsDeferred = false;
+  bool qcheckPotionsDeferred = false;
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+  std::unique_ptr<ExtMove[]> baseMoveList;
+  std::unique_ptr<ExtMove[]> overflowMoveList;
+#else
+  ExtMove moves[MOVE_PICK_OVERFLOW_CAPACITY];
+#endif
 };
 
 } // namespace Stockfish

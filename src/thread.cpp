@@ -115,11 +115,8 @@ void Thread::idle_loop() {
       searching = false;
       cv.notify_one(); // Wake up anyone waiting for search finished
       // Start ponder search from separate thread to prevent deadlock
-      if (Threads.size() && this == Threads.main() && XBoard::stateMachine && XBoard::stateMachine->ponderMove)
-      {
-          NativeThread t(&XBoard::StateMachine::ponder, XBoard::stateMachine);
-          t.detach();
-      }
+      if (!Threads.stop && Threads.size() && this == Threads.main() && XBoard::stateMachine && XBoard::stateMachine->ponderMove)
+          XBoard::stateMachine->launch_ponder_worker();
       cv.wait(lk, [&]{ return searching; });
 
       if (exit)
@@ -166,6 +163,9 @@ void ThreadPool::set(size_t requested) {
 
 void ThreadPool::clear() {
 
+  if (empty())
+      return;
+
   for (Thread* th : *this)
       th->clear();
 
@@ -195,9 +195,9 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
           rootMoves.emplace_back(m);
 
   // Add virtual drops
-  if (pos.two_boards() && Partner.opptime && limits.time[pos.side_to_move()] > Partner.opptime + 1000)
+  if (pos.two_boards() && pos.virtual_drops() && Partner.opptime && limits.time[pos.side_to_move()] > Partner.opptime + 1000)
   {
-      if (pos.checkers())
+      if (pos.evasion_checkers())
       {
           for (const auto& m : MoveList<EVASIONS>(pos))
               if (pos.virtual_drop(m) && pos.legal(m))
@@ -214,12 +214,14 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
   if (!rootMoves.empty())
       Tablebases::rank_root_moves(pos, rootMoves);
 
-  // After ownership transfer 'states' becomes empty, so if we stop the search
-  // and call 'go' again without setting a new position states.get() == NULL.
-  assert(states.get() || setupStates.get());
+  // Search code assumes a root move entry exists even for terminal positions.
+  if (rootMoves.empty())
+      rootMoves.emplace_back(MOVE_NONE);
 
   if (states.get())
       setupStates = std::move(states); // Ownership transfer, states is now empty
+  else
+      setupStates.reset();
 
   // We use Position::set() to set root position across threads. But there are
   // some StateInfo fields (previous, pliesFromNull, capturedPiece) that cannot
@@ -232,7 +234,8 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
       th->rootDepth = th->completedDepth = 0;
       th->rootMoves = rootMoves;
       th->rootPos.set(pos.variant(), pos.fen(), pos.is_chess960(), &th->rootState, th);
-      th->rootState = setupStates->back();
+      if (setupStates && !setupStates->empty())
+          th->rootState = setupStates->back();
   }
 
   main()->start_searching();
@@ -241,27 +244,60 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
 Thread* ThreadPool::get_best_thread() const {
 
     Thread* bestThread = front();
+    if (bestThread->rootMoves.empty())
+        return bestThread;
+
     std::map<Move, int64_t> votes;
     Value minScore = VALUE_NONE;
+    auto incomplete_iteration = [](const Thread* th) {
+        return th->completedDepth != th->rootDepth;
+    };
 
     // Find minimum score of all threads
     for (Thread* th: *this)
+    {
+        if (th->rootMoves.empty())
+            continue;
         minScore = std::min(minScore, th->rootMoves[0].score);
+    }
 
     // Vote according to score and depth, and select the best thread
     for (Thread* th : *this)
     {
+        if (th->rootMoves.empty())
+            continue;
         votes[th->rootMoves[0].pv[0]] +=
             (th->rootMoves[0].score - minScore + 14) * int(th->completedDepth);
 
-        if (abs(bestThread->rootMoves[0].score) >= VALUE_TB_WIN_IN_MAX_PLY)
+        const auto bestThreadScore = bestThread->rootMoves[0].score;
+        const auto newThreadScore  = th->rootMoves[0].score;
+
+        const bool bestThreadInProvenWin  = bestThreadScore >= VALUE_TB_WIN_IN_MAX_PLY
+                                         && !incomplete_iteration(bestThread);
+        const bool newThreadInProvenWin   = newThreadScore >= VALUE_TB_WIN_IN_MAX_PLY
+                                         && !incomplete_iteration(th);
+        const bool bestThreadInProvenLoss = bestThreadScore != -VALUE_INFINITE
+                                         && bestThreadScore <= VALUE_TB_LOSS_IN_MAX_PLY
+                                         && !incomplete_iteration(bestThread);
+        const bool newThreadInProvenLoss  = newThreadScore != -VALUE_INFINITE
+                                         && newThreadScore <= VALUE_TB_LOSS_IN_MAX_PLY
+                                         && !incomplete_iteration(th);
+
+        if (bestThreadInProvenWin)
         {
-            // Make sure we pick the shortest mate / TB conversion or stave off mate the longest
-            if (th->rootMoves[0].score > bestThread->rootMoves[0].score)
+            // Make sure we pick the shortest mate / TB conversion
+            if (newThreadInProvenWin && newThreadScore > bestThreadScore)
                 bestThread = th;
         }
-        else if (   th->rootMoves[0].score >= VALUE_TB_WIN_IN_MAX_PLY
-                 || (   th->rootMoves[0].score > VALUE_TB_LOSS_IN_MAX_PLY
+        else if (bestThreadInProvenLoss)
+        {
+            // Make sure we pick the shortest mated / TB conversion
+            if (newThreadInProvenLoss && newThreadScore < bestThreadScore)
+                bestThread = th;
+        }
+        else if (   newThreadInProvenWin
+                 || newThreadInProvenLoss
+                 || (   newThreadScore > VALUE_TB_LOSS_IN_MAX_PLY
                      && votes[th->rootMoves[0].pv[0]] > votes[bestThread->rootMoves[0].pv[0]]))
             bestThread = th;
     }

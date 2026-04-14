@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <string>
+#include <cstdlib>
 
 #include "evaluate.h"
 #include "misc.h"
@@ -44,6 +45,52 @@ namespace XBoard {
 
   StateMachine* stateMachine = nullptr;
 
+  StateMachine::~StateMachine() {
+    join_ponder_worker();
+  }
+
+  void StateMachine::launch_ponder_worker() {
+
+    join_ponder_worker();
+
+    if (shuttingDown.load())
+        return;
+
+    std::lock_guard<std::mutex> lk(ponderMutex);
+    if (ponderMove == MOVE_NONE)
+        return;
+
+    ponderWorker.reset(new NativeThread(&StateMachine::ponder, this));
+  }
+
+  void StateMachine::join_ponder_worker() {
+
+    std::unique_ptr<NativeThread> worker;
+
+    {
+        std::lock_guard<std::mutex> lk(ponderMutex);
+        if (!ponderWorker)
+            return;
+        worker = std::move(ponderWorker);
+    }
+
+    worker->join();
+  }
+
+  void StateMachine::cancel_ponder_worker() {
+    ponderMove = MOVE_NONE;
+    join_ponder_worker();
+  }
+
+  void StateMachine::shutdown_ponder_worker() {
+    shuttingDown.store(true);
+    ponderMove = MOVE_NONE;
+    Threads.abort = true;
+    Threads.stop = true;
+    Threads.main()->wait_for_search_finished();
+    join_ponder_worker();
+  }
+
   // go() starts the search for game play, analysis, or perft.
 
   void StateMachine::go(Search::LimitsType searchLimits, bool ponder) {
@@ -57,10 +104,15 @@ namespace XBoard {
 
   void StateMachine::ponder() {
 
+    if (shuttingDown.load())
+        return;
+
     sync_cout << "Hint: " << UCI::move(pos, ponderMove) << sync_endl;
     ponderHighlight = highlight(UCI::square(pos, from_sq(ponderMove)));
     do_move(ponderMove);
     ponderMove = MOVE_NONE;
+    if (shuttingDown.load())
+        return;
     go(limits, true);
   }
 
@@ -87,11 +139,11 @@ namespace XBoard {
   void StateMachine::setboard(std::string fen) {
 
     if (fen.empty())
-        fen = variants.find(Options["UCI_Variant"])->second->startFen;
+        fen = variants.get(Options["UCI_Variant"])->startFen;
 
     states = StateListPtr(new std::deque<StateInfo>(1)); // Drop old and create a new one
     moveList.clear();
-    pos.set(variants.find(Options["UCI_Variant"])->second, fen, Options["UCI_Chess960"], &states->back(), Threads.main());
+    pos.set(variants.get(Options["UCI_Variant"]), fen, Options["UCI_Chess960"], &states->back(), Threads.main());
   }
 
   // do_move() is called when engine needs to apply a move when using XBoard protocol.
@@ -146,6 +198,9 @@ namespace XBoard {
     // Generate color FEN
     int emptyCnt;
     std::ostringstream ss;
+    if (pos.variant()->commitGates) {
+        ss << pos.max_file() + 1 << "/";
+    }
     for (Rank r = pos.max_rank(); r >= RANK_1; --r)
     {
         for (File f = FILE_A; f <= pos.max_file(); ++f)
@@ -162,6 +217,9 @@ namespace XBoard {
 
         if (r > RANK_1)
             ss << '/';
+    }
+    if (pos.variant()->commitGates) {
+        ss << "/" << pos.max_file() + 1;
     }
     return ss.str();
   }
@@ -258,47 +316,63 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   }
   else if (token == "level" || token == "st" || token == "sd" || token == "time" || token == "otim")
   {
-      int num;
+      int num = 0;
       if (token == "level")
       {
           // moves to go
-          is >> limits.movestogo;
-          // base time
-          is >> token;
-          size_t idx = token.find(":");
-          if (idx != std::string::npos)
-              num = std::stoi(token.substr(0, idx)) * 60 + std::stoi(token.substr(idx + 1));
-          else
-              num = std::stoi(token) * 60;
-          limits.time[WHITE] = num * 1000;
-          limits.time[BLACK] = num * 1000;
-          // increment
-          is >> num;
-          limits.inc[WHITE] = num * 1000;
-          limits.inc[BLACK] = num * 1000;
+          if (is >> limits.movestogo)
+          {
+              // base time
+              if (is >> token)
+              {
+                  size_t idx = token.find(":");
+                  if (idx != std::string::npos)
+                  {
+                      std::string m_str = token.substr(0, idx);
+                      std::string s_str = token.substr(idx + 1);
+                      int m = m_str.empty() ? 0 : std::atoi(m_str.c_str());
+                      int s = s_str.empty() ? 0 : std::atoi(s_str.c_str());
+                      num = m * 60 + s;
+                  }
+                  else
+                      num = std::atoi(token.c_str()) * 60;
+                  limits.time[WHITE] = num * 1000;
+                  limits.time[BLACK] = num * 1000;
+              }
+              // increment
+              if (is >> num)
+              {
+                  limits.inc[WHITE] = num * 1000;
+                  limits.inc[BLACK] = num * 1000;
+              }
+          }
       }
       else if (token == "sd")
           is >> limits.depth;
       else if (token == "st")
       {
-          is >> num;
-          limits.movetime = num * 1000;
-          limits.time[WHITE] = limits.time[BLACK] = 0;
+          if (is >> num)
+          {
+              limits.movetime = num * 1000;
+              limits.time[WHITE] = limits.time[BLACK] = 0;
+          }
       }
       // Note: time/otim are in centi-, not milliseconds
       else if (token == "time")
       {
-          is >> num;
-          Color us = playColor != COLOR_NB ? playColor : pos.side_to_move();
-          if (limits.time[us])
+          if (is >> num)
+          {
+              Color us = playColor != COLOR_NB ? playColor : pos.side_to_move();
               limits.time[us] = num * 10;
+          }
       }
       else if (token == "otim")
       {
-          is >> num;
-          Color them = playColor != COLOR_NB ? ~playColor : ~pos.side_to_move();
-          if (limits.time[them])
+          if (is >> num)
+          {
+              Color them = playColor != COLOR_NB ? ~playColor : ~pos.side_to_move();
               limits.time[them] = num * 10;
+          }
       }
   }
   else if (token == "setboard")
@@ -349,7 +423,7 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   else if (token == "option")
   {
       std::string name, value;
-      is.get();
+      is >> std::ws;
       std::getline(is, name, '=');
       std::getline(is, value);
       if (Options.count(name))
@@ -383,7 +457,7 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   else if (token == "remove")
   {
       stop();
-      if (moveList.size())
+      if (moveList.size() >= 2)
       {
           undo_move();
           undo_move();

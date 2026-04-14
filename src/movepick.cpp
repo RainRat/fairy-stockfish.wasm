@@ -56,6 +56,57 @@ namespace {
 } // namespace
 
 
+bool MovePicker::is_useless_potion(Move m) const {
+
+  if (!pos.potions_enabled() || !is_gating(m))
+      return false;
+
+  PieceType gatingPiece = gating_type(m);
+
+  for (int idx = 0; idx < Variant::POTION_TYPE_NB; ++idx)
+  {
+      auto potion = static_cast<Variant::PotionType>(idx);
+      if (pos.potion_piece(potion) != gatingPiece)
+          continue;
+
+      if (potion == Variant::POTION_FREEZE)
+      {
+          Bitboard zone = pos.freeze_zone_from_square(pos.gate_square(m));
+          Bitboard enemies = pos.pieces(~pos.side_to_move());
+          return !(zone & enemies);
+      }
+
+      if (potion == Variant::POTION_JUMP)
+      {
+          Square gate = pos.gate_square(m);
+          if (pos.piece_on(gate) == NO_PIECE)
+              return true;
+
+          Bitboard path = between_bb(from_sq(m), to_sq(m), type_of(pos.moved_piece(m)));
+          path &= ~square_bb(to_sq(m));
+          return !(path & square_bb(gate));
+      }
+
+      break;
+  }
+
+  return false;
+}
+
+ExtMove* MovePicker::prune_useless_potions(ExtMove* begin, ExtMove* end) const {
+
+  if (!pos.potions_enabled())
+      return end;
+
+  ExtMove* write = begin;
+  for (ExtMove* it = begin; it != end; ++it)
+      if (!is_useless_potion(it->move))
+          *write++ = *it;
+
+  return write;
+}
+
+
 /// Constructors of the MovePicker class. As arguments we pass information
 /// to help it to return the (presumably) good moves first, to decide which
 /// moves to return (in the quiescence search, for instance, we only want to
@@ -69,8 +120,18 @@ MovePicker::MovePicker(const Position& p, Move ttm, Depth d, const ButterflyHist
              ttMove(ttm), refutations{{killers[0], 0}, {killers[1], 0}, {cm, 0}}, depth(d), ply(pl) {
 
   assert(d > 0);
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+  if (pos.potions_enabled() || pos.capture_type() == PRISON)
+      overflowMoveList = std::make_unique<ExtMove[]>(MOVE_PICK_OVERFLOW_CAPACITY);
+  else
+      baseMoveList = std::make_unique<ExtMove[]>(MAX_MOVES);
 
-  stage = (pos.checkers() ? EVASION_TT : MAIN_TT) +
+  moveList = overflowMoveList ? overflowMoveList.get() : baseMoveList.get();
+#else
+  moveList = moves;
+#endif
+
+  stage = (pos.evasion_checkers() ? EVASION_TT : MAIN_TT) +
           !(ttm && pos.pseudo_legal(ttm));
 }
 
@@ -80,10 +141,20 @@ MovePicker::MovePicker(const Position& p, Move ttm, Depth d, const ButterflyHist
            : pos(p), mainHistory(mh), gateHistory(dh), captureHistory(cph), continuationHistory(ch), ttMove(ttm), recaptureSquare(rs), depth(d) {
 
   assert(d <= 0);
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+  if (pos.potions_enabled() || pos.capture_type() == PRISON)
+      overflowMoveList = std::make_unique<ExtMove[]>(MOVE_PICK_OVERFLOW_CAPACITY);
+  else
+      baseMoveList = std::make_unique<ExtMove[]>(MAX_MOVES);
 
-  stage = (pos.checkers() ? EVASION_TT : QSEARCH_TT) +
+  moveList = overflowMoveList ? overflowMoveList.get() : baseMoveList.get();
+#else
+  moveList = moves;
+#endif
+
+  stage = (pos.evasion_checkers() ? EVASION_TT : QSEARCH_TT) +
           !(   ttm
-            && (pos.checkers() || depth > DEPTH_QS_RECAPTURES || to_sq(ttm) == recaptureSquare)
+            && (pos.evasion_checkers() || depth > DEPTH_QS_RECAPTURES || to_sq(ttm) == recaptureSquare)
             && pos.pseudo_legal(ttm));
 }
 
@@ -92,11 +163,21 @@ MovePicker::MovePicker(const Position& p, Move ttm, Depth d, const ButterflyHist
 MovePicker::MovePicker(const Position& p, Move ttm, Value th, const GateHistory* dh, const CapturePieceToHistory* cph)
            : pos(p), gateHistory(dh), captureHistory(cph), ttMove(ttm), threshold(th) {
 
-  assert(!pos.checkers());
+  assert(!pos.evasion_checkers());
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+  if (pos.potions_enabled() || pos.capture_type() == PRISON)
+      overflowMoveList = std::make_unique<ExtMove[]>(MOVE_PICK_OVERFLOW_CAPACITY);
+  else
+      baseMoveList = std::make_unique<ExtMove[]>(MAX_MOVES);
+
+  moveList = overflowMoveList ? overflowMoveList.get() : baseMoveList.get();
+#else
+  moveList = moves;
+#endif
 
   stage = PROBCUT_TT + !(ttm && pos.capture(ttm)
                              && pos.pseudo_legal(ttm)
-                             && pos.see_ge(ttm, threshold));
+                             && (pos.see_pruning_unreliable() || pos.see_ge(ttm, threshold)));
 }
 
 /// MovePicker::score() assigns a numerical value to each move in a list, used
@@ -106,29 +187,118 @@ template<GenType Type>
 void MovePicker::score() {
 
   static_assert(Type == CAPTURES || Type == QUIETS || Type == EVASIONS, "Wrong type");
+  const Color us = pos.side_to_move();
+  const PieceType myFlag = pos.flag_piece(us);
+  const Bitboard myGoal = pos.flag_region(us);
+  int goalDist[SQUARE_NB];
+  if (myGoal && myFlag == KING)
+  {
+      for (int s = 0; s < SQUARE_NB; ++s)
+      {
+          int best = 64;
+          for (Bitboard goals = myGoal; goals;)
+              best = std::min(best, distance(Square(s), pop_lsb(goals)));
+          goalDist[s] = best;
+      }
+  }
+  auto flag_goal_bonus = [&](Move mv) {
+      Piece mp = pos.moved_piece(mv);
+      return (myGoal && mp != NO_PIECE && type_of(mp) == myFlag && (myGoal & square_bb(to_sq(mv)))) ? 30000 : 0;
+  };
+  auto king_goal_progress_bonus = [&](Move mv) {
+      if (!myGoal || myFlag != KING)
+          return 0;
+      Piece mp = pos.moved_piece(mv);
+      if (mp == NO_PIECE || type_of(mp) != KING)
+          return 0;
+      Square from = from_sq(mv);
+      Square to = to_sq(mv);
+      if (!is_ok(from) || !is_ok(to))
+          return 0;
+      int delta = goalDist[from] - goalDist[to];
+      return delta > 0 ? 900 * delta : 0;
+  };
+  auto points_capture_bonus = [&](Move mv) {
+      if (!pos.points_counting())
+          return 0;
+      Piece captured = pos.captured_piece(mv);
+      if (captured == NO_PIECE)
+          return 0;
+      int pts = pos.variant()->piecePoints[type_of(captured)];
+      int signedPts = 0;
+      switch (pos.points_rule_captures())
+      {
+          case POINTS_US:        signedPts =  pts; break;
+          case POINTS_THEM:      signedPts = -pts; break;
+          case POINTS_OWNER:     signedPts =  color_of(captured) == pos.side_to_move() ? pts : -pts; break;
+          case POINTS_NON_OWNER: signedPts =  color_of(captured) == pos.side_to_move() ? -pts : pts; break;
+          case POINTS_NONE:      signedPts = 0; break;
+      }
+      if (pos.points_goal() > 0)
+      {
+          if (pos.points_goal_value() < VALUE_ZERO)
+              signedPts = -signedPts;
+          else if (pos.points_goal_value() == VALUE_ZERO)
+              signedPts = 0;
+      }
+      return 20 * signedPts;
+  };
+  auto capture_victim_value = [&](Move mv) {
+      Piece captured = pos.captured_piece(mv);
+      if (captured == NO_PIECE)
+          captured = pos.piece_on(to_sq(mv));
+      return int(PieceValue[MG][captured]);
+  };
+  auto capture_victim_type = [&](Move mv) {
+      Piece captured = pos.captured_piece(mv);
+      if (captured == NO_PIECE)
+          captured = pos.piece_on(to_sq(mv));
+      return type_of(captured);
+  };
+  auto gate_history_bonus = [&](Move mv) {
+      return is_gating(mv) ? (*gateHistory)[pos.side_to_move()][gating_square(mv)] : 0;
+  };
 
   for (auto& m : *this)
       if constexpr (Type == CAPTURES)
-          m.value =  int(PieceValue[MG][pos.piece_on(to_sq(m))]) * 6
-                   + (*gateHistory)[pos.side_to_move()][gating_square(m)]
-                   + (*captureHistory)[pos.moved_piece(m)][to_sq(m)][type_of(pos.piece_on(to_sq(m)))];
+      {
+          m.value =  capture_victim_value(m) * 6
+                   + points_capture_bonus(m)
+                   + flag_goal_bonus(m)
+                   + king_goal_progress_bonus(m)
+                   + gate_history_bonus(m)
+                   + (*captureHistory)[pos.moved_piece(m)][to_sq(m)][capture_victim_type(m)];
+      }
 
       else if constexpr (Type == QUIETS)
+      {
+          int exchangeBonus = exchange_piece(m) != NO_PIECE_TYPE
+                            ? 3 * int(PieceValue[MG][make_piece(pos.side_to_move(), exchange_piece(m))])
+                            : 0;
           m.value =      (*mainHistory)[pos.side_to_move()][from_to(m)]
-                   +     (*gateHistory)[pos.side_to_move()][gating_square(m)]
+                   +     exchangeBonus
+                   +     flag_goal_bonus(m)
+                   +     king_goal_progress_bonus(m)
+                   +     gate_history_bonus(m)
                    + 2 * (*continuationHistory[0])[history_slot(pos.moved_piece(m))][to_sq(m)]
                    +     (*continuationHistory[1])[history_slot(pos.moved_piece(m))][to_sq(m)]
                    +     (*continuationHistory[3])[history_slot(pos.moved_piece(m))][to_sq(m)]
                    +     (*continuationHistory[5])[history_slot(pos.moved_piece(m))][to_sq(m)]
                    + (ply < MAX_LPH ? std::min(4, depth / 3) * (*lowPlyHistory)[ply][from_to(m)] : 0);
+      }
 
       else // Type == EVASIONS
       {
           if (pos.capture(m))
-              m.value =  PieceValue[MG][pos.piece_on(to_sq(m))]
+              m.value =  capture_victim_value(m)
+                       + points_capture_bonus(m)
+                       + flag_goal_bonus(m)
+                       + king_goal_progress_bonus(m)
                        - Value(type_of(pos.moved_piece(m)));
           else
               m.value =      (*mainHistory)[pos.side_to_move()][from_to(m)]
+                       +     flag_goal_bonus(m)
+                       +     king_goal_progress_bonus(m)
                        + 2 * (*continuationHistory[0])[history_slot(pos.moved_piece(m))][to_sq(m)]
                        - (1 << 28);
       }
@@ -139,12 +309,18 @@ void MovePicker::score() {
 template<MovePicker::PickType T, typename Pred>
 Move MovePicker::select(Pred filter) {
 
+  const bool potions = pos.potions_enabled();
+
   while (cur < endMoves)
   {
       if (T == Best)
           std::swap(*cur, *std::max_element(cur, endMoves));
 
-      if (*cur != ttMove && filter())
+      Move move = *cur;
+
+      if (move != ttMove
+          && (!potions || !is_gating(move) || !is_useless_potion(move))
+          && filter())
           return *cur++;
 
       cur++;
@@ -157,6 +333,13 @@ Move MovePicker::select(Pred filter) {
 /// moves left, picking the move with the highest score from a list of generated moves.
 Move MovePicker::next_move(bool skipQuiets) {
 
+  auto assert_move_list_bounds = [&]() {
+      assert(endMoves >= moveList);
+      assert(endMoves - moveList <= MOVE_PICK_OVERFLOW_CAPACITY);
+      assert(cur >= moveList && cur <= endMoves);
+  };
+  const bool potions = pos.potions_enabled();
+
 top:
   switch (stage) {
 
@@ -165,14 +348,24 @@ top:
   case QSEARCH_TT:
   case PROBCUT_TT:
       ++stage;
-      assert(pos.legal(ttMove) == MoveList<LEGAL>(pos).contains(ttMove) || pos.virtual_drop(ttMove));
-      return ttMove;
+      if (ttMove && !is_useless_potion(ttMove))
+      {
+          assert(pos.legal(ttMove) == MoveList<LEGAL>(pos).contains(ttMove) || pos.virtual_drop(ttMove) || exchange_piece(ttMove));
+          return ttMove;
+      }
+      ttMove = MOVE_NONE;
+      goto top;
 
   case CAPTURE_INIT:
   case PROBCUT_INIT:
   case QCAPTURE_INIT:
-      cur = endBadCaptures = moves;
-      endMoves = generate<CAPTURES>(pos, cur);
+      cur = endBadCaptures = moveList;
+      endMoves = generate_without_potions<CAPTURES>(pos, cur);
+      captureBaseEnd = endMoves;
+      capturePotionsDeferred = potions
+          && (pos.can_cast_potion(pos.side_to_move(), Variant::POTION_FREEZE)
+              || pos.can_cast_potion(pos.side_to_move(), Variant::POTION_JUMP));
+      assert_move_list_bounds();
 
       score<CAPTURES>();
       ++stage;
@@ -180,10 +373,20 @@ top:
 
   case GOOD_CAPTURE:
       if (select<Best>([&](){
-                       return pos.see_ge(*cur, Value(-69 * cur->value / 1024 - 500 * (pos.captures_to_hand() && pos.gives_check(*cur))))?
+                       return (pos.see_pruning_unreliable() || pos.see_ge(*cur, Value(-69 * cur->value / 1024 - 500 * (pos.captures_to_hand() && pos.gives_check(*cur)))))?
                               // Move losing capture to endBadCaptures to be tried later
                               true : (*endBadCaptures++ = *cur, false); }))
           return *(cur - 1);
+
+      if (capturePotionsDeferred)
+      {
+          endMoves = append_potions<CAPTURES>(pos, moveList, captureBaseEnd);
+          endMoves = prune_useless_potions(captureBaseEnd, endMoves);
+          cur = captureBaseEnd;
+          score<CAPTURES>();
+          capturePotionsDeferred = false;
+          goto top;
+      }
 
       // Prepare the pointers to loop over the refutations array
       cur = std::begin(refutations);
@@ -208,8 +411,14 @@ top:
   case QUIET_INIT:
       if (!skipQuiets && !(pos.must_capture() && pos.has_capture()))
       {
-          cur = endBadCaptures;
-          endMoves = generate<QUIETS>(pos, cur);
+          quietListBegin = endBadCaptures;
+          cur = quietListBegin;
+          endMoves = generate_without_potions<QUIETS>(pos, cur);
+          quietBaseEnd = endMoves;
+          quietPotionsDeferred = potions
+              && (pos.can_cast_potion(pos.side_to_move(), Variant::POTION_FREEZE)
+                  || pos.can_cast_potion(pos.side_to_move(), Variant::POTION_JUMP));
+          assert_move_list_bounds();
 
           score<QUIETS>();
           partial_insertion_sort(cur, endMoves, -3000 * depth);
@@ -225,8 +434,17 @@ top:
                                       && *cur != refutations[2].move;}))
           return *(cur - 1);
 
+      if (!skipQuiets && quietPotionsDeferred)
+      {
+          endMoves = append_potions<QUIETS>(pos, quietListBegin, quietBaseEnd);
+          endMoves = prune_useless_potions(quietBaseEnd, endMoves);
+          cur = quietBaseEnd;
+          quietPotionsDeferred = false;
+          goto top;
+      }
+
       // Prepare the pointers to loop over the bad captures
-      cur = moves;
+      cur = moveList;
       endMoves = endBadCaptures;
 
       ++stage;
@@ -236,18 +454,36 @@ top:
       return select<Next>([](){ return true; });
 
   case EVASION_INIT:
-      cur = moves;
-      endMoves = generate<EVASIONS>(pos, cur);
+      cur = moveList;
+      endMoves = generate_without_potions<EVASIONS>(pos, cur);
+      evasionBaseEnd = endMoves;
+      evasionPotionsDeferred = potions
+          && (pos.can_cast_potion(pos.side_to_move(), Variant::POTION_FREEZE)
+              || pos.can_cast_potion(pos.side_to_move(), Variant::POTION_JUMP));
+      assert_move_list_bounds();
 
       score<EVASIONS>();
       ++stage;
       [[fallthrough]];
 
   case EVASION:
-      return select<Best>([](){ return true; });
+      if (Move m = select<Best>([](){ return true; }))
+          return m;
+
+      if (evasionPotionsDeferred)
+      {
+          endMoves = append_potions<EVASIONS>(pos, moveList, evasionBaseEnd);
+          endMoves = prune_useless_potions(evasionBaseEnd, endMoves);
+          cur = evasionBaseEnd;
+          score<EVASIONS>();
+          evasionPotionsDeferred = false;
+          goto top;
+      }
+
+      return MOVE_NONE;
 
   case PROBCUT:
-      return select<Best>([&](){ return pos.see_ge(*cur, threshold); });
+      return select<Best>([&](){ return pos.see_pruning_unreliable() || pos.see_ge(*cur, threshold); });
 
   case QCAPTURE:
       if (select<Best>([&](){ return   depth > DEPTH_QS_RECAPTURES
@@ -262,14 +498,31 @@ top:
       [[fallthrough]];
 
   case QCHECK_INIT:
-      cur = moves;
-      endMoves = generate<QUIET_CHECKS>(pos, cur);
+      cur = moveList;
+      endMoves = generate_without_potions<QUIET_CHECKS>(pos, cur);
+      qcheckBaseEnd = endMoves;
+      qcheckPotionsDeferred = potions
+          && (pos.can_cast_potion(pos.side_to_move(), Variant::POTION_FREEZE)
+              || pos.can_cast_potion(pos.side_to_move(), Variant::POTION_JUMP));
+      assert_move_list_bounds();
 
       ++stage;
       [[fallthrough]];
 
   case QCHECK:
-      return select<Next>([](){ return true; });
+      if (Move m = select<Next>([](){ return true; }))
+          return m;
+
+      if (qcheckPotionsDeferred)
+      {
+          endMoves = append_potions<QUIET_CHECKS>(pos, moveList, qcheckBaseEnd);
+          endMoves = prune_useless_potions(qcheckBaseEnd, endMoves);
+          cur = qcheckBaseEnd;
+          qcheckPotionsDeferred = false;
+          goto top;
+      }
+
+      return MOVE_NONE;
   }
 
   assert(false);
