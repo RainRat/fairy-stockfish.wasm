@@ -1,4 +1,4 @@
-import { build } from "esbuild";
+import { transform } from "esbuild";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -10,34 +10,45 @@ const output = process.argv[3]
   ? resolve(process.argv[3])
   : resolve(repoRoot, "tests/js/ffish.fairyground.js");
 
-await build({
-  entryPoints: [input],
-  outfile: output,
-  bundle: false,
-  format: "esm",
-  platform: "browser",
-  target: "es2018",
-  define: {
-    "globalThis.process": "undefined",
-    module: "undefined",
-    __filename: "undefined",
-    __dirname: '""',
-  },
-  logLevel: "info",
-});
+let text = await readFile(input, "utf8");
 
-let text = await readFile(output, "utf8");
-
-// Fairyground's Browserify pipeline walks bare `require()` calls even in
-// dead Node-only branches. Replace them with inert placeholders after the
-// browser-targeted transform.
 text = text
-  .replaceAll('var fs = require("node:fs");', "var fs = null;")
-  .replaceAll(
-    'var nodeCrypto = require("node:crypto");',
-    "var nodeCrypto = null;",
+  .replace(
+    'var Module=typeof Module!="undefined"?Module:{};',
+    [
+      "Module = Module || {};",
+      "var readyPromiseResolve,readyPromiseReject;",
+      'Module["ready"]=new Promise(function(resolve,reject){readyPromiseResolve=resolve;readyPromiseReject=reject});',
+    ].join(""),
+  )
+  .replace(
+    'var ENVIRONMENT_IS_NODE=globalThis.process?.versions?.node&&globalThis.process?.type!="renderer";',
+    "var ENVIRONMENT_IS_NODE=false;",
+  )
+  .replaceAll('var fs=require("node:fs");', "var fs=null;")
+  .replaceAll('var nodeCrypto=require("node:crypto");', "var nodeCrypto=null;")
+  .replace(
+    'initRuntime();Module["onRuntimeInitialized"]?.();postRun()',
+    'initRuntime();readyPromiseResolve(Module);Module["onRuntimeInitialized"]?.();postRun()',
   );
 
-await writeFile(output, text);
+const wrapped = [
+  "var ModuleFactory = function(Module) {",
+  text,
+  'return Module["ready"];',
+  "};",
+  "export default ModuleFactory;",
+  "",
+].join("\n");
+
+const transformed = await transform(wrapped, {
+  format: "esm",
+  platform: "browser",
+  target: "es2015",
+  loader: "js",
+  logLevel: "silent",
+});
+
+await writeFile(output, transformed.code);
 
 console.log(`Wrote Fairyground-compatible ffish bundle to ${output}`);
