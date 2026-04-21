@@ -405,6 +405,22 @@ namespace {
     if (stepF == 0 && stepR == 0)
         return false;
 
+    if (mt == NORMAL)
+    {
+        Square cur = from;
+        while (true)
+        {
+            Square next;
+            if (!advance_square(pos, cur, stepF, stepR, next))
+                return false;
+            if (next == to)
+                break;
+            if ((pos.pieces() | pos.wall_squares() | pos.dead_squares()) & next)
+                return false;
+            cur = next;
+        }
+    }
+
     Bitboard blockers = pos.pieces() | pos.wall_squares() | pos.dead_squares();
     Square cur = to;
     while (true)
@@ -463,8 +479,9 @@ namespace {
   }
 
   bool analyze_push(const Position& pos, Move m, PushInfo& info) {
-    return type_of(m) == INSERT ? analyze_push_direct(pos, m, info)
-                                : analyze_push_stepwise(pos, m, info);
+    return type_of(m) == INSERT || !pos.stepwise_pushing()
+               ? analyze_push_direct(pos, m, info)
+               : analyze_push_stepwise(pos, m, info);
   }
 
   inline Bitboard retro_asymmetric_check_squares(Color attacker, PieceType pt, Square kingSq, Bitboard occupied) {
@@ -518,14 +535,14 @@ namespace {
     return pos.attacks_from(c, pt, sq, syntheticOccupancy);
   }
 
-  Bitboard rose_revealed_blockers(Square target, Square attackerSq, Bitboard occupied) {
+  Bitboard rose_revealed_blockers(Square target, Square attackerSq, Bitboard occupied, const MagicGeometry* mg) {
     Bitboard blockers = 0;
     Bitboard candidates = rose_between_union_bb(target, attackerSq, Bitboard(0)) & occupied & ~square_bb(attackerSq);
 
     while (candidates)
     {
         Square blocker = pop_lsb(candidates);
-        if (rose_attacks_bb(attackerSq, occupied ^ square_bb(blocker)) & target)
+        if (rose_attacks_bb(attackerSq, occupied ^ square_bb(blocker), mg) & target)
             blockers |= blocker;
     }
 
@@ -1045,7 +1062,7 @@ void Position::init() {
       Piece pc = make_piece(c, pop_lsb(ps));
       for (Square s1 = SQ_A1; s1 <= SQ_MAX; ++s1)
           for (Square s2 = Square(s1 + 1); s2 <= SQ_MAX; ++s2)
-              if ((type_of(pc) != PAWN) && (attacks_bb(c, type_of(pc), s1, 0) & s2))
+              if ((type_of(pc) != PAWN) && (::Stockfish::attacks_bb(c, type_of(pc), s1, 0) & s2))
               {
                   Move move = make_move(s1, s2);
                   Key key = Zobrist::psq[pc][s1] ^ Zobrist::psq[pc][s2] ^ Zobrist::side;
@@ -1750,10 +1767,10 @@ void Position::set_check_info(StateInfo* si) const {
   {
       const bool hasKing = ksq != SQ_NONE;
       const Bitboard pawnAttacks = hasKing ? pawn_attacks_bb(~sideToMove, ksq) : Bitboard(0);
-      const Bitboard knightAttacks = hasKing ? attacks_bb<KNIGHT>(ksq) : Bitboard(0);
-      const Bitboard bishopAttacks = hasKing ? attacks_bb<BISHOP>(ksq, occupied) : Bitboard(0);
-      const Bitboard rookAttacks = hasKing ? attacks_bb<ROOK>(ksq, occupied) : Bitboard(0);
-      const Bitboard kingAttacks = hasKing ? attacks_bb<KING>(ksq) : Bitboard(0);
+      const Bitboard knightAttacks = hasKing ? this->attacks_bb<KNIGHT>(ksq) : Bitboard(0);
+      const Bitboard bishopAttacks = hasKing ? this->attacks_bb<BISHOP>(ksq, occupied) : Bitboard(0);
+      const Bitboard rookAttacks = hasKing ? this->attacks_bb<ROOK>(ksq, occupied) : Bitboard(0);
+      const Bitboard kingAttacks = hasKing ? this->attacks_bb<KING>(ksq) : Bitboard(0);
       const Bitboard queenAttacks = bishopAttacks | rookAttacks;
 
       si->checkSquares[PAWN] = pawnAttacks;
@@ -1947,8 +1964,8 @@ void Position::refresh_state_derived(StateInfo* si) const {
 
 Bitboard Position::compute_checkers_bb(Color side) const {
 
-  Bitboard checkers = !allow_checks() && count<KING>(side)
-                    ? attackers_to_king(square<KING>(side), ~side)
+  Bitboard checkers = !allow_checks() && count(side, king_type())
+                    ? attackers_to_king(square(side, king_type()), ~side)
                     : Bitboard(0);
 
   if (!allow_checks())
@@ -1969,8 +1986,8 @@ Bitboard Position::compute_evasion_checkers_bb(Color side) const {
   // Fairy-Stockfish-X split from upstream-style broad checkersBB:
   // this tracks only king-evasion state that should drive EVASIONS, mate/stalemate,
   // null-move, and perpetual-check semantics.
-  Bitboard checkers = !allow_checks() && count<KING>(side)
-                    ? attackers_to_king(square<KING>(side), ~side)
+  Bitboard checkers = !allow_checks() && count(side, king_type())
+                    ? attackers_to_king(square(side, king_type()), ~side)
                     : Bitboard(0);
 
   if (!allow_checks() && var->blastPassiveTypes)
@@ -2339,7 +2356,7 @@ Bitboard Position::slider_blockers(Bitboard sliders, Square s, Bitboard& pinners
     PieceType sniperType = type_of(sniper);
     if (AttackRiderTypes[sniperType] & RIDER_ROSE)
     {
-        Bitboard b = rose_revealed_blockers(s, sniperSq, occupancy);
+        Bitboard b = rose_revealed_blockers(s, sniperSq, occupancy, magic_geometry());
         if (b && !more_than_one(b))
             pinners |= pieces(c) & sniperSq;
         blockers |= b;
@@ -2463,6 +2480,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
 Bitboard Position::attackers_to_king(Square s, Bitboard occupied, Color c, Bitboard janggiCannons) const {
 
   Bitboard attackers = attackers_to(s, occupied, c, janggiCannons);
+  attackers |= janggi_cannon_attackers_to_king(s, occupied, c);
   // Frozen pieces cannot give check (relevant for spell-chess freeze effects).
   attackers &= ~(freeze_squares(c) | (pieces(c, PAWN) & pawnCannotCheckZone[c]));
   if (anti_royal_king_mutually_immune())
@@ -2474,6 +2492,70 @@ Bitboard Position::attackers_to_king(Square s, Bitboard occupied, Color c, Bitbo
 
   for (PieceSet ps = forbiddenToKing; ps; )
       attackers &= ~pieces(c, pop_lsb(ps));
+
+  return attackers;
+}
+
+Bitboard Position::janggi_cannon_attackers_to_king(Square s, Bitboard occupied, Color c) const {
+
+  Bitboard attackers = 0;
+  Bitboard cannons = pieces(c, JANGGI_CANNON) & occupied;
+  Bitboard cannonPieces = pieces(JANGGI_CANNON);
+
+  while (cannons)
+  {
+      Square from = pop_lsb(cannons);
+      int df = int(file_of(s)) - int(file_of(from));
+      int dr = int(rank_of(s)) - int(rank_of(from));
+      int stepF = 0;
+      int stepR = 0;
+      bool diagonal = false;
+
+      if (df == 0 && dr != 0)
+          stepR = dr > 0 ? 1 : -1;
+      else if (dr == 0 && df != 0)
+          stepF = df > 0 ? 1 : -1;
+      else if (std::abs(df) == std::abs(dr) && (diagonal_lines() & from) && (diagonal_lines() & s))
+      {
+          stepF = df > 0 ? 1 : -1;
+          stepR = dr > 0 ? 1 : -1;
+          diagonal = true;
+      }
+      else
+          continue;
+
+      int f = int(file_of(from)) + stepF;
+      int r = int(rank_of(from)) + stepR;
+      bool foundScreen = false;
+      bool blocked = false;
+
+      while (f != int(file_of(s)) || r != int(rank_of(s)))
+      {
+          Square cur = make_square(File(f), Rank(r));
+          if (diagonal && !(diagonal_lines() & cur))
+          {
+              blocked = true;
+              break;
+          }
+
+          if (occupied & cur)
+          {
+              if (!foundScreen && !(cannonPieces & cur))
+                  foundScreen = true;
+              else
+              {
+                  blocked = true;
+                  break;
+              }
+          }
+
+          f += stepF;
+          r += stepR;
+      }
+
+      if (foundScreen && !blocked)
+          attackers |= from;
+  }
 
   return attackers;
 }
@@ -2815,8 +2897,13 @@ bool Position::legal(Move m) const {
   }
 
   assert(is_pass(m) || color_of(moved_piece(m)) == us);
-  assert(!count<KING>(us) || piece_on(square<KING>(us)) == make_piece(us, KING));
+  assert(!count(us, king_type()) || piece_on(square(us, king_type())) == make_piece(us, king_type()));
   assert(board_bb() & to);
+
+  const PieceType royalType = king_type();
+  const bool hasRoyal = count(us, royalType);
+  const Square royalSquare = hasRoyal ? square(us, royalType) : SQ_NONE;
+  const bool moverIsRoyal = type_of(moved_piece(m)) == royalType;
 
   if (forced_jump_continuation() && st->forcedJumpSquare != SQ_NONE)
   {
@@ -2846,7 +2933,7 @@ bool Position::legal(Move m) const {
       if (isHop && jump_capture_square(from, to) == SQ_NONE)
           return false;
   }
-  if (topology_wraps() && !allow_checks() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
+  if (!allow_checks() && checking_permitted() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
       return false;
   if (!dropMove && (var->mutuallyHopIllegalTypes & movePt) && (AttackRiderTypes[movePt] & HOPPING_RIDERS))
   {
@@ -2890,7 +2977,7 @@ bool Position::legal(Move m) const {
       StateInfo setupState, nextState;
       probe.set(variant(), fen(), is_chess960(), &setupState, this_thread());
       probe.do_move(m, nextState, false);
-      if (!allow_checks() && probe.count<KING>(us) && probe.attackers_to_king(probe.square<KING>(us), them))
+      if (!allow_checks() && probe.count(us, probe.king_type()) && probe.attackers_to_king(probe.square(us, probe.king_type()), them))
           return false;
       return true;
   }
@@ -2904,7 +2991,7 @@ bool Position::legal(Move m) const {
       StateInfo setupState, nextState;
       probe.set(variant(), fen(), is_chess960(), &setupState, this_thread());
       probe.do_move(m, nextState, false);
-      if (!allow_checks() && probe.count<KING>(us) && probe.attackers_to_king(probe.square<KING>(us), them))
+      if (!allow_checks() && probe.count(us, probe.king_type()) && probe.attackers_to_king(probe.square(us, probe.king_type()), them))
           return false;
       return true;
   }
@@ -2912,7 +2999,7 @@ bool Position::legal(Move m) const {
       return false;
 
   // Illegal captures
-  if (topology_wraps() && !allow_checks() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
+  if (!allow_checks() && checking_permitted() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
       return false;
 
   // Illegal non-drop moves
@@ -3467,9 +3554,9 @@ bool Position::legal(Move m) const {
   // En passant captures are a tricky special case. Because they are rather
   // uncommon, we do it simply by testing whether the king is attacked after
   // the move is made.
-  if (!allow_checks() && type_of(m) == EN_PASSANT && count<KING>(us))
+  if (!allow_checks() && type_of(m) == EN_PASSANT && hasRoyal)
   {
-      Square ksq = square<KING>(us);
+      Square ksq = royalSquare;
       Square capsq = capture_square(to);
       Bitboard occupied = rifleShot ? (pieces() ^ capsq) : ((pieces() ^ from ^ capsq) | to);
 
@@ -3674,21 +3761,21 @@ bool Position::legal(Move m) const {
   // In case of bikjang passing is always allowed, even when in check
   if (st->bikjang && is_pass(m))
       return !violates_same_player_board_repetition(m);
-  if ((var->flyingGeneral && count<KING>(us)) || st->bikjang)
+  if ((var->flyingGeneral && hasRoyal) || st->bikjang)
   {
-      Square s = type_of(moved_piece(m)) == KING ? (rifleShot ? from : to) : square<KING>(us);
+      Square s = moverIsRoyal ? (rifleShot ? from : to) : royalSquare;
       if (attacks_bb(~us, ROOK, s, occupied) & pieces(~us, KING) & ~square_bb(to))
           return false;
   }
-  if (var->diagonalGeneral && count<KING>(us))
+  if (var->diagonalGeneral && hasRoyal)
   {
-      Square s = type_of(moved_piece(m)) == KING ? (rifleShot ? from : to) : square<KING>(us);
+      Square s = moverIsRoyal ? (rifleShot ? from : to) : royalSquare;
       if (attacks_bb(~us, BISHOP, s, occupied) & pieces(~us, KING) & ~square_bb(to))
           return false;
   }
 
   // Makpong rule
-  if (var->makpongRule && evasion_checkers() && type_of(moved_piece(m)) == KING && (evasion_checkers() ^ to))
+  if (var->makpongRule && evasion_checkers() && moverIsRoyal && (evasion_checkers() ^ to))
       return false;
 
   if (var->royalPieceNoThroughCheck && type_of(moved_piece(m)) == king_type())
@@ -3703,22 +3790,22 @@ bool Position::legal(Move m) const {
       }
   }
 
-  if (count<KING>(us))
+  if (hasRoyal)
   {
-      Square kingSquareAfterMove = type_of(moved_piece(m)) == KING ? (rifleShot ? from : to)
-                                                                   : square<KING>(us);
+      Square kingSquareAfterMove = moverIsRoyal ? (rifleShot ? from : to)
+                                                : royalSquare;
       if (removedByEffects & square_bb(kingSquareAfterMove))
           return false;
   }
 
   // If the moving piece is a king, check whether the destination square is
   // attacked by the opponent.
-  if (!allow_checks() && type_of(moved_piece(m)) == KING)
+  if (!allow_checks() && moverIsRoyal)
       return !(attackers_to_king(rifleShot ? from : to, occupied, ~us) & ~removedAttackers)
           && !violates_same_player_board_repetition(m);
 
   // Return early when without king
-  if (!count<KING>(us))
+  if (!hasRoyal)
       return !violates_same_player_board_repetition(m);
 
   Bitboard janggiCannons = pieces(JANGGI_CANNON);
@@ -3729,10 +3816,47 @@ bool Position::legal(Move m) const {
       janggiCannons ^= to;
 
   // A non-king move is legal if the king is not under attack after the move.
-  return (allow_checks() || !(attackers_to_king(square<KING>(us), occupied, ~us, janggiCannons)
+  return (allow_checks() || !(attackers_to_king(royalSquare, occupied, ~us, janggiCannons)
                               & ~removedAttackers
                               & ~(rifleShot ? Bitboard(0) : SquareBB[to])))
       && !violates_same_player_board_repetition(m);
+}
+
+
+/// Position::has_legal_move() tests whether there is at least one legal move
+
+bool Position::has_legal_move() const {
+
+  if (is_immediate_game_end())
+      return false;
+
+  ExtMove moveList[MOVEGEN_OVERFLOW_CAPACITY];
+  ExtMove* end;
+
+  const bool useWrappedFallback = topology_wraps() && evasion_checkers();
+  const bool useNonEvasions = anti_royal_types() || useWrappedFallback;
+
+  if (evasion_checkers() && !useNonEvasions)
+  {
+      end = generate<EVASIONS>(*this, moveList);
+      for (ExtMove* it = moveList; it != end; ++it)
+          if (legal(*it) && !virtual_drop(*it))
+              return true;
+  }
+  else
+  {
+      end = generate<CAPTURES>(*this, moveList);
+      for (ExtMove* it = moveList; it != end; ++it)
+          if (legal(*it) && !virtual_drop(*it))
+              return true;
+
+      end = generate<QUIETS>(*this, moveList);
+      for (ExtMove* it = moveList; it != end; ++it)
+          if (legal(*it) && !virtual_drop(*it))
+              return true;
+  }
+
+  return false;
 }
 
 
@@ -4038,7 +4162,7 @@ bool Position::pseudo_legal(const Move m) const {
   if ((anti_royal_self_capture_only() && (anti_royal_types() & piece_set(type_of(pc)))) && (pieces(them) & to) && !is_self_destruct(m))
       return false;
 
-  if ((topology_wraps() || pushMove) && !allow_checks() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
+  if (!allow_checks() && checking_permitted() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
       return false;
 
   // Handle the special case of a pawn move
@@ -4181,7 +4305,6 @@ bool Position::gives_check(Move m) const {
   Square from = from_sq(m);
   Square to = to_sq(m);
   bool dropMove = is_drop_move(m);
-  bool swapMove = is_swap_move(m);
 
   Bitboard freezeExtra = 0;
   Bitboard jumpRemoved = 0;
@@ -4230,7 +4353,7 @@ bool Position::gives_check(Move m) const {
   else if (janggiCannons & to)
       janggiCannons ^= to;
 
-  if (topology_wraps() || var->blastPassiveTypes || has_pushing() || has_pulling() || has_adjacent_swapping() || type_of(m) == PULL || swapMove)
+  if (topology_wraps() || has_pushing() || has_adjacent_swapping() || is_swap_move(m))
   {
       Position* pos = const_cast<Position*>(this);
       StateInfo nextState;
@@ -4238,6 +4361,14 @@ bool Position::gives_check(Move m) const {
       bool givesCheck = bool(pos->evasion_checkers());
       pos->undo_move(m);
       return givesCheck;
+  }
+
+  if (type_of(m) == PULL)
+  {
+      Square pullFrom = pull_square(m);
+      occupied ^= square_bb(pullFrom) ^ square_bb(from);
+      if (janggiCannons & pullFrom)
+          janggiCannons ^= square_bb(pullFrom) ^ square_bb(from);
   }
 
   // Is there a direct check?
@@ -4265,10 +4396,20 @@ bool Position::gives_check(Move m) const {
           else if (check_squares(pt) & attackFrom)
               return true;
       }
+      if (var->blastPassiveTypes && (var->blastPassiveTypes & piece_set(pt)))
+      {
+          Square ksq = square<KING>(~sideToMove);
+          if (!(blast_immune_bb() & square_bb(ksq)) && (blast_pattern(ksq) & to))
+              return true;
+      }
   }
 
   // Is there a discovered check?
-  if (  ((!dropMove && (blockers_for_king(~sideToMove) & (rifleShot ? square_bb(to) : square_bb(from)))) || (non_sliding_riders() & pieces(sideToMove)))
+  Bitboard discCheckSq = rifleShot ? square_bb(to) : square_bb(from);
+  if (type_of(m) == PULL)
+      discCheckSq |= square_bb(pull_square(m));
+
+  if (  ((!dropMove && (blockers_for_king(~sideToMove) & discCheckSq)) || (non_sliding_riders() & pieces(sideToMove)))
       && attackers_to_king(square<KING>(~sideToMove), occupied, sideToMove, janggiCannons) & occupied)
       return true;
 
@@ -4559,7 +4700,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
                                     : (color_of(captured) == them
                                        || (((self_capture(type_of(pc)) || (anti_royal_self_capture_only() && (anti_royal_types() & piece_set(type_of(pc)))))
                                            && color_of(captured) == us)))));
-  assert(type_of(captured) != KING || allow_checks());
+  assert(type_of(captured) != KING || allow_checks() || !checking_permitted());
 
   auto trigger_matches = [](ColorChangeTrigger trigger, bool isCapture) {
       switch (trigger)
@@ -6214,7 +6355,7 @@ void Position::undo_move(Move m) {
          || wasOpeningSelfRemoval
          || (commit_gates() && st->removedGatingType > NO_PIECE_TYPE)
   );
-  assert(type_of(st->captured.piece) != KING || allow_checks());
+  assert(type_of(st->captured.piece) != KING || allow_checks() || !checking_permitted());
 
   // Reset wall squares
   byTypeBB[ALL_PIECES] ^= st->wallSquares ^ st->previous->wallSquares;
@@ -6223,7 +6364,8 @@ void Position::undo_move(Move m) {
   // Add the blast pieces
   if (
        ( surround_capture_opposite() || surround_capture_intervene() || surround_capture_edge() ) ||
-       ( st->captured.piece && (blast_on_capture(pc, st->captured.piece) || var->petrifyOnCaptureTypes) ) ||
+       ( st->bycatchSquares ) ||
+       ( st->captured.piece && var->petrifyOnCaptureTypes ) ||
        ( blast_on_move() && !st->captured.piece && !is_self_destruct(st->move) ) ||
        ( blast_on_self_destruct() && is_self_destruct(st->move) ) ||
        ( remove_connect_n() > 0 )
@@ -6398,9 +6540,19 @@ void Position::undo_move(Move m) {
           else if (st->dead.piece && type_of(m) != PROMOTION && type_of(m) != PIECE_PROMOTION)
           {
               if (st->deadSquares & moverSq)
+              {
                   st->deadSquares ^= moverSq;
-              put_piece(st->dead.piece, moverSq, st->dead.promoted, st->dead.unpromoted);
-              pc = piece_on(moverSq);
+                  put_piece(st->dead.piece, moverSq, st->dead.promoted, st->dead.unpromoted);
+                  pc = piece_on(moverSq);
+              }
+              else
+              {
+                  // st->dead represents the mover being removed after moving (e.g. self-destruct,
+                  // death-on-capture, zero-range blast-on-capture). When undoing, the mover belongs
+                  // back on its source square; any captured piece is restored to the destination later.
+                  put_piece(st->dead.piece, from, st->dead.promoted, st->dead.unpromoted);
+                  pc = piece_on(from);
+              }
           }
           if (cloneMove)
           {
@@ -6415,8 +6567,8 @@ void Position::undo_move(Move m) {
           }
           else if (swapMove)
               swap_piece(from, to);
-          else if (!rifleShot)
-              move_piece(to, from); // Put the piece back at the source square
+          else if (!rifleShot && piece_on(to) != NO_PIECE)
+              move_piece(to, from); // Put the piece back at the source square when the mover survived on 'to'
       }
 
       if (st->didPush && st->pushStepwise)
@@ -7132,6 +7284,43 @@ bool Position::is_optional_game_end(Value& result, int ply, int countStarted) co
 /// It does not detect stalemates.
 
 bool Position::is_immediate_game_end(Value& result, int ply) const {
+
+  // Direct king capture ends the game immediately in capture-the-royal flows,
+  // even when the variant is not modeled through extinction or pseudo-royals.
+  if (type_of(st->captured.piece) == king_type())
+  {
+      Color capturedColor = color_of(st->captured.piece);
+      result = capturedColor == sideToMove ? mated_in(ply) : mate_in(ply);
+      return true;
+  }
+
+  // Some variants treat the runtime king piece as a real royal even when the
+  // current position was reconstructed after the capture happened (for example
+  // tafl surround-capture positions loaded from FEN). In those cases we must
+  // not fall through to stalemate/insufficient-material adjudication just
+  // because st->captured is empty in the reconstructed state.
+  if (king_type() != NO_PIECE_TYPE)
+      for (Color c : { ~sideToMove, sideToMove })
+          if (!count(c, king_type()) && (allow_checks() || flag_piece(c) == king_type()))
+          {
+              result = c == sideToMove ? mated_in(ply) : mate_in(ply);
+              return true;
+          }
+
+  // Tablut-family variants model the escape king as a flag piece rather than
+  // the orthodox runtime king type. Once that piece is gone, the side has
+  // already lost even if the position was reconstructed from FEN and there are
+  // still other pieces left to move. Keep this scoped to surround-capture
+  // variants rather than all flag-piece games.
+  for (Color c : { ~sideToMove, sideToMove })
+      if (surround_capture_opposite()
+          && flag_piece(c) != NO_PIECE_TYPE
+          && flag_region(c)
+          && !count(c, flag_piece(c)))
+      {
+          result = c == sideToMove ? mated_in(ply) : mate_in(ply);
+          return true;
+      }
 
   // Pseudo-royal loss
   // Some variants transfer royal status across a family of piece types.

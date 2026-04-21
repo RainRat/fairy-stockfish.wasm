@@ -20,8 +20,37 @@
 
 #include "movegen.h"
 #include "position.h"
+#include "thread.h"
 
 namespace Stockfish {
+
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+template<GenType T>
+MoveList<T>::MoveList(const Position& pos) {
+    thread = pos.this_thread();
+    if (thread)
+        moveList = acquire_thread_buffer(thread);
+    else {
+        moveListPtr = std::make_unique<ExtMove[]>(MOVEGEN_OVERFLOW_CAPACITY);
+        moveList = moveListPtr.get();
+    }
+    last = generate<T>(pos, moveList);
+    assert(last - moveList <= MOVEGEN_OVERFLOW_CAPACITY);
+}
+
+template<GenType T>
+MoveList<T>::~MoveList() {
+    if (thread)
+        release_thread_buffer(thread, moveList);
+}
+
+// Explicit instantiations
+template struct MoveList<CAPTURES>;
+template struct MoveList<QUIETS>;
+template struct MoveList<QUIET_CHECKS>;
+template struct MoveList<EVASIONS>;
+template struct MoveList<NON_EVASIONS>;
+#endif
 
 namespace {
 
@@ -69,7 +98,8 @@ namespace {
         }
 
         if (pos.walling_rule() == ARROW)
-            b &= moves_bb(us, type_of(pos.piece_on(from)), effectiveTo, occupancyAfter ^ square_bb(effectiveTo));
+            b &= pos.moves_bb(us, type_of(pos.piece_on(from)), effectiveTo,
+                              occupancyAfter ^ square_bb(effectiveTo));
 
         //Any current or future wall variant must follow the walling region rule if set:
         b &= pos.walling_region(us);
@@ -617,7 +647,7 @@ namespace {
                 while (b)
                 {
                     Square to = pop_lsb(b);
-                    if (!(attacks_bb(Us, pt, to, pos.pieces() ^ from) & pos.pieces(Them)))
+                    if (!(pos.attacks_bb(Us, pt, to, pos.pieces() ^ from) & pos.pieces(Them)))
                         *moveList++ = make<PROMOTION>(from, to, pt);
                 }
             }
@@ -779,7 +809,11 @@ namespace {
                 b3 &= pos.check_squares(type_of(pos.unpromoted_piece_on(from)));
         }
 
-        if (Type != CAPTURES && Pt != PAWN && (pos.pawn_like_types(Us) & piece_set(Pt)))
+        const PieceInfo* pieceInfo = pieceMap.get(Pt);
+        if (Type != CAPTURES
+            && Pt != PAWN
+            && (pos.pawn_like_types(Us) & piece_set(Pt))
+            && !pieceInfo->has_explicit_initial_moves())
         {
             Square oneAhead = from + Up;
             if (is_ok(oneAhead) && (quiets & oneAhead))
@@ -810,6 +844,8 @@ namespace {
         // Jump captures are emitted explicitly below in capture-generating modes.
         // Exclude them from regular NORMAL generation to avoid duplicates.
         b1 &= ~jumpCaptures;
+        if (!pos.stepwise_pushing())
+            b1 &= ~pushMoves;
 
         while (b1)
             moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, from, pop_lsb(b1));
@@ -876,7 +912,6 @@ namespace {
     Bitboard forcedFromMask = AllSquares;
     bool restrictToForcedJumper = false;
     PieceType forcedJumpPt = NO_PIECE_TYPE;
-    Bitboard jumpForbidden = current_spell_context() ? current_spell_context()->jumpRemoved : Bitboard(0);
 
     if (pos.in_opening_self_removal_phase())
     {
@@ -959,7 +994,7 @@ namespace {
             }
 
             // Remove inaccessible squares (outside board + wall squares)
-            target &= pos.board_bb() & ~jumpForbidden;
+            target &= pos.board_bb();
 
             captureTarget = target;
         }
@@ -1247,26 +1282,22 @@ namespace {
             continue;
         }
 
-        while (candidates)
+        if (potion == Variant::POTION_JUMP)
         {
-            if (cur >= maxEnd)
-                return maxEnd;
+            if (!candidates)
+                continue;
 
-            Square gate = pop_lsb(candidates);
-            assert(potion == Variant::POTION_JUMP);
-
-            Bitboard gateMask = square_bb(gate);
-            ScopedSpellContext guard(Bitboard(0), gateMask);
+            ScopedSpellContext guard(Bitboard(0), candidates);
 
 #ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
             std::unique_ptr<ExtMove[]> jumpMoves(new ExtMove[MOVEGEN_OVERFLOW_CAPACITY]);
-            ExtMove* jumpEnd = generate_all_impl<Us, Type>(pos, jumpMoves.get());
+            ExtMove* jumpEnd = generate_all_impl<Us, NON_EVASIONS>(pos, jumpMoves.get());
             assert(jumpEnd - jumpMoves.get() <= MOVEGEN_OVERFLOW_CAPACITY);
 
             for (ExtMove* it = jumpMoves.get(); it != jumpEnd; ++it)
 #else
             ExtMove jumpMoves[MOVEGEN_OVERFLOW_CAPACITY];
-            ExtMove* jumpEnd = generate_all_impl<Us, Type>(pos, jumpMoves);
+            ExtMove* jumpEnd = generate_all_impl<Us, NON_EVASIONS>(pos, jumpMoves);
             assert(jumpEnd - jumpMoves <= MOVEGEN_OVERFLOW_CAPACITY);
 
             for (ExtMove* it = jumpMoves; it != jumpEnd; ++it)
@@ -1282,6 +1313,7 @@ namespace {
                 MoveType mt = type_of(base);
                 if (mt != NORMAL && mt != CASTLING)
                     continue;
+
                 Square from = from_sq(base);
                 Square to = to_sq(base);
 
@@ -1298,19 +1330,29 @@ namespace {
                     && moverType != SOLDIER)
                     continue;
 
-                if (to == gate)
-                    continue;
-
                 if (distance(from, to) <= 1)
                     continue;
 
                 Bitboard path = between_bb(from, to, moverType);
-                if (!(path & gateMask))
+                Bitboard intersection = path & candidates & ~square_bb(to);
+                if (popcount(intersection) != 1)
+                    continue;
+
+                Square gate = lsb(intersection);
+                if (to == gate)
                     continue;
 
                 Move gatingMove = mt == NORMAL
                                   ? make_gating<NORMAL>(from, to, potionPiece, gate)
                                   : make_gating<CASTLING>(from, to, potionPiece, gate);
+
+                // Filter by original Type and legality
+                bool isCapture = pos.capture_or_promotion(gatingMove);
+                if (   (Type == CAPTURES && !isCapture)
+                    || (Type == QUIETS && isCapture)
+                    || (Type == QUIET_CHECKS && (isCapture || !pos.gives_check(gatingMove)))
+                    || !pos.legal(gatingMove))
+                    continue;
 
                 cur->move = gatingMove;
                 cur->value = it->value;
@@ -1426,5 +1468,9 @@ ExtMove* generate<LEGAL>(const Position& pos, ExtMove* moveList) {
 
   return moveList;
 }
+
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+template struct MoveList<LEGAL>;
+#endif
 
 } // namespace Stockfish

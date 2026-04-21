@@ -12,36 +12,50 @@ const output = process.argv[3]
 
 let text = await readFile(input, "utf8");
 
+const isModernModule = text.includes("export default Module;");
+
 text = text
-  .replace(
-    'var Module=typeof Module!="undefined"?Module:{};',
-    [
-      "Module = Module || {};",
-      "var readyPromiseResolve,readyPromiseReject;",
-      'Module["ready"]=new Promise(function(resolve,reject){readyPromiseResolve=resolve;readyPromiseReject=reject});',
-    ].join(""),
-  )
   .replace(
     'var ENVIRONMENT_IS_NODE=globalThis.process?.versions?.node&&globalThis.process?.type!="renderer";',
     "var ENVIRONMENT_IS_NODE=false;",
   )
-  .replaceAll('var fs=require("node:fs");', "var fs=null;")
-  .replaceAll('var nodeCrypto=require("node:crypto");', "var nodeCrypto=null;")
   .replace(
-    'initRuntime();Module["onRuntimeInitialized"]?.();postRun()',
-    'initRuntime();readyPromiseResolve(Module);Module["onRuntimeInitialized"]?.();postRun()',
-  );
+    "var _scriptName=import.meta.url;",
+    'var _scriptName=((globalThis.document?.currentScript)?.src)||"";',
+  )
+  .replace(
+    'return new URL("ffish.wasm",import.meta.url).href',
+    'return locateFile("ffish.wasm")',
+  )
+  .replaceAll('var fs=require("node:fs");', "var fs=null;")
+  .replaceAll('var nodeCrypto=require("node:crypto");', "var nodeCrypto=null;");
 
-const wrapped = [
-  "var ModuleFactory = function(Module) {",
-  text,
-  'return Module["ready"];',
-  "};",
-  "export default ModuleFactory;",
-  "",
-].join("\n");
+if (!isModernModule) {
+  text = text
+    .replace(
+      'var Module=typeof Module!="undefined"?Module:{};',
+      [
+        "Module = Module || {};",
+        "var readyPromiseResolve,readyPromiseReject;",
+        'Module["ready"]=new Promise(function(resolve,reject){readyPromiseResolve=resolve;readyPromiseReject=reject});',
+      ].join(""),
+    )
+    .replace(
+      'initRuntime();Module["onRuntimeInitialized"]?.();postRun()',
+      'initRuntime();readyPromiseResolve(Module);Module["onRuntimeInitialized"]?.();postRun()',
+    );
 
-const transformed = await transform(wrapped, {
+  text = [
+    "var ModuleFactory = function(Module) {",
+    text,
+    'return Module["ready"];',
+    "};",
+    "export default ModuleFactory;",
+    "",
+  ].join("\n");
+}
+
+const transformed = await transform(text, {
   format: "esm",
   platform: "browser",
   target: "es2015",

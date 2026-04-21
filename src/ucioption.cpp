@@ -70,8 +70,11 @@ std::set<string, UCI::CaseInsensitiveLess> standard_variants = {
 };
 
 void init_variant(const Variant* v) {
-    if (Options.count("DynamicMagicsByBoardSize") && bool(Options["DynamicMagicsByBoardSize"]))
-        Bitboards::init_magics(v->maxFile, v->maxRank);
+    const bool useBoardSizeMagics = bool(Options["DynamicMagicsByBoardSize"]) || v->cylindrical || v->toroidal;
+    if (!v->magicGeometry)
+        const_cast<Variant*>(v)->magicGeometry = useBoardSizeMagics
+                                               ? Bitboards::init_magics(v->maxFile, v->maxRank)
+                                               : Bitboards::init_magics(FILE_MAX, RANK_MAX);
     pieceMap.init(v);
     Bitboards::init_pieces();
 }

@@ -209,6 +209,7 @@ struct Variant {
   bool pushChainEnemyOnly = false;
   bool pushCaptureAgainstFriendlyBlocker = false;
   bool pushNoImmediateReturn = false;
+  bool stepwisePushing = true;
   PieceSet edgeInsertTypes = NO_PIECE_SET;
   ColorSetting<Bitboard> edgeInsertRegion = ColorSetting<Bitboard>(Bitboard(0));
   bool edgeInsertOnly = false;
@@ -309,6 +310,9 @@ struct Variant {
   int nFoldRule = 3;
   int nFoldRuleImmediate = 0;
   ColorSetting<Value> nFoldValue = ColorSetting<Value>(VALUE_DRAW);
+
+  std::shared_ptr<const MagicGeometry> magicGeometry;
+
   bool nFoldValueAbsolute = false;
   bool perpetualCheckIllegal = false;
   bool moveRepetitionIllegal = false;
