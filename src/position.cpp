@@ -65,9 +65,13 @@ namespace {
   inline Variant::PotionType potion_type_from_piece(const Variant* var, PieceType pt) {
     if (!var || !var->potions)
         return static_cast<Variant::PotionType>(Variant::POTION_TYPE_NB);
-    if (pt == var->potionPiece[Variant::POTION_FREEZE])
+    if (pt == NO_PIECE_TYPE)
+        return static_cast<Variant::PotionType>(Variant::POTION_TYPE_NB);
+    if (var->potionPiece[Variant::POTION_FREEZE] != NO_PIECE_TYPE
+        && pt == var->potionPiece[Variant::POTION_FREEZE])
         return Variant::POTION_FREEZE;
-    if (pt == var->potionPiece[Variant::POTION_JUMP])
+    if (var->potionPiece[Variant::POTION_JUMP] != NO_PIECE_TYPE
+        && pt == var->potionPiece[Variant::POTION_JUMP])
         return Variant::POTION_JUMP;
     return static_cast<Variant::PotionType>(Variant::POTION_TYPE_NB);
   }
@@ -89,18 +93,6 @@ namespace {
   }
 
   
-  struct PushInfo {
-    bool valid = false;
-    bool captures = false;
-    bool ejects = false;
-    Square tail = SQ_NONE;
-    Square first = SQ_NONE;
-    int stepF = 0;
-    int stepR = 0;
-    int count = 0;
-    int distance = 0;
-  };
-
   struct PushTempPiece {
     Piece piece = NO_PIECE;
     Square origin = SQ_NONE;
@@ -108,16 +100,63 @@ namespace {
     Piece unpromoted = NO_PIECE;
   };
 
-  constexpr int MAX_PUSH_SNAPSHOT = 32;
+  class ScopedProbeMove {
+  public:
+    ScopedProbeMove(const Position& pos, Move m, StateInfo& newSt)
+      : pos_(const_cast<Position&>(pos)), move_(m) {
+      pos_.do_move(move_, newSt, false);
+    }
+
+    ~ScopedProbeMove() {
+      pos_.undo_move(move_);
+    }
+
+    ScopedProbeMove(const ScopedProbeMove&) = delete;
+    ScopedProbeMove& operator=(const ScopedProbeMove&) = delete;
+
+  private:
+    Position& pos_;
+    Move move_;
+  };
+
   static_assert(MAX_PUSH_SNAPSHOT <= 32, "push snapshot promotion bitmask must fit in uint32_t");
+  static_assert(sizeof(StateInfo::push.snapshots) / sizeof(StateInfo::push.snapshots[0]) == MAX_PUSH_SNAPSHOT, "push snapshots array size mismatch");
 
   inline bool advance_square(const Position& pos, Square from, int stepF, int stepR, Square& out) {
+    if (pos.topology_wraps())
+        return wrapped_destination_square(from, stepF, stepR, pos.max_file(), pos.max_rank(),
+                                          pos.wraps_files(), pos.wraps_ranks(), out);
+
     int f = int(file_of(from)) + stepF;
     int r = int(rank_of(from)) + stepR;
     if (f < int(FILE_A) || f > int(pos.max_file()) || r < int(RANK_1) || r > int(pos.max_rank()))
         return false;
     out = make_square(File(f), Rank(r));
     return true;
+  }
+
+  inline int adjusted_delta(const Position& pos, int delta, int size) {
+    if (!pos.topology_wraps() || size <= 1)
+        return delta;
+
+    if (std::abs(delta + size) < std::abs(delta))
+        delta += size;
+    else if (std::abs(delta - size) < std::abs(delta))
+        delta -= size;
+    return delta;
+  }
+
+  template<typename T, size_t N>
+  bool same_array(const T (&lhs)[N], const T (&rhs)[N]) {
+      return std::equal(std::begin(lhs), std::end(lhs), std::begin(rhs));
+  }
+
+  template<typename T, size_t N, size_t M>
+  bool same_array(const T (&lhs)[N][M], const T (&rhs)[N][M]) {
+      for (size_t i = 0; i < N; ++i)
+          if (!same_array(lhs[i], rhs[i]))
+              return false;
+      return true;
   }
 
   bool violates_push_no_immediate_return(const Position& pos, Move m, const PushInfo& info) {
@@ -138,7 +177,7 @@ namespace {
         return false;
 
     Square cur = to_sq(m);
-    while (true)
+    for (int steps = 0; steps < int(popcount(pos.board_bb())); ++steps)
     {
         if (cur == lastTo)
         {
@@ -163,8 +202,10 @@ namespace {
         if (cur == info.tail)
             break;
 
-        cur = make_square(File(int(file_of(cur)) + info.stepF),
-                          Rank(int(rank_of(cur)) + info.stepR));
+        Square next = SQ_NONE;
+        if (!advance_square(pos, cur, info.stepF, info.stepR, next) || next == cur)
+            break;
+        cur = next;
     }
 
     return false;
@@ -173,10 +214,13 @@ namespace {
   int collect_push_line(const Position& pos, Square from, int stepF, int stepR, Square squares[MAX_PUSH_SNAPSHOT]) {
     int count = 0;
     Square cur = from;
-    while (count < MAX_PUSH_SNAPSHOT)
+    const int maxSteps = std::min<int>(MAX_PUSH_SNAPSHOT, pos.topology_wraps() ? popcount(pos.board_bb()) : MAX_PUSH_SNAPSHOT);
+    while (count < maxSteps)
     {
       Square next = SQ_NONE;
       if (!advance_square(pos, cur, stepF, stepR, next))
+          break;
+      if (next == from)
           break;
       squares[count++] = next;
       cur = next;
@@ -211,7 +255,7 @@ namespace {
                              PushTempPiece* outTransfers = nullptr,
                              int* outTransferCount = nullptr) {
     const MoveType mt = type_of(m);
-    if (mt != NORMAL || is_gating(m) || pos.topology_wraps())
+    if (mt != NORMAL)
         return false;
 
     Square from = from_sq(m);
@@ -233,6 +277,11 @@ namespace {
 
     int df = int(file_of(to)) - int(file_of(from));
     int dr = int(rank_of(to)) - int(rank_of(from));
+    if (pos.topology_wraps())
+    {
+        df = adjusted_delta(pos, df, int(pos.max_file()) + 1);
+        dr = adjusted_delta(pos, dr, int(pos.max_rank()) + 1);
+    }
     int stepF = (df > 0) - (df < 0);
     int stepR = (dr > 0) - (dr < 0);
     if ((df != 0 && dr != 0 && std::abs(df) != std::abs(dr)) || (df == 0 && dr == 0))
@@ -297,7 +346,11 @@ namespace {
 
       int tailIndex = nextIndex;
       while (tailIndex + 1 < lineCount && line[tailIndex + 1].piece != NO_PIECE)
+      {
+          if (pos.push_chain_enemy_only() && color_of(line[tailIndex + 1].piece) == color_of(mover))
+              break;
           ++tailIndex;
+      }
 
       int chainCount = tailIndex - nextIndex + 1;
       if (chainCount > strength)
@@ -321,11 +374,30 @@ namespace {
           Square beyond = squares[tailIndex + 1];
           if ((pos.wall_squares() | pos.dead_squares()) & beyond)
               return false;
+
           if (line[tailIndex + 1].piece != NO_PIECE)
-              return false;
-          for (int i = tailIndex + 1; i > nextIndex; --i)
-              line[i] = line[i - 1];
-          line[nextIndex] = PushTempPiece{};
+          {
+              if (pos.push_chain_enemy_only() && color_of(line[tailIndex + 1].piece) == color_of(mover))
+              {
+                  if (!pos.push_capture_against_friendly_blocker())
+                      return false;
+
+                  transfers[transferCount++] = line[tailIndex];
+                  for (int i = tailIndex; i > nextIndex; --i)
+                      line[i] = line[i - 1];
+                  line[nextIndex] = PushTempPiece{};
+                  info.captures = true;
+                  info.ejects = false;
+              }
+              else
+                  return false;
+          }
+          else
+          {
+              for (int i = tailIndex + 1; i > nextIndex; --i)
+                  line[i] = line[i - 1];
+              line[nextIndex] = PushTempPiece{};
+          }
       }
 
       moverIndex = nextIndex;
@@ -367,9 +439,7 @@ namespace {
 
   bool analyze_push_direct(const Position& pos, Move m, PushInfo& info) {
     const MoveType mt = type_of(m);
-    if ((mt != NORMAL && mt != INSERT) || is_gating(m))
-        return false;
-    if (pos.topology_wraps())
+    if ((mt != NORMAL && mt != INSERT))
         return false;
 
     Square from = from_sq(m);
@@ -398,11 +468,14 @@ namespace {
                           : int(file_of(to)) - int(file_of(from));
     int dr = mt == INSERT ? int(rank_of(from)) - int(rank_of(to))
                           : int(rank_of(to)) - int(rank_of(from));
+    if (pos.topology_wraps())
+    {
+        df = adjusted_delta(pos, df, int(pos.max_file()) + 1);
+        dr = adjusted_delta(pos, dr, int(pos.max_rank()) + 1);
+    }
     int stepF = (df > 0) - (df < 0);
     int stepR = (dr > 0) - (dr < 0);
     if ((df != 0 && dr != 0 && std::abs(df) != std::abs(dr)) || (df == 0 && dr == 0))
-        return false;
-    if (stepF == 0 && stepR == 0)
         return false;
 
     if (mt == NORMAL)
@@ -478,16 +551,12 @@ namespace {
     }
   }
 
-  bool analyze_push(const Position& pos, Move m, PushInfo& info) {
-    return type_of(m) == INSERT || !pos.stepwise_pushing()
-               ? analyze_push_direct(pos, m, info)
-               : analyze_push_stepwise(pos, m, info);
-  }
+
 
   inline Bitboard retro_asymmetric_check_squares(Color attacker, PieceType pt, Square kingSq, Bitboard occupied) {
     // Hopper families need hurdle-aware retro logic. Keep pseudo candidates for
     // those, and use path-based retro filtering for other asymmetrical riders.
-    if (AttackRiderTypes[pt] & HOPPING_RIDERS)
+    if (pieceMap.get(pt)->has_hopper_like_capture())
         return PseudoAttacks[~attacker][pt][kingSq];
 
     Bitboard checks = 0;
@@ -504,45 +573,86 @@ namespace {
     return checks;
   }
 
-  bool is_pure_hopper_like(const PieceInfo* pi) {
-    bool hasHopper = false;
-
-    for (MoveModality modality : {MODALITY_QUIET, MODALITY_CAPTURE})
+  inline Bitboard retro_lame_check_squares(const Position& pos, Color attacker, PieceType pt, Square kingSq, Bitboard occupied) {
+    Bitboard checks = 0;
+    const PieceInfo* pi = pieceMap.get(pos.effective_piece_type(pt));
+    auto add_candidates = [&](const std::map<Direction, PieceInfo::LameProfile>& profiles)
     {
-        if (!pi->steps[0][modality].empty()
-            || !pi->tupleSteps[0][modality].empty()
-            || !pi->slider[0][modality].empty()
-            || pi->griffon[0][modality]
-            || pi->manticore[0][modality]
-            || pi->rose[0][modality])
-            return false;
+        const int maxSteps = pos.topology_wraps() ? popcount(pos.board_bb())
+                                                  : std::max(int(pos.max_file()), int(pos.max_rank())) + 1;
+        for (const auto& [profileDir, profile] : profiles)
+        {
+            Direction dir = attacker == WHITE ? profileDir : Direction(-profileDir);
+            auto [dr, df] = decode_direction(dir);
+            Square from = kingSq;
+            int steps = 0;
 
-        hasHopper = hasHopper
-                 || !pi->hopper[0][modality].empty()
-                 || !pi->contraHopper[0][modality].empty();
-    }
+            while (steps < maxSteps)
+            {
+                if (profile.limit > 0 && steps >= profile.limit)
+                    break;
 
-    return hasHopper;
+                Square next = SQ_NONE;
+                if (pos.topology_wraps())
+                {
+                    if (!wrapped_destination_square(from, -df, -dr, pos.max_file(), pos.max_rank(),
+                                                    pos.wraps_files(), pos.wraps_ranks(), next))
+                        break;
+                }
+                else
+                {
+                    next = from - dir;
+                    if (!is_ok(next))
+                        break;
+                    if (int(file_of(from)) - int(file_of(next)) != df
+                        || int(rank_of(from)) - int(rank_of(next)) != dr)
+                        break;
+                }
+
+                if (next == kingSq)
+                    break;
+                if (!(square_bb(next) & pos.board_bb()))
+                    break;
+
+                from = next;
+                ++steps;
+                if (pos.attacks_from(attacker, pt, from, occupied) & square_bb(kingSq))
+                    checks |= square_bb(from);
+                if (occupied & square_bb(from))
+                    break;
+                if (profile.limit < 0)
+                    break;
+            }
+        }
+    };
+
+    add_candidates(pi->stepsLame[0][MODALITY_CAPTURE]);
+    add_candidates(pi->stepsLame[1][MODALITY_CAPTURE]);
+
+    return checks;
   }
+
+
 
   bool has_hopper_potential_from_square(const Position& pos, Color c, PieceType pt, Square sq) {
     // PseudoMoves deliberately treats hopper families too optimistically on an
-    // empty board. For immobility checks, ask the real attack generator with a
-    // maximally helpful occupancy instead: every other square is occupied, so
-    // any genuine adjacent-hurdle lane remains available while edge-trapped
-    // hoppers still report no future move.
+    // empty board. For immobility checks, ask the real move/attack generators
+    // with a maximally helpful occupancy instead: every other square is
+    // occupied, so any genuine adjacent-hurdle lane remains available while
+    // edge-trapped hoppers still report no future move.
     Bitboard syntheticOccupancy = pos.board_bb() & ~square_bb(sq);
-    return pos.attacks_from(c, pt, sq, syntheticOccupancy);
+    return pos.attacks_from<false, false>(c, pt, sq, syntheticOccupancy)
+        | pos.moves_from<false>(c, pt, sq, syntheticOccupancy);
   }
 
-  Bitboard rose_revealed_blockers(Square target, Square attackerSq, Bitboard occupied, const MagicGeometry* mg) {
+  Bitboard rose_revealed_blockers(Square target, Square attackerSq, Bitboard occupied) {
     Bitboard blockers = 0;
     Bitboard candidates = rose_between_union_bb(target, attackerSq, Bitboard(0)) & occupied & ~square_bb(attackerSq);
 
     while (candidates)
     {
         Square blocker = pop_lsb(candidates);
-        if (rose_attacks_bb(attackerSq, occupied ^ square_bb(blocker), mg) & target)
+        if (rose_attacks_bb(attackerSq, occupied ^ square_bb(blocker)) & target)
             blockers |= blocker;
     }
 
@@ -555,9 +665,13 @@ namespace {
     if (!(pos.pieces(c) & a) || !(pos.pieces(c) & b))
         return false;
 
-    int df = int(file_of(b)) - int(file_of(a));
-    int dr = int(rank_of(b)) - int(rank_of(a));
-    if (std::abs(df) != 1 || std::abs(dr) != 1)
+    int df = std::abs(int(file_of(b)) - int(file_of(a)));
+    int dr = std::abs(int(rank_of(b)) - int(rank_of(a)));
+
+    bool f_adj = (df == 1) || (pos.wraps_files() && df == int(pos.max_file()));
+    bool r_adj = (dr == 1) || (pos.wraps_ranks() && dr == int(pos.max_rank()));
+
+    if (!f_adj || !r_adj)
         return false;
 
     Square bridge1 = make_square(file_of(a), rank_of(b));
@@ -568,25 +682,65 @@ namespace {
   Bitboard weak_connection_expansion(const Position& pos, Bitboard frontier, Bitboard connectPieces, Color c) {
     Bitboard expanded = 0;
 
-    for (Direction d : pos.getConnectDirections())
-        expanded |= shift(d, frontier) & connectPieces;
-
-    while (frontier)
+    if (pos.topology_wraps())
     {
-        Square from = pop_lsb(frontier);
-        if (!pos.weak_diagonal_connect())
-            continue;
+        Bitboard tmp = frontier;
+        while (tmp)
+        {
+            Square s = pop_lsb(tmp);
+            for (Direction d : pos.getConnectDirections())
+            {
+                auto [dr, df] = decode_direction(d);
+                for (int sign : {1, -1})
+                {
+                    Square next = SQ_NONE;
+                    if (wrapped_destination_square(s, sign * df, sign * dr, pos.max_file(), pos.max_rank(), pos.wraps_files(), pos.wraps_ranks(), next))
+                    {
+                        if (connectPieces & next)
+                            expanded |= next;
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        for (Direction d : pos.getConnectDirections())
+            expanded |= (shift(d, frontier) | shift(-d, frontier)) & connectPieces;
+    }
 
-        Bitboard fromBb = square_bb(from);
+    if (!pos.weak_diagonal_connect())
+        return expanded;
+
+    Bitboard tmp = frontier;
+    while (tmp)
+    {
+        Square from = pop_lsb(tmp);
         static constexpr Direction diagonals[] = {NORTH_EAST, NORTH_WEST, SOUTH_EAST, SOUTH_WEST};
         for (Direction d : diagonals)
         {
-            Bitboard toBb = shift(d, fromBb) & connectPieces;
-            if (!toBb)
-                continue;
-            Square to = lsb(toBb);
-            if (weak_diagonal_link(pos, c, from, to))
-                expanded |= toBb;
+            Square to = SQ_NONE;
+            bool ok = false;
+            if (pos.topology_wraps())
+            {
+                auto [dr, df] = decode_direction(d);
+                ok = wrapped_destination_square(from, df, dr, pos.max_file(), pos.max_rank(), pos.wraps_files(), pos.wraps_ranks(), to);
+            }
+            else
+            {
+                Bitboard toBb = shift(d, square_bb(from));
+                if (toBb)
+                {
+                    to = lsb(toBb);
+                    ok = true;
+                }
+            }
+
+            if (ok && (connectPieces & to))
+            {
+                if (weak_diagonal_link(pos, c, from, to))
+                    expanded |= to;
+            }
         }
     }
 
@@ -661,33 +815,54 @@ namespace {
       return make_square(File(spec[0] - 'a'), Rank(rankNumber - 1));
   }
 
-  inline std::array<int, 4> parse_potion_cooldowns(std::string content) {
+  inline bool parse_potion_cooldowns(const std::string& content, std::array<int, 4>& parsed) {
       // Order: white-freeze, white-jump, black-freeze, black-jump.
-      std::array<int, 4> parsed = {0, 0, 0, 0};
-      for (char& ch : content)
-          if (!(std::isdigit(static_cast<unsigned char>(ch)) || ch == '-'))
-              ch = ' ';
+      parsed = {0, 0, 0, 0};
 
       std::istringstream ss(content);
       std::vector<int> vals;
-      int v = 0;
-      while (ss >> v)
-          vals.push_back(std::max(0, v));
+      std::string token;
+      while (ss >> token)
+      {
+          if (token.empty())
+              return false;
 
-      if (vals.size() >= 4)
+          size_t start = token[0] == '-' ? 1 : 0;
+          if (start == token.size())
+              return false;
+
+          long long value = 0;
+          for (size_t i = start; i < token.size(); ++i)
+          {
+              unsigned char ch = static_cast<unsigned char>(token[i]);
+              if (!std::isdigit(ch))
+                  return false;
+              value = value * 10 + (token[i] - '0');
+              if (value > std::numeric_limits<int>::max())
+                  return false;
+          }
+
+          int signedValue = token[0] == '-' ? -int(value) : int(value);
+          vals.push_back(std::max(0, signedValue));
+      }
+
+      if (vals.size() == 2)
+      {
+          // Compact form: "<w b>" means both potion cooldowns for each side.
+          parsed[0] = parsed[1] = vals[0];
+          parsed[2] = parsed[3] = vals[1];
+          return true;
+      }
+      if (vals.size() == 4)
       {
           parsed[0] = vals[0];
           parsed[1] = vals[1];
           parsed[2] = vals[2];
           parsed[3] = vals[3];
+          return true;
       }
-      else if (vals.size() == 2)
-      {
-          // Compact form: "<w b>" means both potion cooldowns for each side.
-          parsed[0] = parsed[1] = vals[0];
-          parsed[2] = parsed[3] = vals[1];
-      }
-      return parsed;
+
+      return false;
   }
 
 } // namespace
@@ -899,20 +1074,25 @@ inline int non_negative_points(int points) {
   return std::max(points, 0);
 }
 
-inline int append_dirty(StateInfo* st, Piece pc, Square from, Square to, Piece handPiece = NO_PIECE, int handCount = 0) {
-  auto& dp = st->dirtyPiece;
-  if (dp.dirty_num >= DIRTY_PIECE_MAX) {
-      assert(false && "DirtyPiece overflow");
-      st->nnueRefreshNeeded = true;
-      return -1;
-  }
-
-  int idx = dp.dirty_num++;
+inline void init_dirty_piece_entry(DirtyPiece& dp, int idx, Piece pc, Square from, Square to, Piece handPiece, int handCount) {
   dp.piece[idx] = pc;
   dp.from[idx] = from;
   dp.to[idx] = to;
   dp.handPiece[idx] = handPiece;
   dp.handCount[idx] = handCount;
+}
+
+inline int append_dirty(StateInfo* st, Piece pc, Square from, Square to, Piece handPiece = NO_PIECE, int handCount = 0) {
+  auto& dp = st->dirtyPiece;
+  if (dp.dirty_num >= DIRTY_PIECE_MAX) {
+      assert(false && "DirtyPiece overflow");
+      st->nnueRefreshNeeded = true;
+      dp.dirty_num = 0;
+      return -1;
+  }
+
+  int idx = dp.dirty_num++;
+  init_dirty_piece_entry(dp, idx, pc, from, to, handPiece, handCount);
   return idx;
 }
 
@@ -958,21 +1138,20 @@ bool Position::violates_same_player_board_repetition(Move m) const {
   if (!var->samePlayerBoardRepetitionIllegal)
       return false;
 
-  Position probe;
-  StateInfo probeState, nextState;
-  probe.set(variant(), fen(), is_chess960(), &probeState, this_thread());
-  probe.do_move(m, nextState, false);
+  StateInfo* previousState = st;
+  StateInfo nextState;
+  ScopedProbeMove probe(*this, m, nextState);
 
   bool repeated = false;
-  int end = probe.captures_to_hand() ? probe.st->pliesFromNull
-                                     : std::min(probe.st->rule50, probe.st->pliesFromNull);
+  int end = captures_to_hand() ? st->pliesFromNull
+                               : std::min(st->rule50, st->pliesFromNull);
   if (end >= 4)
   {
-      StateInfo* stp = st;
+      StateInfo* stp = previousState;
       for (int i = 4; i <= end; i += 2)
       {
           stp = stp->previous->previous;
-          if (stp->move != MOVE_NONE && stp->layoutKey == probe.st->layoutKey)
+          if (stp->move != MOVE_NONE && stp->layoutKey == st->layoutKey)
           {
               repeated = true;
               break;
@@ -1193,13 +1372,16 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
                   || !std::isdigit(static_cast<unsigned char>(next)))
                   break;
 
-              ss >> token;
-              steps = 10 * steps + (token - '0');
-          }
-          if (commit_gates() && (rank == 0 || rank == max_rank() + 2))
-              commitFile += steps;
-          else
-              sq += steps * EAST; // Advance the given number of files
+               ss >> token;
+               if (steps <= int(max_file()) + 1)
+                   steps = 10 * steps + (token - '0');
+               else
+                   steps = int(max_file()) + 2;
+           }
+           if (commit_gates() && (rank == 0 || rank == max_rank() + 2))
+               commitFile += steps;
+           else
+               sq += steps * EAST; // Advance the given number of files
       }
 
       else if (token == '/')
@@ -1261,12 +1443,14 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
           if (ss.peek() == '~')
               ss >> token;
 
-          if(v->commitGates && (rank == 0 || rank == max_rank() + 2))
+          if (v->commitGates && (rank == 0 || rank == max_rank() + 2))
           {
-              commit_piece(pc, File(commitFile));
+              if (commitFile <= max_file())
+                  commit_piece(pc, File(commitFile));
               ++commitFile;
           }
-          else{
+          else
+          {
               put_piece(pc, sq, token == '~', NO_PIECE, true);
               ++sq;
           }
@@ -1280,13 +1464,16 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
           Piece promoted = piece_from_symbol(symbol);
           if (promoted == NO_PIECE || !promoted_piece_type(type_of(promoted)))
               continue;
-          if(v->commitGates && (rank == 0 || rank == max_rank() + 2)){
-            commit_piece(promoted, File(commitFile));
-            ++commitFile;
+          if (v->commitGates && (rank == 0 || rank == max_rank() + 2))
+          {
+              if (commitFile <= max_file())
+                  commit_piece(promoted, File(commitFile));
+              ++commitFile;
           }
-          else {
-            put_piece(make_piece(color_of(promoted), promoted_piece_type(type_of(promoted))), sq, true, promoted, true);
-            ++sq;
+          else
+          {
+              put_piece(make_piece(color_of(promoted), promoted_piece_type(type_of(promoted))), sq, true, promoted, true);
+              ++sq;
           }
       }
   }
@@ -1498,21 +1685,30 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
               // a) side to move have a pawn threatening epSquare
               // b) there is an enemy pawn one or two (for triple steps) squares in front of epSquare
               // c) there is no (non-wall) piece on epSquare or behind epSquare
-              Square gateBehind = epSquare + pawn_push(sideToMove);
-              bool behindSquareAllowed = !((pieces(WHITE) | pieces(BLACK)) & gateBehind);
-              if (!behindSquareAllowed)
+              Square gateBehind = pawn_step(epSquare, sideToMove, 1);
+              bool behindSquareAllowed = false;
+              if (is_ok(gateBehind) && file_of(gateBehind) <= max_file() && rank_of(gateBehind) <= max_rank())
               {
-                  PieceType forcedGate = forced_gating_type(~sideToMove, PAWN);
-                  behindSquareAllowed = forcedGate != NO_PIECE_TYPE
-                                     && piece_on(gateBehind) == make_piece(~sideToMove, forcedGate);
+                  behindSquareAllowed = !((pieces(WHITE) | pieces(BLACK)) & gateBehind);
+                  if (!behindSquareAllowed)
+                  {
+                      PieceType forcedGate = forced_gating_type(~sideToMove, PAWN);
+                      behindSquareAllowed = forcedGate != NO_PIECE_TYPE
+                                         && piece_on(gateBehind) == make_piece(~sideToMove, forcedGate);
+                  }
               }
+
+              Square front1 = pawn_step(epSquare, ~sideToMove, 1);
+              Square front2 = pawn_step(epSquare, ~sideToMove, 2);
+              bool front1_ok = is_ok(front1) && file_of(front1) <= max_file() && rank_of(front1) <= max_rank();
+              bool front2_ok = is_ok(front2) && file_of(front2) <= max_file() && rank_of(front2) <= max_rank();
 
               if (   (var->enPassantRegion[sideToMove] & epSquare)
                   && (   !var->fastAttacks
                       || (var->enPassantTypes[sideToMove] & ~piece_set(PAWN))
                       || (   pawn_attacks_bb(~sideToMove, epSquare) & pieces(sideToMove, PAWN)
-                          && (   (pieces(~sideToMove, PAWN) & (epSquare + pawn_push(~sideToMove)))
-                              || (pieces(~sideToMove, PAWN) & (epSquare + 2 * pawn_push(~sideToMove))))
+                          && (   (front1_ok && (pieces(~sideToMove, PAWN) & front1))
+                              || (front2_ok && (pieces(~sideToMove, PAWN) & front2)))
                           && !((pieces(WHITE) | pieces(BLACK)) & epSquare)
                           && behindSquareAllowed)))
                   st->epSquares |= epSquare;
@@ -1554,8 +1750,12 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
           else if (std::isdigit(static_cast<unsigned char>(token)))
           {
               handCount = token - '0';
-              while (std::isdigit(ss.peek()) && ss >> token)
-                  handCount = 10 * handCount + (token - '0');
+              while (std::isdigit(ss.peek()) && ss >> token) {
+                  if (handCount <= 1000)
+                      handCount = 10 * handCount + (token - '0');
+                  else
+                      handCount = 1001;
+              }
           }
           else if (Variant::is_piece_id_start(token))
           {
@@ -1647,13 +1847,26 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
           char open = 0;
           ss >> open;
           std::string cooldownSpec;
-          std::getline(ss, cooldownSpec, '>');
-          auto vals = parse_potion_cooldowns(cooldownSpec);
-          int maxCooldown = (1 << POTION_COOLDOWN_BITS) - 1;
-          st->potionCooldown[WHITE][Variant::POTION_FREEZE] = std::min(vals[0], maxCooldown);
-          st->potionCooldown[WHITE][Variant::POTION_JUMP]   = std::min(vals[1], maxCooldown);
-          st->potionCooldown[BLACK][Variant::POTION_FREEZE] = std::min(vals[2], maxCooldown);
-          st->potionCooldown[BLACK][Variant::POTION_JUMP]   = std::min(vals[3], maxCooldown);
+          if (std::getline(ss, cooldownSpec, '>') && !ss.eof())
+          {
+              std::array<int, 4> vals = {0, 0, 0, 0};
+              if (parse_potion_cooldowns(cooldownSpec, vals))
+              {
+                  int maxCooldown = (1 << POTION_COOLDOWN_BITS) - 1;
+                  st->potionCooldown[WHITE][Variant::POTION_FREEZE] = std::min(vals[0], maxCooldown);
+                  st->potionCooldown[WHITE][Variant::POTION_JUMP]   = std::min(vals[1], maxCooldown);
+                  st->potionCooldown[BLACK][Variant::POTION_FREEZE] = std::min(vals[2], maxCooldown);
+                  st->potionCooldown[BLACK][Variant::POTION_JUMP]   = std::min(vals[3], maxCooldown);
+              }
+              else
+              {
+                  std::cerr << "Invalid potion cooldown specification in FEN: '<" << cooldownSpec << ">'."
+                            << std::endl;
+                  ss.setstate(std::ios::failbit);
+              }
+          }
+          else
+              ss.setstate(std::ios::failbit);
       }
   }
 
@@ -1683,8 +1896,8 @@ void Position::set_castling_right(Color c, Square rfrom) {
   castlingRightsMask[rfrom] |= cr;
   castlingRookSquare[cr] = rfrom;
 
-  Square kto = make_square(cr & KING_SIDE ? castling_kingside_file() : castling_queenside_file(), castling_rank(c));
-  Square rto = kto + (cr & KING_SIDE ? WEST : EAST);
+  Square kto, rto;
+  castling_destinations(c, kfrom, rfrom, kto, rto);
 
   castlingPath[cr] =   (between_bb(rfrom, rto) | between_bb(kfrom, kto))
                     & ~(kfrom | rfrom);
@@ -1695,18 +1908,48 @@ void Position::set_castling_right(Color c, Square rfrom) {
 
 void Position::set_check_info(StateInfo* si) const {
 
+  std::fill_n(si->checkSquares, PIECE_TYPE_NB, Bitboard(0));
+  auto init_royal_extinction_state = [&]() {
+      si->extinctionSeen[WHITE] = NO_PIECE_SET;
+      si->extinctionSeen[BLACK] = NO_PIECE_SET;
+      for (PieceSet ps = extinction_must_appear(); ps;)
+      {
+          PieceType pt = pop_lsb(ps);
+          if (count(WHITE, pt))
+              si->extinctionSeen[WHITE] |= piece_set(pt);
+          if (count(BLACK, pt))
+              si->extinctionSeen[BLACK] |= piece_set(pt);
+      }
+
+      si->pseudoRoyalCandidates = 0;
+      si->pseudoRoyals = 0;
+      if (pseudo_royal_types())
+      {
+          for (PieceSet ps = pseudo_royal_types(); ps;)
+          {
+              PieceType pt = pop_lsb(ps);
+              si->pseudoRoyalCandidates |= pieces(pt);
+              if (count(sideToMove, pt) <= pseudo_royal_count())
+                  si->pseudoRoyals |= pieces(sideToMove, pt);
+              if (count(~sideToMove, pt) <= pseudo_royal_count())
+                  si->pseudoRoyals |= pieces(~sideToMove, pt);
+          }
+      }
+  };
+
   if (topology_wraps())
   {
       si->blockersForKing[WHITE] = si->blockersForKing[BLACK] = 0;
       si->pinners[WHITE] = si->pinners[BLACK] = 0;
 
-      Square ksq = count<KING>(~sideToMove) ? square<KING>(~sideToMove) : SQ_NONE;
+      Square ksq = royal_square(~sideToMove);
       si->nonSlidingRiders = 0;
 
       for (PieceSet ps = piece_types(); ps;)
       {
           PieceType pt = pop_lsb(ps);
-          PieceType movePt = pt == KING ? king_type() : pt;
+          PieceType movePt = effective_piece_type(pt);
+          const PieceInfo* pi = pieceMap.get(movePt);
           si->checkSquares[pt] = 0;
 
           if (ksq != SQ_NONE)
@@ -1720,7 +1963,7 @@ void Position::set_check_info(StateInfo* si) const {
               }
           }
 
-          if (AttackRiderTypes[movePt] & NON_SLIDING_RIDERS)
+          if ((AttackRiderTypes[movePt] & NON_SLIDING_RIDERS) || pi->has_lame_capture() || pi->has_hopper_like_capture())
               si->nonSlidingRiders |= pieces(pt);
       }
 
@@ -1729,37 +1972,14 @@ void Position::set_check_info(StateInfo* si) const {
       si->chased = Bitboard(0);
       si->legalCapture = NO_VALUE;
       si->legalEnPassant = NO_VALUE;
-      si->extinctionSeen[WHITE] = NO_PIECE_SET;
-      si->extinctionSeen[BLACK] = NO_PIECE_SET;
-      for (PieceSet ps = extinction_must_appear(); ps;)
-      {
-          PieceType pt = pop_lsb(ps);
-          if (count(WHITE, pt))
-              si->extinctionSeen[WHITE] |= piece_set(pt);
-          if (count(BLACK, pt))
-              si->extinctionSeen[BLACK] |= piece_set(pt);
-      }
-      if (pseudo_royal_types())
-      {
-          si->pseudoRoyalCandidates = 0;
-          si->pseudoRoyals = 0;
-          for (PieceSet ps = pseudo_royal_types(); ps;)
-          {
-              PieceType pt = pop_lsb(ps);
-              si->pseudoRoyalCandidates |= pieces(pt);
-              if (count(sideToMove, pt) <= pseudo_royal_count())
-                  si->pseudoRoyals |= pieces(sideToMove, pt);
-              if (count(~sideToMove, pt) <= pseudo_royal_count())
-                  si->pseudoRoyals |= pieces(~sideToMove, pt);
-          }
-      }
+      init_royal_extinction_state();
       return;
   }
 
-  si->blockersForKing[WHITE] = slider_blockers(pieces(BLACK), count<KING>(WHITE) ? square<KING>(WHITE) : SQ_NONE, si->pinners[BLACK], BLACK);
-  si->blockersForKing[BLACK] = slider_blockers(pieces(WHITE), count<KING>(BLACK) ? square<KING>(BLACK) : SQ_NONE, si->pinners[WHITE], WHITE);
+  si->blockersForKing[WHITE] = slider_blockers(pieces(BLACK), count<KING>(WHITE) == 1 ? square<KING>(WHITE) : SQ_NONE, si->pinners[BLACK], BLACK);
+  si->blockersForKing[BLACK] = slider_blockers(pieces(WHITE), count<KING>(BLACK) == 1 ? square<KING>(BLACK) : SQ_NONE, si->pinners[WHITE], WHITE);
 
-  Square ksq = count<KING>(~sideToMove) ? square<KING>(~sideToMove) : SQ_NONE;
+  Square ksq = royal_square(~sideToMove);
   Bitboard occupied = pieces();
 
   // For unused piece types, the check squares are left uninitialized
@@ -1797,14 +2017,17 @@ void Position::set_check_info(StateInfo* si) const {
           for (PieceSet ps = piece_types(); ps;)
           {
               PieceType pt = pop_lsb(ps);
-              PieceType movePt = pt == KING ? king_type() : pt;
+              PieceType movePt = effective_piece_type(pt);
+              const PieceInfo* pi = pieceMap.get(movePt);
               if (AttackRiderTypes[movePt] & ASYMMETRICAL_RIDERS)
                   // For asymmetrical riders, use true retro paths from the king square.
                   si->checkSquares[pt] = retro_asymmetric_check_squares(sideToMove, movePt, ksq, occupied);
               else
                   si->checkSquares[pt] = attacks_bb(~sideToMove, movePt, ksq, occupied);
+              if (pi->has_lame_capture())
+                  si->checkSquares[pt] |= retro_lame_check_squares(*this, sideToMove, pt, ksq, occupied);
               // Collect special piece types that require slower check and evasion detection
-              if (AttackRiderTypes[movePt] & NON_SLIDING_RIDERS)
+              if ((AttackRiderTypes[movePt] & NON_SLIDING_RIDERS) || pi->has_lame_capture() || pi->has_hopper_like_capture())
                   si->nonSlidingRiders |= pieces(pt);
           }
       }
@@ -1814,30 +2037,7 @@ void Position::set_check_info(StateInfo* si) const {
   si->chased = var->chasingRule ? chased() : Bitboard(0);
   si->legalCapture = NO_VALUE;
   si->legalEnPassant = NO_VALUE;
-  si->extinctionSeen[WHITE] = NO_PIECE_SET;
-  si->extinctionSeen[BLACK] = NO_PIECE_SET;
-  for (PieceSet ps = extinction_must_appear(); ps;)
-  {
-      PieceType pt = pop_lsb(ps);
-      if (count(WHITE, pt))
-          si->extinctionSeen[WHITE] |= piece_set(pt);
-      if (count(BLACK, pt))
-          si->extinctionSeen[BLACK] |= piece_set(pt);
-  }
-  if (pseudo_royal_types())
-  {
-      si->pseudoRoyalCandidates = 0;
-      si->pseudoRoyals = 0;
-      for (PieceSet ps = pseudo_royal_types(); ps;)
-      {
-          PieceType pt = pop_lsb(ps);
-          si->pseudoRoyalCandidates |= pieces(pt);
-          if (count(sideToMove, pt) <= pseudo_royal_count())
-              si->pseudoRoyals |= pieces(sideToMove, pt);
-          if (count(~sideToMove, pt) <= pseudo_royal_count())
-              si->pseudoRoyals |= pieces(~sideToMove, pt);
-      }
-  }
+  init_royal_extinction_state();
 
 }
 
@@ -1862,7 +2062,7 @@ void Position::recompute_state_hashes_and_material(StateInfo* si) const {
       si->key ^= Zobrist::psq[pc][s];
 
       if (!pc)
-          si->key ^= (st->deadSquares & s) ? Zobrist::dead[s] : Zobrist::wall[s];
+          si->key ^= (si->deadSquares & s) ? Zobrist::dead[s] : Zobrist::wall[s];
 
       else if (type_of(pc) == PAWN)
           si->pawnKey ^= Zobrist::psq[pc][s];
@@ -1939,9 +2139,7 @@ void Position::set_state(StateInfo* si) const {
   si->capturedGatingType = NO_PIECE_TYPE;
   si->captured.clear();
   si->dead.clear();
-  si->didColorChange = false;
-  si->colorChanged.clear();
-  si->colorChangeSquare = SQ_NONE;
+  si->transforms.clear();
   si->claimedSquares = 0;
   si->pendingClaimPass = false;
   si->dropHandColor = COLOR_NB;
@@ -1964,9 +2162,7 @@ void Position::refresh_state_derived(StateInfo* si) const {
 
 Bitboard Position::compute_checkers_bb(Color side) const {
 
-  Bitboard checkers = !allow_checks() && count(side, king_type())
-                    ? attackers_to_king(square(side, king_type()), ~side)
-                    : Bitboard(0);
+  Bitboard checkers = compute_evasion_checkers_bb(side);
 
   if (!allow_checks())
   {
@@ -1974,8 +2170,6 @@ Bitboard Position::compute_checkers_bb(Color side) const {
           checkers |= checked_pseudo_royals(side);
       if (anti_royal_types())
           checkers |= checked_anti_royals(side);
-      if (var->blastPassiveTypes)
-          checkers |= passive_blast_checkers(side, pieces());
   }
 
   return checkers;
@@ -1986,8 +2180,11 @@ Bitboard Position::compute_evasion_checkers_bb(Color side) const {
   // Fairy-Stockfish-X split from upstream-style broad checkersBB:
   // this tracks only king-evasion state that should drive EVASIONS, mate/stalemate,
   // null-move, and perpetual-check semantics.
-  Bitboard checkers = !allow_checks() && count(side, king_type())
-                    ? attackers_to_king(square(side, king_type()), ~side)
+  Square royalSq = royal_square(side);
+  if (royalSq == SQ_NONE && var->bikjangRule && count<KING>(side) == 1)
+      royalSq = square<KING>(side);
+  Bitboard checkers = !allow_checks() && royalSq != SQ_NONE
+                    ? attackers_to_king(royalSq, ~side)
                     : Bitboard(0);
 
   if (!allow_checks() && var->blastPassiveTypes)
@@ -2003,13 +2200,19 @@ Bitboard Position::compute_evasion_checkers_bb(Color side) const {
 
 Position& Position::set(const string& code, Color c, StateInfo* si) {
 
-  string sides[] = { code.substr(code.find('v') != string::npos ? code.find('v') + 1 : code.find('K', 1)),      // Weak
-                     code.substr(0, std::min(code.find('v'), code.find('K', 1))) }; // Strong
+  size_t v_pos = code.find('v');
+  size_t k_pos = code.find('K', 1);
+  size_t split_pos = (v_pos != string::npos) ? v_pos : (k_pos != string::npos ? k_pos : code.length());
+
+  string sides[] = {
+      (split_pos < code.length()) ? code.substr(v_pos != string::npos ? v_pos + 1 : k_pos) : "",      // Weak
+      code.substr(0, split_pos) // Strong
+  };
 
   assert(sides[0].length() > 0 && sides[0].length() < 8);
   assert(sides[1].length() > 0 && sides[1].length() < 8);
 
-  std::transform(sides[c].begin(), sides[c].end(), sides[c].begin(), tolower);
+  std::transform(sides[c].begin(), sides[c].end(), sides[c].begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
 
   string fenStr =  sides[0] + "///////" + sides[1] + " w - - 0 10";
 
@@ -2325,7 +2528,7 @@ Bitboard Position::slider_blockers(Bitboard sliders, Square s, Bitboard& pinners
               }
               else
                   snipers |= b & ~attacks_bb(~c, pt, s, pieces());
-              if ((riderTypes & ~HOPPING_RIDERS) || !pi->tupleSlider[0][MODALITY_CAPTURE].empty())
+              if (((riderTypes & ~HOPPING_RIDERS) && !pi->has_hopper_like_capture()) || !pi->tupleSlider[0][MODALITY_CAPTURE].empty())
                   slidingSnipers |= snipers & ptPieces;
           }
       }
@@ -2356,13 +2559,13 @@ Bitboard Position::slider_blockers(Bitboard sliders, Square s, Bitboard& pinners
     PieceType sniperType = type_of(sniper);
     if (AttackRiderTypes[sniperType] & RIDER_ROSE)
     {
-        Bitboard b = rose_revealed_blockers(s, sniperSq, occupancy, magic_geometry());
+        Bitboard b = rose_revealed_blockers(s, sniperSq, occupancy);
         if (b && !more_than_one(b))
             pinners |= pieces(c) & sniperSq;
         blockers |= b;
         continue;
     }
-    bool isHopper = AttackRiderTypes[sniperType] & HOPPING_RIDERS;
+    bool isHopper = (AttackRiderTypes[sniperType] & HOPPING_RIDERS) || pieceMap.get(sniperType)->has_hopper_like_capture();
     Bitboard b = between_bb(s, sniperSq, sniperType) & (isHopper ? (allPieces ^ sniperSq) : occupancy);
 
     if (b && (!more_than_one(b) || (isHopper && popcount(b) == 2)))
@@ -2394,19 +2597,44 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
           if (!ptPieces)
               continue;
 
-          PieceType move_pt = pt == KING ? king_type() : pt;
-          if (pt == JANGGI_CANNON)
-              b |= attacks_from(~c, move_pt, s, occupied)
-                 & attacks_from(~c, move_pt, s, occupied & ~janggiCannons)
+          PieceType move_pt = effective_piece_type(pt);
+          const PieceInfo* pi = pieceMap.get(move_pt);
+          // Runtime rider augments and asymmetric riders need per-piece forward
+          // attack testing — the reverse-attack shortcut is incorrect for these.
+          if (pi->has_runtime_rider_augment()
+              || pi->has_universal_hopper()
+              || (AttackRiderTypes[move_pt] & ASYMMETRICAL_RIDERS))
+          {
+              Bitboard candidates = ptPieces;
+              while (candidates)
+              {
+                  Square from = pop_lsb(candidates);
+                  if (attacks_from(c, pt, from, occupied) & s)
+                      b |= from;
+              }
+          }
+          else if (pt == JANGGI_CANNON)
+              b |= attacks_from<false, false>(~c, move_pt, s, occupied)
+                 & attacks_from<false, false>(~c, move_pt, s, occupied & ~janggiCannons)
                  & ptPieces;
           else
-              b |= attacks_from(~c, move_pt, s, occupied) & ptPieces;
+              b |= attacks_from<false, false>(~c, move_pt, s, occupied) & ptPieces;
       }
       return b;
   }
 
+  bool hasRuntimeSpecialAttackers = false;
+  for (PieceSet ps = pieceMap.runtime_rider_augment_types(); ps && !hasRuntimeSpecialAttackers;)
+  {
+      PieceType move_pt = pop_lsb(ps);
+      if (move_pt == king_type())
+          hasRuntimeSpecialAttackers = bool(pieces(c, KING));
+      else
+          hasRuntimeSpecialAttackers = bool(pieces(c, move_pt));
+  }
+
   // Use a faster version for variants with moderate rule variations
-  if (fast_attacks())
+  if (!hasRuntimeSpecialAttackers && fast_attacks())
   {
       return  (pawn_attacks_bb(~c, s)          & pieces(c, PAWN))
             | (attacks_bb<KNIGHT>(s)           & pieces(c, KNIGHT, ARCHBISHOP, CHANCELLOR))
@@ -2416,7 +2644,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
   }
 
   // Use a faster version for selected fairy pieces
-  if (fast_attacks2())
+  if (!hasRuntimeSpecialAttackers && fast_attacks2())
   {
       return  (pawn_attacks_bb(~c, s)             & pieces(c, PAWN, BREAKTHROUGH_PIECE, GOLD))
             | (attacks_bb<KNIGHT>(s)              & pieces(c, KNIGHT))
@@ -2436,7 +2664,19 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
       PieceType pt = pop_lsb(ps);
       if (board_bb(c, pt) & s)
       {
-          PieceType move_pt = pt == KING ? king_type() : pt;
+          PieceType move_pt = effective_piece_type(pt);
+          const PieceInfo* pi = pieceMap.get(move_pt);
+          if (pi->has_runtime_rider_augment() || pi->has_universal_hopper())
+          {
+              Bitboard candidates = pieces(c, pt);
+              while (candidates)
+              {
+                  Square from = pop_lsb(candidates);
+                  if (attacks_from(c, pt, from, occupied) & s)
+                      b |= from;
+              }
+              continue;
+          }
           // Consider asymmetrical moves (e.g., horse)
           if (AttackRiderTypes[move_pt] & ASYMMETRICAL_RIDERS)
           {
@@ -2449,9 +2689,9 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
               }
           }
           else if (pt == JANGGI_CANNON)
-              b |= attacks_from(~c, move_pt, s, occupied) & attacks_from(~c, move_pt, s, occupied & ~janggiCannons) & pieces(c, JANGGI_CANNON);
+              b |= attacks_from<false, false>(~c, move_pt, s, occupied) & attacks_from<false, false>(~c, move_pt, s, occupied & ~janggiCannons) & (janggiCannons & pieces(c));
           else
-              b |= attacks_from(~c, move_pt, s, occupied) & pieces(c, pt);
+              b |= attacks_from<false, false>(~c, move_pt, s, occupied) & pieces(c, pt);
       }
   }
 
@@ -2464,9 +2704,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
       diags |= attacks_bb(~c, FERS, s, occupied) & pieces(c, WAZIR);
       diags |= attacks_bb(~c, PAWN, s, occupied) & pieces(c, SOLDIER);
       diags |= rider_attacks_bb<RIDER_BISHOP>(s, occupied) & pieces(c, ROOK);
-      diags |=  rider_attacks_bb<RIDER_CANNON_DIAG>(s, occupied)
-              & rider_attacks_bb<RIDER_CANNON_DIAG>(s, occupied & ~janggiCannons)
-              & pieces(c, JANGGI_CANNON);
+      diags |= janggi_cannon_diagonal_targets(s, occupied, janggiCannons) & (janggiCannons & pieces(c));
       b |= diags & diagonal_lines();
   }
 
@@ -2477,30 +2715,89 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied, Color c, Bitboard j
   return b;
 }
 
-Bitboard Position::attackers_to_king(Square s, Bitboard occupied, Color c, Bitboard janggiCannons) const {
+Bitboard Position::attackers_to_king(Square s, Bitboard occupied, Color c, Bitboard janggiCannons, PieceType pt) const {
 
   Bitboard attackers = attackers_to(s, occupied, c, janggiCannons);
-  attackers |= janggi_cannon_attackers_to_king(s, occupied, c);
+  attackers |= janggi_cannon_attackers_to_king(s, occupied, c, janggiCannons);
+  // Locust-style universal hoppers capture the hurdle square and land beyond it,
+  // so the hurdle square is not present in attacks_from() landing targets.
+  // When `occupied` is hypothetical and already includes s, we still need to
+  // consider locust attacks on that square even if it is empty on the board.
+  if (pt != NO_PIECE_TYPE || piece_on(s) != NO_PIECE || (occupied & square_bb(s)))
+      for (PieceSet ps = piece_types(); ps; )
+      {
+          PieceType apt = pop_lsb(ps);
+          Bitboard candidates = pieces(c, apt) & occupied;
+          if (!candidates)
+              continue;
+
+          PieceType movePt = effective_piece_type(apt);
+          if (movePt == NO_PIECE_TYPE)
+              continue;
+          const PieceInfo* pi = pieceMap.get(movePt);
+          if (!pi->has_universal_hopper())
+              continue;
+
+          bool hasLocust = false;
+          for (int initial = 0; initial < 2 && !hasLocust; ++initial)
+              for (const auto& [_, profile] : pi->universalHopper[initial][MODALITY_CAPTURE])
+                  if (profile.captureMode != PieceInfo::CAPTURE_DEST)
+                  {
+                      hasLocust = true;
+                      break;
+                  }
+          if (!hasLocust)
+              continue;
+
+          while (candidates)
+          {
+              Square from = pop_lsb(candidates);
+              Bitboard landings = attacks_from(c, apt, from, occupied) & ~pieces(c);
+              while (landings)
+              {
+                  Square to = pop_lsb(landings);
+                  if (jump_capture_square(from, to, occupied) == s)
+                  {
+                      attackers |= square_bb(from);
+                      break;
+                  }
+              }
+          }
+      }
   // Frozen pieces cannot give check (relevant for spell-chess freeze effects).
-  attackers &= ~(freeze_squares(c) | (pieces(c, PAWN) & pawnCannotCheckZone[c]));
+  Bitboard restricted = freeze_squares(c);
+  if (var->prisonPawnPromotion)
+      restricted |= pieces(c, PAWN) & pawnCannotCheckZone[c];
+  attackers &= ~restricted;
+  PieceType royalType = pt != NO_PIECE_TYPE ? pt :
+                        (piece_on(s) != NO_PIECE ? type_of(piece_on(s)) : king_type());
+
   if (anti_royal_king_mutually_immune())
-      for (PieceSet ps = anti_royal_types(); ps; )
-          attackers &= ~pieces(c, pop_lsb(ps));
-  PieceSet forbiddenToKing = var->captureForbiddenToKing;
-  if (!attackers || !forbiddenToKing)
-      return attackers;
+  {
+      if (royalType == king_type())
+      {
+          for (PieceSet ps = anti_royal_types(); ps; )
+              attackers &= ~pieces(c, pop_lsb(ps));
+      }
+      else if (anti_royal_types() & royalType)
+          attackers &= ~pieces(c, king_type());
+  }
 
-  for (PieceSet ps = forbiddenToKing; ps; )
-      attackers &= ~pieces(c, pop_lsb(ps));
-
+  if (royalType != NO_PIECE_TYPE)
+      for (PieceSet ps = piece_types(); ps; )
+      {
+          PieceType apt = pop_lsb(ps);
+          if (var->captureForbidden[apt] & royalType)
+              attackers &= ~pieces(c, apt);
+      }
   return attackers;
 }
 
-Bitboard Position::janggi_cannon_attackers_to_king(Square s, Bitboard occupied, Color c) const {
+Bitboard Position::janggi_cannon_attackers_to_king(Square s, Bitboard occupied, Color c, Bitboard janggiCannons) const {
 
   Bitboard attackers = 0;
   Bitboard cannons = pieces(c, JANGGI_CANNON) & occupied;
-  Bitboard cannonPieces = pieces(JANGGI_CANNON);
+  Bitboard cannonPieces = janggiCannons;
 
   while (cannons)
   {
@@ -2581,8 +2878,9 @@ bool Position::compute_forced_jump_followup(Square s, int step) const {
   if (freeze_squares() & s)
       return false;
 
-  PieceSet jumpTypes = jump_capture_types();
-  if (!(jumpTypes & ALL_PIECES) && !(jumpTypes & type_of(mover)))
+  PieceType movePt = type_of(mover) == KING ? king_type() : type_of(mover);
+  const PieceInfo* pi = pieceMap.get(movePt);
+  if (!(pi->has_universal_capture_hopper()))
       return false;
 
   Color c = color_of(mover);
@@ -2707,9 +3005,213 @@ Bitboard Position::checked_anti_royals(Color c) const {
 }
 
 
+Bitboard Position::compute_surround_capture_mask(Square moverSq, Bitboard usPieces, Bitboard themPieces, Bitboard occupied) const {
+  Bitboard mask = 0;
+  if (!(surround_capture_opposite() || surround_capture_intervene() || surround_capture_edge()))
+      return mask;
+
+  for (int sign : {-1, 1})
+  {
+      for (const Direction& d : var->connectDirections)
+      {
+          Direction mod_d = d * sign;
+          Square s = moverSq + mod_d;
+          if (!is_ok(s) || !(square_bb(s) & themPieces & occupied))
+              continue;
+
+          if (s & surround_capture_max_region())
+          {
+              bool surrounded = true;
+              Bitboard adj = attacks_bb<WAZIR>(s, occupied) & board_bb();
+              while (adj)
+              {
+                  Square s2 = pop_lsb(adj);
+                  if (!((s2 & surround_capture_hostile_region()) || (s2 & usPieces & occupied) || (s2 == moverSq)))
+                  {
+                      surrounded = false;
+                      break;
+                  }
+              }
+              if (surrounded)
+                  mask |= s;
+              else
+                  continue;
+          }
+
+          Square oppSquare = s + mod_d;
+          if (!is_ok(oppSquare))
+          {
+              if (surround_capture_edge())
+                  mask |= s;
+          }
+          else
+          {
+              if (surround_capture_opposite() && ((usPieces & oppSquare & occupied) || (oppSquare == moverSq) || (surround_capture_hostile_region() & oppSquare)))
+                  mask |= s;
+          }
+      }
+  }
+  if (surround_capture_intervene())
+  {
+      for (const Direction& d : var->connectDirections)
+      {
+          Square s1 = moverSq + d;
+          Square s2 = moverSq - d;
+          if (is_ok(s1) && is_ok(s2) && (themPieces & s1 & occupied) && (themPieces & s2 & occupied))
+              mask |= square_bb(s1) | s2;
+      }
+  }
+  return mask;
+}
+
+
+Bitboard Position::compute_remove_connect_n_mask(
+    const std::vector<Bitboard>& baseLines,
+    Bitboard alreadyRemoved,
+    Bitboard blastMask,
+    Bitboard& connectMask) const
+{
+    Bitboard removalMask = 0;
+
+    if (blast_promotion() && blastMask)
+    {
+        Bitboard b = blastMask;
+        while (b)
+        {
+            Square sq = pop_lsb(b);
+            Piece p = piece_on(sq);
+            if (p != NO_PIECE && promoted_piece_type(type_of(p)) != NO_PIECE_TYPE)
+                alreadyRemoved &= ~square_bb(sq);
+        }
+    }
+
+    auto mark_line = [&](Bitboard line) {
+        for (Direction d : var->connectDirections)
+        {
+            if (topology_wraps())
+            {
+                auto [dr, df] = decode_direction(d);
+                Bitboard lineSquares = line;
+                while (lineSquares)
+                {
+                    Square end = pop_lsb(lineSquares);
+                    Bitboard seq = square_bb(end);
+                    Square cur = end;
+                    bool ok = true;
+
+                    for (int i = 1; i < remove_connect_n(); ++i)
+                    {
+                        Square prev = SQ_NONE;
+                        if (!wrapped_destination_square(cur, -df, -dr, max_file(), max_rank(), wraps_files(), wraps_ranks(), prev))
+                        {
+                            ok = false;
+                            break;
+                        }
+
+                        Bitboard prev_bb = square_bb(prev);
+                        if (!(line & prev_bb))
+                        {
+                            ok = false;
+                            break;
+                        }
+
+                        seq |= prev_bb;
+                        cur = prev;
+                    }
+
+                    if (ok)
+                    {
+                        removalMask |= seq;
+                        connectMask |= seq;
+                    }
+                }
+            }
+            else
+            {
+                Bitboard temp = line;
+                for (int i = 1; i < remove_connect_n(); ++i)
+                    temp &= shift(d, temp);
+                Bitboard lineStarts = temp;
+                while (lineStarts)
+                {
+                    Square start = pop_lsb(lineStarts);
+                    for (int i = 0; i < remove_connect_n(); ++i)
+                    {
+                        Square sq = start - i * d;
+                        if (is_ok(sq))
+                        {
+                            removalMask |= sq;
+                            connectMask |= sq;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    if (remove_connect_n_by_type())
+    {
+        for (PieceSet ps = variant()->pieceTypes; ps; )
+        {
+            PieceType pt = pop_lsb(ps);
+            Bitboard line = baseLines[pt];
+            if (blast_promotion() && blastMask)
+            {
+                Bitboard b = blastMask;
+                while (b)
+                {
+                    Square sq = pop_lsb(b);
+                    Piece p = piece_on(sq);
+                    if (p == NO_PIECE)
+                        continue;
+                    PieceType fromPt = type_of(p);
+                    PieceType toPt = promoted_piece_type(fromPt);
+                    if (fromPt == pt)
+                        line &= ~square_bb(sq);
+                    if (toPt == pt)
+                        line |= square_bb(sq);
+                }
+            }
+            line &= ~(alreadyRemoved & ~connectMask);
+            mark_line(line);
+        }
+    }
+    else
+    {
+        Bitboard whiteLine = baseLines[WHITE];
+        Bitboard blackLine = baseLines[BLACK];
+        if (blast_promotion() && blastMask)
+        {
+            Bitboard b = blastMask;
+            while (b)
+            {
+                Square sq = pop_lsb(b);
+                Piece p = piece_on(sq);
+                if (p == NO_PIECE)
+                    continue;
+                if (promoted_piece_type(type_of(p)) == NO_PIECE_TYPE)
+                {
+                    if (color_of(p) == WHITE)
+                        whiteLine &= ~square_bb(sq);
+                    else
+                        blackLine &= ~square_bb(sq);
+                }
+            }
+        }
+        whiteLine &= ~(alreadyRemoved & ~connectMask);
+        blackLine &= ~(alreadyRemoved & ~connectMask);
+        mark_line(whiteLine);
+        mark_line(blackLine);
+    }
+
+    return removalMask;
+}
+
+
 /// Position::legal() tests whether a pseudo-legal move is legal
 
 bool Position::legal(Move m) const {
+  SimulatedMoveGuard guard(*this, m);
 
   assert(is_ok(m));
   assert(!is_drop_move(m) || piece_drops());
@@ -2736,22 +3238,7 @@ bool Position::legal(Move m) const {
       if (!(edge_insert_region(us) & to))
           return false;
 
-      int df = int(file_of(from)) - int(file_of(to));
-      int dr = int(rank_of(from)) - int(rank_of(to));
-      if (std::abs(df) + std::abs(dr) != 1)
-          return false;
-
-      bool dirOk = false;
-      if (df == 0 && dr == -1)
-          dirOk = edge_insert_from_top(us) && rank_of(to) == max_rank();
-      else if (df == 0 && dr == 1)
-          dirOk = edge_insert_from_bottom(us) && rank_of(to) == RANK_1;
-      else if (df == 1 && dr == 0)
-          dirOk = edge_insert_from_left(us) && file_of(to) == FILE_A;
-      else if (df == -1 && dr == 0)
-          dirOk = edge_insert_from_right(us) && file_of(to) == max_file();
-
-      if (!dirOk)
+      if (!edge_insert_direction_ok(us, from, to))
           return false;
 
       if (!empty(to) && !push_move(m))
@@ -2766,30 +3253,9 @@ bool Position::legal(Move m) const {
       && !is_pass(m))
       return false;
 
-  Bitboard freezeExtra = 0;
-  Bitboard jumpRemoved = 0;
-  Variant::PotionType gatingPotion = Variant::POTION_TYPE_NB;
-  if (is_gating(m))
-  {
-      gatingPotion = potion_type_from_piece(var, gating_type(m));
-      if (gatingPotion != Variant::POTION_TYPE_NB)
-      {
-          if (!can_cast_potion(us, gatingPotion))
-              return false;
-          if (gatingPotion == Variant::POTION_FREEZE)
-              freezeExtra = freeze_zone_from_square(gating_square(m));
-          else if (gatingPotion == Variant::POTION_JUMP)
-          {
-              jumpRemoved = square_bb(gating_square(m));
-              if (!piece_on(gating_square(m)))
-                  return false;
-          }
-      }
-  }
-
-  ScopedSpellContext spellScope(freezeExtra, jumpRemoved);
-  bool pureWallMove = is_gating(m) && gatingPotion == Variant::POTION_TYPE_NB
-                   && walling(us) && wall_or_move() && from == to;
+  PotionContext potCtx = setup_potion_context(m, us);
+  if (!potCtx.valid)
+      return false;
 
   if (!dropMove && (freeze_squares() & from))
       return false;
@@ -2804,12 +3270,19 @@ bool Position::legal(Move m) const {
       if (freeze_squares() & rookFrom)
           return false;
   }
-  if (type_of(m) == CASTLING && gamePly < var->castlingForbiddenPlies)
-      return false;
-  if (jumpRemoved && (square_bb(to) & jumpRemoved))
+  if (potCtx.jumpRemoved && (square_bb(to) & potCtx.jumpRemoved))
       return false;
 
-  if (from == to && !(is_pass(m) || is_self_destruct(m) || (type_of(m) == PROMOTION && sittuyin_promotion()) || pureWallMove))
+  ScopedSpellContext spellScope(potCtx.freezeExtra, potCtx.jumpRemoved);
+  const bool isCapture = capture(m);
+  const Square shotSq = isCapture ? capture_square(m) : to;
+  bool pureWallMove = is_gating(m) && potCtx.potion == Variant::POTION_TYPE_NB
+                   && walling(us) && wall_or_move() && from == to;
+
+  if (type_of(m) == CASTLING && gamePly < var->castlingForbiddenPlies)
+      return false;
+
+  if (from == to && !(is_pass(m) || is_self_destruct(m) || (is_promotion_move(m) && sittuyin_promotion()) || pureWallMove))
       return false;
 
   if (st->pendingClaimPass)
@@ -2824,7 +3297,7 @@ bool Position::legal(Move m) const {
           return false;
   }
 
-  bool rifleShot = rifle_capture(m) && capture(m) && type_of(m) != CASTLING;
+  bool rifleShot = rifle_capture(m) && isCapture && type_of(m) != CASTLING;
   bool cloneMove = is_clone_move(m);
   bool pullMove = is_pull_move(m);
   if (cloneMove && !(clone_targets_from(us, from) & to))
@@ -2846,14 +3319,26 @@ bool Position::legal(Move m) const {
               return false;
       }
   }
-  Square shotSq = capture(m) ? capture_square(m) : to;
   Bitboard removedAttackers = rifleShot ? square_bb(shotSq) : Bitboard(0);
   Square effectiveTo = rifleShot ? from : to;
+  Square captureBlastCenter = blast_on_capture_mover_center() ? effectiveTo : shotSq;
   Piece moverPiece = moved_piece(m);
   PieceType movePt = type_of(moverPiece);
   PieceType finalMovePt = movePt;
 
-  if (type_of(m) == PROMOTION)
+  Bitboard janggiCannons = pieces(JANGGI_CANNON);
+  if (!is_pass(m))
+  {
+      if (type_of(moverPiece) == JANGGI_CANNON)
+          janggiCannons = rifleShot ? (janggiCannons & ~square_bb(shotSq))
+                                    : ((!dropMove ? janggiCannons ^ from : janggiCannons) | to);
+      else if (janggiCannons & (rifleShot ? square_bb(shotSq) : square_bb(to)))
+          janggiCannons ^= (rifleShot ? square_bb(shotSq) : square_bb(to));
+  }
+
+  Bitboard janggiCannonsAfter = janggiCannons;
+
+  if (is_promotion_move(m))
       finalMovePt = promotion_type(m);
   else if (type_of(m) == PIECE_PROMOTION)
       finalMovePt = promoted_piece_type(movePt);
@@ -2866,11 +3351,11 @@ bool Position::legal(Move m) const {
 
   if (   !dropMove
       && type_of(m) != CASTLING
-      && type_of(m) != PROMOTION
+      && !is_promotion_move(m)
       && type_of(m) != PIECE_PROMOTION
       && !is_pass(m))
   {
-      if (capture_morph() && capture(m))
+      if (capture_morph() && isCapture)
       {
           Piece captured = piece_on(shotSq);
           if (captured != NO_PIECE)
@@ -2882,13 +3367,13 @@ bool Position::legal(Move m) const {
           finalMovePt = moveMorphType;
   }
 
-  if (type_of(m) == PROMOTION && !promotion_allowed(us, promotion_type(m), to))
+  if (is_promotion_move(m) && !promotion_allowed(us, promotion_type(m), to))
       return false;
   if (type_of(m) == PIECE_PROMOTION && (is_promoted(from) || !promotion_allowed(us, promoted_piece_type(type_of(moved_piece(m))))))
       return false;
-  if (rifleShot && (type_of(m) == PROMOTION || type_of(m) == PIECE_PROMOTION))
+  if (rifleShot && (is_promotion_move(m) || type_of(m) == PIECE_PROMOTION))
       return false;
-  if (!dropMove && type_of(m) != PROMOTION && type_of(m) != PIECE_PROMOTION)
+  if (!dropMove && !is_promotion_move(m) && type_of(m) != PIECE_PROMOTION)
   {
       Piece mover = moved_piece(m);
       Bitboard mandatoryZone = mover == NO_PIECE ? Bitboard(0) : mandatory_promotion_zone(mover);
@@ -2896,14 +3381,28 @@ bool Position::legal(Move m) const {
           return false;
   }
 
-  assert(is_pass(m) || color_of(moved_piece(m)) == us);
-  assert(!count(us, king_type()) || piece_on(square(us, king_type())) == make_piece(us, king_type()));
-  assert(board_bb() & to);
+  [[maybe_unused]] Color movedPieceColor = dropMove ? drop_hand_color(us, in_hand_piece_type(m)) : us;
+  assert(is_pass(m) || pureWallMove || color_of(moved_piece(m)) == movedPieceColor);
+  assert(royal_square(us) == SQ_NONE || piece_on(royal_square(us)) == make_piece(us, royal_piece_type(us)));
+  assert(is_pass(m) || pureWallMove || (board_bb() & to));
 
-  const PieceType royalType = king_type();
-  const bool hasRoyal = count(us, royalType);
-  const Square royalSquare = hasRoyal ? square(us, royalType) : SQ_NONE;
-  const bool moverIsRoyal = type_of(moved_piece(m)) == royalType;
+  const Square royalSquare = royal_square(us);
+  const bool hasRoyal = royalSquare != SQ_NONE;
+  const PieceType royalType = hasRoyal ? type_of(piece_on(royalSquare)) : NO_PIECE_TYPE;
+  if (!is_pass(m) && !hasRoyal && royal_piece_type(us) != NO_PIECE_TYPE && is_actual_runtime_royal(us, king_type()))
+      return false;
+
+  if (pureWallMove)
+  {
+      if (must_capture() && has_capture())
+          return false;
+
+      Bitboard occupied = pieces() | gating_square(m);
+      return (allow_checks() || !hasRoyal || !attackers_to_king(royalSquare, occupied, them, janggiCannonsAfter))
+          && !violates_same_player_board_repetition(m);
+  }
+
+  const bool moverIsRoyal = hasRoyal && type_of(moved_piece(m)) == royalType;
 
   if (forced_jump_continuation() && st->forcedJumpSquare != SQ_NONE)
   {
@@ -2921,85 +3420,44 @@ bool Position::legal(Move m) const {
               return false;
       }
   }
-  PieceSet jumpTypes = jump_capture_types();
-  bool jumpTypeMover = (jumpTypes & ALL_PIECES) || (jumpTypes & type_of(moved_piece(m)));
-  if ((type_of(m) == NORMAL || type_of(m) == PROMOTION) && jumpTypeMover && !empty(to))
-      return false;
-  if ((type_of(m) == NORMAL || type_of(m) == PROMOTION) && jumpTypeMover)
-  {
-      int df = std::abs(int(file_of(to)) - int(file_of(from)));
-      int dr = std::abs(int(rank_of(to)) - int(rank_of(from)));
-      bool isHop = std::max(df, dr) == 2 && (df == 0 || dr == 0 || df == dr);
-      if (isHop && jump_capture_square(from, to) == SQ_NONE)
-          return false;
-  }
+  // Universal-hopper semantics are fully encoded in attacks/moves generation and
+  // jump_capture_square() capture-square resolution; avoid legacy pre-filters here.
   if (!allow_checks() && checking_permitted() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
       return false;
-  if (!dropMove && (var->mutuallyHopIllegalTypes & movePt) && (AttackRiderTypes[movePt] & HOPPING_RIDERS))
-  {
-      Bitboard between = between_bb(from, to);
-      Bitboard hopIllegalPieces = 0;
-      for (PieceSet ps = var->mutuallyHopIllegalTypes; ps;)
-          hopIllegalPieces |= pieces(pop_lsb(ps));
-      if ((between & pieces()) && ((between | to) & hopIllegalPieces))
-          return false;
-  }
+  if ((pieces(us) & to) && !is_pass(m) && !is_self_destruct(m) && is_uncapturable_royal_square(us, to))
+      return false;
+  if (!dropMove && violates_mutual_hop_restriction(from, to, movePt))
+      return false;
+
+  OptBool gives = NO_VALUE;
+  auto move_gives_check = [&]() {
+      if (gives == NO_VALUE)
+          gives = gives_check(m) ? VALUE_TRUE : VALUE_FALSE;
+      return gives == VALUE_TRUE;
+  };
 
   // Illegal checks
-  if (((!checking_permitted() && !allow_checks()) || (sittuyin_promotion() && type_of(m) == PROMOTION) || (!drop_checks() && dropMove)) && gives_check(m))
+  if (((!checking_permitted() && !allow_checks()) || (sittuyin_promotion() && is_promotion_move(m)) || (!drop_checks() && dropMove)) && move_gives_check())
       return false;
 
   // Optional rule: disallow checkmate by drops.
   // Shogi pawn-drop mate rule is a stricter piece-specific version.
   if (   dropMove
-      && gives_check(m)
+      && move_gives_check()
       && (   !drop_mates()
           || (shogi_pawn_drop_mate_illegal() && type_of(moved_piece(m)) == SHOGI_PAWN)))
   {
-      StateInfo setupState, nextState;
-      Position p;
-      p.set(variant(), fen(), is_chess960(), &setupState, this_thread());
-      p.do_move(m, nextState, true);
-      if (p.evasion_checkers() && MoveList<LEGAL>(p).size() == 0)
+      StateInfo nextState;
+      ScopedProbeMove probe(*this, m, nextState);
+      if (evasion_checkers() && !has_legal_move_ignoring_immediate_end())
           return false;
   }
 
   // Illegal quiet moves
-  if (must_capture() && !capture(m) && has_capture())
+  if (must_capture() && !isCapture && has_capture())
       return false;
 
-  if (swapMove)
-  {
-      if (violates_same_player_board_repetition(m))
-          return false;
-
-      Position probe;
-      StateInfo setupState, nextState;
-      probe.set(variant(), fen(), is_chess960(), &setupState, this_thread());
-      probe.do_move(m, nextState, false);
-      if (!allow_checks() && probe.count(us, probe.king_type()) && probe.attackers_to_king(probe.square(us, probe.king_type()), them))
-          return false;
-      return true;
-  }
-
-  if (pullMove)
-  {
-      if (violates_same_player_board_repetition(m))
-          return false;
-
-      Position probe;
-      StateInfo setupState, nextState;
-      probe.set(variant(), fen(), is_chess960(), &setupState, this_thread());
-      probe.do_move(m, nextState, false);
-      if (!allow_checks() && probe.count(us, probe.king_type()) && probe.attackers_to_king(probe.square(us, probe.king_type()), them))
-          return false;
-      return true;
-  }
   if (must_capture_en_passant() && type_of(m) != EN_PASSANT && has_en_passant_capture())
-      return false;
-
-  // Illegal captures
-  if (!allow_checks() && checking_permitted() && (pieces(them) & to) && type_of(piece_on(to)) == KING)
       return false;
 
   // Illegal non-drop moves
@@ -3025,6 +3483,19 @@ bool Position::legal(Move m) const {
       }
   }
 
+  if (swapMove || pullMove)
+  {
+      if (violates_same_player_board_repetition(m))
+          return false;
+
+      StateInfo nextState;
+      ScopedProbeMove probe(*this, m, nextState);
+      Square probeRoyal = royal_square(us);
+      if (!allow_checks() && probeRoyal != SQ_NONE && attackers_to_king(probeRoyal, them))
+          return false;
+      return true;
+  }
+
   // Illegal drop move
   if (dropMove)
   {
@@ -3034,7 +3505,10 @@ bool Position::legal(Move m) const {
       {
           legalDropTargets |= pieces(them);
           if (self_capture(in_hand_piece_type(m)))
-              legalDropTargets |= pieces(us) & ~pieces(us, KING);
+          {
+              Bitboard ownRoyal = royal_square(us) != SQ_NONE ? square_bb(royal_square(us)) : Bitboard(0);
+              legalDropTargets |= pieces(us) & ~ownRoyal;
+          }
       }
 
       if (!(drop_region(us, type_of(moved_piece(m))) & legalDropTargets & to))
@@ -3309,8 +3783,9 @@ bool Position::legal(Move m) const {
       {
           if ((capture(m) || rifleShot) && blast_on_capture(m))
           {
-              moverRemovedByBlast = zero_range_blast_on_capture(m)
-                                 || (blast_center() && effectiveTo == shotSq);
+              moverRemovedByBlast = (blast_on_capture(moved_piece(m), captured_piece(m))
+                                     && blast_center() && !blast_orthogonals() && !blast_diagonals())
+                                 || (blast_center() && effectiveTo == captureBlastCenter);
           }
           else if ((blast_on_move() && !capture(m) && !is_self_destruct(m))
                 || (blast_on_self_destruct() && is_self_destruct(m)))
@@ -3321,12 +3796,12 @@ bool Position::legal(Move m) const {
 
       if (!moverRemovedByBlast)
       {
-          const PieceInfo* pi = pieceMap.get(pt);
-          bool hasPotentialMove = PseudoMoves[0][us][pt][to] & board_bb();
-          if (is_pure_hopper_like(pi))
-              hasPotentialMove = has_hopper_potential_from_square(*this, us, pt, to);
-          if (   !hasPotentialMove
-              && !(jump_capture_types() & ALL_PIECES) && !(jump_capture_types() & pt))
+          PieceType movePt2 = effective_piece_type(pt);
+          const PieceInfo* pInfo2 = pieceMap.get(movePt2);
+          bool hasPotentialMove = PseudoMoves[0][us][movePt2][to] & board_bb();
+          if (pInfo2->has_hopper_like_movement())
+              hasPotentialMove = has_hopper_potential_from_square(*this, us, movePt2, to);
+          if (!hasPotentialMove)
               return false;
       }
   }
@@ -3348,13 +3823,117 @@ bool Position::legal(Move m) const {
           return false;
   }
 
+  if (is_pass(m))
+  {
+      Bitboard occupied = pieces();
+      return (st->bikjang
+           || allow_checks()
+           || !hasRoyal
+           || !(attackers_to_king(royalSquare, occupied, them, janggiCannonsAfter) & occupied & ~removedAttackers))
+          && !violates_same_player_board_repetition(m);
+  }
+
+  Bitboard postMoveOccupied;
+  if (type_of(m) == CASTLING)
+  {
+      Square kfrom = from;
+      Square rfrom = to;
+      Square kto, rto;
+      castling_destinations(sideToMove, kfrom, rfrom, kto, rto);
+      postMoveOccupied = (pieces() ^ kfrom ^ rfrom) | kto | rto;
+  }
+  else
+      postMoveOccupied = rifleShot ? (pieces() ^ square_bb(shotSq))
+                           : (((!dropMove ? pieces() ^ from : pieces()) ^ square_bb(shotSq)) | to);
+
+  if (paired_drop(m))
+      postMoveOccupied |= square_bb(secondary_drop_square(m));
+
+  Bitboard removedByEffects = 0;
+  Bitboard structuralRemoval = 0;
+  if (!is_pass(m))
+  {
+      if (((capture(m) || rifleShot) && blast_on_capture(m))
+          || (blast_on_move() && !capture(m) && !is_self_destruct(m))
+          || (blast_on_self_destruct() && is_self_destruct(m)))
+      {
+          Square blastCenter = (capture(m) || rifleShot) ? captureBlastCenter : effectiveTo;
+          Bitboard blastRelevant = postMoveOccupied & ~blast_immune_bb();
+          Bitboard adjacentBlastRelevant = blastRelevant & ~pieces(PAWN);
+          removedByEffects |= blast_pattern(blastCenter) & adjacentBlastRelevant;
+          if (blast_center())
+              removedByEffects |= square_bb(blastCenter) & blastRelevant;
+          if (blast_on_capture(m) && (blast_immune_types() & movePt))
+              removedByEffects &= ~square_bb(effectiveTo);
+          else if (blast_on_capture(moved_piece(m), captured_piece(m)) && blast_center() && !blast_orthogonals() && !blast_diagonals())
+              removedByEffects |= square_bb(effectiveTo);
+      }
+
+      if ((capture(m) || rifleShot) && (var->petrifyOnCaptureTypes & movePt))
+          removedByEffects |= square_bb(effectiveTo);
+
+      // Surround capture
+      if (surround_capture_opposite() || surround_capture_intervene() || surround_capture_edge())
+      {
+          Bitboard usPostMove = dropMove ? (pieces(us) | effectiveTo) : (pieces(us) ^ from ^ effectiveTo);
+          Bitboard surroundMask = compute_surround_capture_mask(effectiveTo, usPostMove, (pieces(~us) & ~square_bb(shotSq)), postMoveOccupied);
+          removedByEffects |= surroundMask;
+          structuralRemoval |= surroundMask;
+      }
+      // Remove connect N
+      if (remove_connect_n() > 0)
+      {
+          std::vector<Bitboard> baseLines;
+          if (remove_connect_n_by_type())
+          {
+              baseLines.resize(PIECE_TYPE_NB, 0);
+              for (PieceSet ps = variant()->pieceTypes; ps; )
+              {
+                  PieceType pt = pop_lsb(ps);
+                  Bitboard line = pieces(pt);
+                  if (!dropMove) line &= ~from;
+                  if (movePt == pt) line |= effectiveTo;
+                  if (capture(m) && type_of(captured_piece(m)) == pt) line &= ~shotSq;
+                  baseLines[pt] = line;
+              }
+          }
+          else
+          {
+              baseLines.resize(COLOR_NB, 0);
+              Bitboard whiteLine = pieces(WHITE), blackLine = pieces(BLACK);
+              if (!dropMove) { if (us == WHITE) whiteLine &= ~from; else blackLine &= ~from; }
+              if (us == WHITE) whiteLine |= effectiveTo; else blackLine |= effectiveTo;
+              if (capture(m)) { if (us == WHITE) blackLine &= ~shotSq; else whiteLine &= ~shotSq; }
+              baseLines[WHITE] = whiteLine;
+              baseLines[BLACK] = blackLine;
+          }
+          Bitboard connectMask = 0;
+          Bitboard blast_mask = 0;
+          if (blast_promotion() && !is_pass(m))
+          {
+              const bool blastOnCaptureMove = (capture(m) || rifleShot) && blast_on_capture(m);
+              if (blastOnCaptureMove || (blast_on_move() && !capture(m) && !is_self_destruct(m)) || (blast_on_self_destruct() && is_self_destruct(m)))
+              {
+                  Square blastCenter = (capture(m) || rifleShot) ? captureBlastCenter : effectiveTo;
+                  blast_mask = blast_squares(blastCenter);
+                  Square moverSq = rifleShot ? from : to;
+                  if (blastOnCaptureMove && !blast_on_capture_mover_center())
+                      blast_mask &= ~square_bb(moverSq);
+              }
+          }
+          Bitboard removalMask = compute_remove_connect_n_mask(baseLines, removedByEffects, blast_mask, connectMask);
+          removedByEffects |= removalMask;
+          structuralRemoval |= removalMask;
+      }
+  }
+  postMoveOccupied &= ~structuralRemoval;
+
   // Check for attacks to pseudo-royal pieces
   if (pseudo_royal_types())
   {
       const bool blastOnCapture = blast_on_capture(m);
-      const bool zeroRangeBlastOnCapture = zero_range_blast_on_capture(m);
       Square kto = rifleShot ? from : to;
-      Square blastCenter = (type_of(m) == EN_PASSANT || rifleShot) ? shotSq : kto;
+      Square blastCenter = (capture(m) || rifleShot) ? captureBlastCenter : kto;
       Bitboard occupied = rifleShot ? pieces() : (!dropMove && !cloneMove ? pieces() ^ from : pieces());
       Bitboard blastImmune = blastOnCapture ? blast_immune_bb() : Bitboard(0);
       if (walling_rule() == DUCK)
@@ -3365,19 +3944,19 @@ bool Position::legal(Move m) const {
       {
           // After castling, the rook and king final positions are the same in
           // Chess960 as they would be in standard chess.
-          kto = make_square(to > from ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
+          Square castlingRto;
+          castling_destinations(us, from, to, kto, castlingRto);
           Direction step = kto > from ? EAST : WEST;
-          Square rto = kto - (to > from ? EAST : WEST);
           // Pseudo-royal king
           if (st->pseudoRoyals & from)
               // Loop over squares between the king and its final position
               // Ensure to include the initial square if from == kto
               for (Square s = from; from != kto ? s != kto : s == from; s += step)
                   if (  !(blastOnCapture && (blast_pattern(s) & st->pseudoRoyals & pieces(~sideToMove) & ~blastImmune))
-                      && (attackers_to(s, occupied, ~us) & ~removedAttackers))
+                      && (attackers_to(s, occupied, ~us, janggiCannonsAfter) & occupied & ~removedAttackers))
                       return false;
           // Move the rook
-          occupied ^= to | rto;
+          occupied ^= to | castlingRto;
       }
       if (!rifleShot)
           occupied |= kto;
@@ -3390,9 +3969,8 @@ bool Position::legal(Move m) const {
           occupied &= ~blast_squares(blastCenter);
           if (blast_immune_types() & movePt)
               occupied |= square_bb(kto);
-          else if (zeroRangeBlastOnCapture)
-              occupied &= ~square_bb(kto);
       }
+      occupied &= ~removedByEffects;
       // Petrifying a pseudo-royal piece is illegal
       if (capture(m) && (var->petrifyOnCaptureTypes & type_of(moved_piece(m))) && (st->pseudoRoyals & from))
           return false;
@@ -3409,7 +3987,7 @@ bool Position::legal(Move m) const {
           pseudoRoyals |= kto;
       else if (!rifleShot && is_ok(from) && (pseudoRoyals & from))
           pseudoRoyals ^= square_bb(from) ^ kto;
-      if (type_of(m) == PROMOTION && (pseudo_royal_types() & promotion_type(m)))
+      if (is_promotion_move(m) && (pseudo_royal_types() & promotion_type(m)))
       {
           if (count(sideToMove, promotion_type(m)) >= pseudo_royal_count())
               // increase in count leads to loss of pseudo-royalty
@@ -3430,9 +4008,10 @@ bool Position::legal(Move m) const {
           while (pseudoRoyals)
           {
               Square sr = pop_lsb(pseudoRoyals);
+              PieceType pt = (sr == kto) ? finalMovePt : type_of(piece_on(sr));
               // Touching pseudo-royal pieces are immune
               if (  !(blastOnCapture && (pseudoRoyalsTheirs & blast_pattern(sr) & ~blastImmune))
-                  && (attackers_to(sr, occupied, ~us) & ~removedAttackers & attackerCandidatesTheirs))
+                  && (attackers_to_king(sr, occupied, ~us, janggiCannonsAfter, pt) & occupied & ~removedAttackers & attackerCandidatesTheirs))
                   return false;
           }
       // Look for duple check
@@ -3443,15 +4022,16 @@ bool Position::legal(Move m) const {
               pseudoRoyalCandidates |= kto;
           else if (!rifleShot && is_ok(from) && (pseudoRoyalCandidates & from))
               pseudoRoyalCandidates ^= square_bb(from) ^ kto;
-          if (type_of(m) == PROMOTION && (pseudo_royal_types() & promotion_type(m)))
+          if (is_promotion_move(m) && (pseudo_royal_types() & promotion_type(m)))
               pseudoRoyalCandidates |= kto;
           bool allCheck = bool(pseudoRoyalCandidates);
           while (allCheck && pseudoRoyalCandidates)
           {
               Square sr = pop_lsb(pseudoRoyalCandidates);
+              PieceType pt = (sr == kto) ? finalMovePt : type_of(piece_on(sr));
               // Touching pseudo-royal pieces are immune
               if (!(  !(blastOnCapture && (pseudoRoyalsTheirs & blast_pattern(sr) & ~blastImmune))
-                    && (attackers_to(sr, occupied, ~us) & ~removedAttackers & attackerCandidatesTheirs)))
+                    && (attackers_to_king(sr, occupied, ~us, janggiCannonsAfter, pt) & occupied & ~removedAttackers & attackerCandidatesTheirs)))
                   allCheck = false;
           }
           if (allCheck)
@@ -3460,25 +4040,24 @@ bool Position::legal(Move m) const {
   }
 
   // Anti-royal pieces must remain under attack.
-  if (anti_royal_types())
-  {
-      const bool blastOnCapture = blast_on_capture(m);
-      const bool zeroRangeBlastOnCapture = zero_range_blast_on_capture(m);
-      Square kto = rifleShot ? from : to;
-      Square blastCenter = (type_of(m) == EN_PASSANT || rifleShot) ? shotSq : kto;
-      Square rfrom = SQ_NONE, rto = SQ_NONE;
-      Bitboard occupied = rifleShot ? pieces() : (!dropMove ? pieces() ^ from : pieces());
-      Bitboard blastImmune = blastOnCapture ? blast_immune_bb() : Bitboard(0);
+      if (anti_royal_types())
+      {
+          const bool blastOnCapture = blast_on_capture(m);
+          Square kto = rifleShot ? from : to;
+          Square blastCenter = (capture(m) || rifleShot) ? captureBlastCenter : kto;
+          Square rfrom = SQ_NONE, rto = SQ_NONE;
+          Bitboard occupied = rifleShot ? pieces() : (!dropMove ? pieces() ^ from : pieces());
+          Bitboard blastImmune = blastOnCapture ? blast_immune_bb() : Bitboard(0);
       if (walling_rule() == DUCK)
           occupied ^= st->wallSquares;
       if (walling(us) || is_gating(m))
           occupied |= gating_square(m);
       if (type_of(m) == CASTLING)
       {
-          kto = make_square(to > from ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
+          Square castlingRto;
+          castling_destinations(us, from, to, kto, castlingRto);
           rfrom = to;
-          rto = kto - (to > from ? EAST : WEST);
-          occupied ^= to | rto;
+          occupied ^= to | castlingRto;
       }
       if (!rifleShot)
           occupied |= kto;
@@ -3489,9 +4068,8 @@ bool Position::legal(Move m) const {
           occupied &= ~blast_squares(blastCenter);
           if (blast_immune_types() & movePt)
               occupied |= square_bb(kto);
-          else if (zeroRangeBlastOnCapture)
-              occupied &= ~square_bb(kto);
       }
+      occupied &= ~removedByEffects;
 
       Bitboard antiRoyals = 0;
       for (PieceSet ps = anti_royal_types(); ps; )
@@ -3523,17 +4101,17 @@ bool Position::legal(Move m) const {
                       antiRoyals |= square_bb(secondary_drop_square(m));
               }
           }
-      }
-      if (is_ok(rfrom) && (antiRoyals & rfrom))
-          antiRoyals ^= square_bb(rfrom) ^ rto;
+          }
+          if (is_ok(rfrom) && (antiRoyals & rfrom))
+              antiRoyals ^= square_bb(rfrom) ^ rto;
 
-      Bitboard vulnerableEnemyRoyals = blastOnCapture
-                                     ? ((st->pseudoRoyals | pieces(king_type())) & pieces(~us) & occupied) & ~blastImmune
-                                     : Bitboard(0);
+          Bitboard vulnerableEnemyRoyals = blastOnCapture
+                                         ? ((st->pseudoRoyals | pieces(king_type())) & pieces(~us) & occupied) & ~blastImmune
+                                         : Bitboard(0);
       while (antiRoyals)
       {
           Square sr = pop_lsb(antiRoyals);
-          Bitboard attackers = attackers_to(sr, occupied, ~us);
+          Bitboard attackers = attackers_to(sr, occupied, ~us, janggiCannonsAfter) & occupied;
           if (anti_royal_king_mutually_immune())
               attackers &= ~pieces(~us, king_type());
           if (!(occupied & sr)
@@ -3563,7 +4141,7 @@ bool Position::legal(Move m) const {
       assert(ep_squares() & to);
       assert(piece_on(to) == NO_PIECE);
 
-      return !((attackers_to_king(ksq, occupied, ~us) & ~removedAttackers) & occupied)
+      return !((attackers_to_king(ksq, occupied, ~us, janggiCannonsAfter) & ~removedAttackers) & occupied)
           && !violates_same_player_board_repetition(m);
   }
 
@@ -3578,12 +4156,12 @@ bool Position::legal(Move m) const {
           rookFrom = castling_rook_square(us & (to > from ? KING_SIDE : QUEEN_SIDE));
       // After castling, the rook and king final positions are the same in
       // Chess960 as they would be in standard chess.
-      to = make_square(to > from ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
+      Square castlingRto;
+      castling_destinations(us, from, rookFrom, to, castlingRto);
       Direction step = to > from ? WEST : EAST;
 
       // Will the gate be blocked by king or rook?
-      Square rto = to + (to_sq(m) > from_sq(m) ? WEST : EAST);
-      if (is_gating(m) && (gating_square(m) == to || gating_square(m) == rto))
+      if (is_gating(m) && (gating_square(m) == to || gating_square(m) == castlingRto))
           return false;
 
       // Non-royal castlers are not impeded by attacked transit squares.
@@ -3598,8 +4176,8 @@ bool Position::legal(Move m) const {
       // "cannot castle through attack", with frozen attackers ignored.
       bool spellLikeCastler = type_of(piece_on(from)) != KING && potions_enabled();
       auto attackers_for_castling = [&](Square s, Bitboard occ) {
-          Bitboard att = spellLikeCastler ? attackers_to(s, occ, ~us)
-                                          : attackers_to_king(s, occ, ~us);
+          Bitboard att = spellLikeCastler ? attackers_to(s, occ, ~us, janggiCannonsAfter)
+                                          : attackers_to_king(s, occ, ~us, janggiCannonsAfter);
           att &= ~removedAttackers;
           if (spellLikeCastler)
               att &= ~freeze_squares(~us);
@@ -3622,47 +4200,9 @@ bool Position::legal(Move m) const {
           && !violates_same_player_board_repetition(m);
   }
 
-  Bitboard occupied;
-  if (type_of(m) == CASTLING)
-  {
-      Square kfrom = from;
-      Square rfrom = to;
-      Square kto = make_square(rfrom > kfrom ? castling_kingside_file() : castling_queenside_file(), castling_rank(sideToMove));
-      Square rto = kto + (rfrom > kfrom ? WEST : EAST);
-      occupied = (pieces() ^ kfrom ^ rfrom) | kto | rto;
-  }
-  else
-      occupied = rifleShot ? (pieces() ^ square_bb(shotSq))
-                           : (((!dropMove ? pieces() ^ from : pieces()) ^ square_bb(shotSq)) | to);
-
-  if (paired_drop(m))
-      occupied |= square_bb(secondary_drop_square(m));
-
-  Bitboard removedByEffects = 0;
-  if (!is_pass(m))
-  {
-      if (((capture(m) || rifleShot) && blast_on_capture(m))
-          || (blast_on_move() && !capture(m) && !is_self_destruct(m))
-          || (blast_on_self_destruct() && is_self_destruct(m)))
-      {
-          Square blastCenter = (capture(m) || rifleShot) ? shotSq : effectiveTo;
-          Bitboard blastRelevant = occupied & ~blast_immune_bb();
-          removedByEffects |= blast_pattern(blastCenter) & blastRelevant;
-          if (blast_center())
-              removedByEffects |= square_bb(blastCenter) & blastRelevant;
-          if (blast_on_capture(m) && (blast_immune_types() & movePt))
-              removedByEffects &= ~square_bb(effectiveTo);
-          else if (zero_range_blast_on_capture(m))
-              removedByEffects |= square_bb(effectiveTo);
-      }
-
-      if ((capture(m) || rifleShot) && (var->petrifyOnCaptureTypes & movePt))
-          removedByEffects |= square_bb(effectiveTo);
-  }
-
   if (var->blastPassiveTypes && !is_pass(m))
   {
-      Bitboard occupiedAfterEffects = occupied & ~removedByEffects;
+      Bitboard occupiedAfterEffects = postMoveOccupied & ~removedByEffects;
       Bitboard burnImmune = blast_immune_bb();
       Bitboard passiveBurners[COLOR_NB] = { Bitboard(0), Bitboard(0) };
       PieceSet passiveTypes = var->blastPassiveTypes;
@@ -3679,9 +4219,9 @@ bool Position::legal(Move m) const {
 
       if (type_of(m) == CASTLING)
       {
-          Square kto = make_square(to > from ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
+          Square kto, rto;
+          castling_destinations(us, from, to, kto, rto);
           Square rfrom = to;
-          Square rto = kto - (to > from ? EAST : WEST);
           Piece rook = piece_on(rfrom);
           if (var->blastPassiveTypes & piece_set(type_of(moved_piece(m))))
               passiveBurners[us] |= square_bb(kto);
@@ -3700,7 +4240,7 @@ bool Position::legal(Move m) const {
       else if (!rifleShot)
       {
           PieceType finalPt = movePt;
-          if (type_of(m) == PROMOTION)
+          if (is_promotion_move(m))
               finalPt = promotion_type(m);
           else if (type_of(m) == PIECE_PROMOTION)
               finalPt = promoted_piece_type(movePt);
@@ -3738,19 +4278,24 @@ bool Position::legal(Move m) const {
           return false;
   }
 
+  Bitboard occupiedAfterEffects = postMoveOccupied & ~removedByEffects;
+
   // Gated kings and pseudo-royals must not be introduced onto attacked squares.
   // If the move captures an attacker on its way, ignore that disappearing attack.
   if (is_gating(m) && gating_type(m) != NO_PIECE_TYPE)
   {
       PieceType gateType = gating_type(m);
-      if (gateType == KING || (pseudo_royal_types() & piece_set(gateType)))
+      if (gateType == KING
+          || is_actual_runtime_royal(us, gateType)
+          || (pseudo_royal_types() & piece_set(gateType)))
       {
           Square gate = gating_square(m);
-          Bitboard occ = occupied | gate;
+          Bitboard occ = occupiedAfterEffects | gate;
 
-          Bitboard attackers = gateType == KING ? attackers_to_king(gate, occ, ~us)
-                                                : attackers_to(gate, occ, ~us);
-          attackers &= ~removedAttackers;
+          Bitboard attackers = gateType == KING || is_actual_runtime_royal(us, gateType)
+                             ? attackers_to_king(gate, occ, ~us, janggiCannonsAfter)
+                             : attackers_to(gate, occ, ~us, janggiCannonsAfter);
+          attackers &= ~(removedAttackers | removedByEffects);
 
           if (attackers)
               return false;
@@ -3763,14 +4308,15 @@ bool Position::legal(Move m) const {
       return !violates_same_player_board_repetition(m);
   if ((var->flyingGeneral && hasRoyal) || st->bikjang)
   {
-      Square s = moverIsRoyal ? (rifleShot ? from : to) : royalSquare;
-      if (attacks_bb(~us, ROOK, s, occupied) & pieces(~us, KING) & ~square_bb(to))
+      Square generalSquare = st->bikjang && count<KING>(us) == 1 ? square<KING>(us) : royalSquare;
+      Square s = from == generalSquare ? (rifleShot ? from : to) : generalSquare;
+      if (attacks_bb(~us, ROOK, s, occupiedAfterEffects) & pieces(~us, KING) & ~square_bb(to))
           return false;
   }
   if (var->diagonalGeneral && hasRoyal)
   {
       Square s = moverIsRoyal ? (rifleShot ? from : to) : royalSquare;
-      if (attacks_bb(~us, BISHOP, s, occupied) & pieces(~us, KING) & ~square_bb(to))
+      if (attacks_bb(~us, BISHOP, s, occupiedAfterEffects) & pieces(~us, KING) & ~square_bb(to))
           return false;
   }
 
@@ -3778,14 +4324,14 @@ bool Position::legal(Move m) const {
   if (var->makpongRule && evasion_checkers() && moverIsRoyal && (evasion_checkers() ^ to))
       return false;
 
-  if (var->royalPieceNoThroughCheck && type_of(moved_piece(m)) == king_type())
+  if (var->royalPieceNoThroughCheck && moverIsRoyal)
   {
       Bitboard traversed = between_bb(from, to) & ~square_bb(to);
       while (traversed)
       {
           Square s = pop_lsb(traversed);
           Bitboard pathOccupied = (pieces() ^ from) | s;
-          if (attackers_to_king(s, pathOccupied, ~us) & ~removedAttackers)
+          if (attackers_to_king(s, pathOccupied, ~us, janggiCannonsAfter) & ~(removedAttackers | removedByEffects))
               return false;
       }
   }
@@ -3801,24 +4347,20 @@ bool Position::legal(Move m) const {
   // If the moving piece is a king, check whether the destination square is
   // attacked by the opponent.
   if (!allow_checks() && moverIsRoyal)
-      return !(attackers_to_king(rifleShot ? from : to, occupied, ~us) & ~removedAttackers)
+      return !(attackers_to_king(rifleShot ? from : to, occupiedAfterEffects, ~us, janggiCannonsAfter) & ~(removedAttackers | removedByEffects))
           && !violates_same_player_board_repetition(m);
 
   // Return early when without king
   if (!hasRoyal)
       return !violates_same_player_board_repetition(m);
 
-  Bitboard janggiCannons = pieces(JANGGI_CANNON);
-  if (type_of(moved_piece(m)) == JANGGI_CANNON)
-      janggiCannons = rifleShot ? (janggiCannons & ~square_bb(shotSq))
-                                : ((!dropMove ? janggiCannons ^ from : janggiCannons) | to);
-  else if (janggiCannons & to)
-      janggiCannons ^= to;
-
   // A non-king move is legal if the king is not under attack after the move.
-  return (allow_checks() || !(attackers_to_king(royalSquare, occupied, ~us, janggiCannons)
-                              & ~removedAttackers
-                              & ~(rifleShot ? Bitboard(0) : SquareBB[to])))
+  Bitboard postMoveAttackers = attackers_to_king(royalSquare, occupiedAfterEffects, ~us, janggiCannonsAfter);
+  bool blockedByPostMove = (postMoveAttackers
+                         & postMoveOccupied
+                         & ~(removedAttackers | removedByEffects)
+                         & ~(rifleShot ? Bitboard(0) : SquareBB[to])) != Bitboard(0);
+  return (allow_checks() || !blockedByPostMove)
       && !violates_same_player_board_repetition(m);
 }
 
@@ -3830,29 +4372,28 @@ bool Position::has_legal_move() const {
   if (is_immediate_game_end())
       return false;
 
-  ExtMove moveList[MOVEGEN_OVERFLOW_CAPACITY];
-  ExtMove* end;
+  return has_legal_move_ignoring_immediate_end();
+}
+
+bool Position::has_legal_move_ignoring_immediate_end() const {
 
   const bool useWrappedFallback = topology_wraps() && evasion_checkers();
   const bool useNonEvasions = anti_royal_types() || useWrappedFallback;
 
   if (evasion_checkers() && !useNonEvasions)
   {
-      end = generate<EVASIONS>(*this, moveList);
-      for (ExtMove* it = moveList; it != end; ++it)
-          if (legal(*it) && !virtual_drop(*it))
+      for (const auto& move : MoveList<EVASIONS>(*this))
+          if (legal(move) && !virtual_drop(move))
               return true;
   }
   else
   {
-      end = generate<CAPTURES>(*this, moveList);
-      for (ExtMove* it = moveList; it != end; ++it)
-          if (legal(*it) && !virtual_drop(*it))
+      for (const auto& move : MoveList<CAPTURES>(*this))
+          if (legal(move) && !virtual_drop(move))
               return true;
 
-      end = generate<QUIETS>(*this, moveList);
-      for (ExtMove* it = moveList; it != end; ++it)
-          if (legal(*it) && !virtual_drop(*it))
+      for (const auto& move : MoveList<QUIETS>(*this))
+          if (legal(move) && !virtual_drop(move))
               return true;
   }
 
@@ -3896,11 +4437,14 @@ bool Position::pseudo_legal(const Move m) const {
       && !is_pass(m))
       return false;
 
-  if (from == to && !(is_pass(m) || is_self_destruct(m) || (type_of(m) == PROMOTION && sittuyin_promotion()) || pureWallMove))
+  if (from == to && !(is_pass(m) || is_self_destruct(m) || (is_promotion_move(m) && sittuyin_promotion()) || pureWallMove))
       return false;
 
   if (st->pendingClaimPass)
       return is_pass(m);
+
+  if (!dropMove && !is_pass(m) && !pureWallMove && (freeze_squares() & from))
+      return false;
 
   if (is_self_destruct(m))
   {
@@ -3910,11 +4454,11 @@ bool Position::pseudo_legal(const Move m) const {
           return false;
   }
 
-  if (type_of(m) == PROMOTION && !promotion_allowed(us, promotion_type(m), to))
+  if (is_promotion_move(m) && !promotion_allowed(us, promotion_type(m), to))
       return false;
   if (type_of(m) == PIECE_PROMOTION && (is_promoted(from) || !promotion_allowed(us, promoted_piece_type(type_of(pc)))))
       return false;
-  if (!dropMove && type_of(m) != PROMOTION && type_of(m) != PIECE_PROMOTION)
+  if (!dropMove && !is_promotion_move(m) && type_of(m) != PIECE_PROMOTION)
   {
       Bitboard mandatoryZone = pc == NO_PIECE ? Bitboard(0) : mandatory_promotion_zone(pc);
       if ((mandatoryZone & effectiveTo) && !(mandatoryZone & from))
@@ -3970,17 +4514,14 @@ bool Position::pseudo_legal(const Move m) const {
               return false;
       }
   }
-  PieceSet jumpTypes = jump_capture_types();
-  bool jumpTypeMover = (jumpTypes & ALL_PIECES) || (jumpTypes & type_of(pc));
-  if ((type_of(m) == NORMAL || type_of(m) == PROMOTION) && jumpTypeMover && !empty(to))
-      return false;
-  if ((type_of(m) == NORMAL || type_of(m) == PROMOTION) && jumpTypeMover)
+  // Universal-hopper semantics are handled by pseudo-move generation and
+  // jump_capture_square() capture-square resolution.
+
+  // Illegal moves to squares outside of board or to wall squares
+  if (pureWallMove)
   {
-      int df = std::abs(int(file_of(to)) - int(file_of(from)));
-      int dr = std::abs(int(rank_of(to)) - int(rank_of(from)));
-      bool isHop = std::max(df, dr) == 2 && (df == 0 || dr == 0 || df == dr);
-      if (isHop && jump_capture_square(from, to) == SQ_NONE)
-          return false;
+      Square wallSq = gating_square(m);
+      return wall_target_mask(us, from, from, SQ_NONE, pieces()) & wallSq;
   }
 
   // Illegal moves to squares outside of board or to wall squares
@@ -3992,27 +4533,12 @@ bool Position::pseudo_legal(const Move m) const {
   {
       if (insertMove)
       {
-          int df = int(file_of(from)) - int(file_of(to));
-          int dr = int(rank_of(from)) - int(rank_of(to));
-          if (std::abs(df) + std::abs(dr) != 1)
-              return false;
-
-          bool dirOk = false;
-          if (df == 0 && dr == -1)
-              dirOk = edge_insert_from_top(us) && rank_of(to) == max_rank();
-          else if (df == 0 && dr == 1)
-              dirOk = edge_insert_from_bottom(us) && rank_of(to) == RANK_1;
-          else if (df == 1 && dr == 0)
-              dirOk = edge_insert_from_left(us) && file_of(to) == FILE_A;
-          else if (df == -1 && dr == 0)
-              dirOk = edge_insert_from_right(us) && file_of(to) == max_file();
-
           return   piece_drops()
                 && pc != NO_PIECE
                 && color_of(pc) == dropColor
                 && (edge_insert_types() & type_of(pc))
                 && (edge_insert_region(us) & to)
-                && dirOk
+                && edge_insert_direction_ok(us, from, to)
                 && (!pay_points_to_drop() || st->pointsCount[us] >= var->piecePoints[type_of(pc)])
                 && (can_drop(us, in_hand_piece_type(m))
                     || (two_boards() && allow_virtual_drop(us, type_of(pc))))
@@ -4029,7 +4555,10 @@ bool Position::pseudo_legal(const Move m) const {
       {
           legalDropTargets |= pieces(them);
           if (self_capture(in_hand_piece_type(m)))
-              legalDropTargets |= pieces(us) & ~pieces(us, KING);
+          {
+              Bitboard ownRoyal = royal_square(us) != SQ_NONE ? square_bb(royal_square(us)) : Bitboard(0);
+              legalDropTargets |= pieces(us) & ~ownRoyal;
+          }
       }
       if (paired_drop(m))
       {
@@ -4064,33 +4593,13 @@ bool Position::pseudo_legal(const Move m) const {
 
   // Use a slower but simpler function for uncommon cases
   // yet we skip the legality check of MoveList<LEGAL>().
-  Bitboard freezeExtra = 0;
-  Bitboard jumpRemoved = 0;
-  if (is_gating(m))
-  {
-      Variant::PotionType potion = potion_type_from_piece(var, gating_type(m));
-      if (potion != Variant::POTION_TYPE_NB)
-      {
-          if (!can_cast_potion(us, potion))
-              return false;
-          if (potion == Variant::POTION_FREEZE)
-              freezeExtra = freeze_zone_from_square(gating_square(m));
-          else if (potion == Variant::POTION_JUMP)
-          {
-              jumpRemoved = square_bb(gating_square(m));
-              if (!piece_on(gating_square(m)))
-                  return false;
-          }
-      }
-  }
-
-  ScopedSpellContext spellScope(freezeExtra, jumpRemoved);
-
-  if (!dropMove && (freeze_squares() & from))
+  PotionContext potCtx = setup_potion_context(m, us);
+  if (!potCtx.valid)
       return false;
+
   if (type_of(m) == CASTLING && gamePly < var->castlingForbiddenPlies)
       return false;
-  if (jumpRemoved && (square_bb(to) & jumpRemoved))
+  if (potCtx.jumpRemoved && (square_bb(to) & potCtx.jumpRemoved))
       return false;
 
   if (type_of(m) != NORMAL || is_gating(m))
@@ -4101,34 +4610,7 @@ bool Position::pseudo_legal(const Move m) const {
           && !violates_same_player_board_repetition(m);
   }
 
-  //if walling, and walling is not optional, or they didn't move, do the checks.
-  if (walling(us) && is_gating(m) && (!wall_or_move() || (from == to)))
-  {
-      Bitboard wallsquares = st->wallSquares;
-      Square capSq = capture(m) ? capture_square(m) : SQ_NONE;
-      Bitboard occupancyAfter = pieces();
-      if (from != effectiveTo) occupancyAfter ^= square_bb(from) ^ square_bb(effectiveTo);
-      if (capSq != SQ_NONE) occupancyAfter ^= square_bb(capSq);
-
-      // Illegal wall square placement
-      if (!((board_bb() & ~occupancyAfter) & gating_square(m)))
-          return false;
-      if (!(walling_region(us) & gating_square(m)) || //putting a wall on disallowed square
-          wallsquares & gating_square(m)) //or square already with a wall
-          return false;
-      if (walling_rule() == ARROW && !(moves_bb(us, type_of(pc), effectiveTo, occupancyAfter ^ square_bb(effectiveTo)) & gating_square(m)))
-          return false;
-      if (walling_rule() == PAST && (from != gating_square(m)))
-          return false;
-      if (walling_rule() == EDGE)
-      {
-          Bitboard validsquares = board_bb() &
-                  ((FileABB | file_bb(max_file()) | Rank1BB | rank_bb(max_rank())) |
-                  ( shift<NORTH     >(wallsquares) | shift<SOUTH     >(wallsquares)
-                  | shift<EAST      >(wallsquares) | shift<WEST      >(wallsquares)));
-          if (!(validsquares & gating_square(m))) return false;
-      };
-  }
+  ScopedSpellContext spellScope(potCtx.freezeExtra, potCtx.jumpRemoved);
 
   // Handle the case where a mandatory piece promotion/demotion is not taken
   if (    mandatory_piece_promotion()
@@ -4150,12 +4632,12 @@ bool Position::pseudo_legal(const Move m) const {
 
   // The destination square cannot be occupied by a friendly piece unless
   // self-capture is enabled. Friendly kings remain uncapturable.
-  if ((pieces(us) & to) && !is_self_destruct(m))
+  if ((pieces(us) & to) && !is_pass(m) && !is_self_destruct(m))
   {
       bool antiRoyalSelfCapture = anti_royal_self_capture_only() && (anti_royal_types() & piece_set(type_of(pc)));
       if (!pushMove && !((self_capture(type_of(pc)) || antiRoyalSelfCapture) && capture(m)))
           return false;
-      if (type_of(piece_on(to)) == KING)
+      if (is_uncapturable_royal_square(us, to))
           return false;
   }
 
@@ -4173,14 +4655,25 @@ bool Position::pseudo_legal(const Move m) const {
       if (mandatory_pawn_promotion() && (promotion_zone(pc) & effectiveTo) && !sittuyin_promotion())
           return false;
 
-      if (   !(pawn_attacks_bb(us, from) & (self_capture(PAWN) ? pieces() : pieces(~us)) & to) // Not a capture
-          && !((from + pawn_push(us) == to) && !(pieces() & to)) // Not a single push
-          && !(   (from + 2 * pawn_push(us) == to)               // Not a double push
-               && (double_step_region(pc) & from)
-               && !(pieces() & (to | (to - pawn_push(us)))))
-          && !(   (from + 3 * pawn_push(us) == to)               // Not a triple push
-               && (triple_step_region(pc) & from)
-               && !(pieces() & (to | (to - pawn_push(us)) | (to - 2 * pawn_push(us))))))
+      Square step1 = pawn_step(from, us, 1);
+      Square step2 = pawn_step(from, us, 2);
+      Square step3 = pawn_step(from, us, 3);
+      const bool isStandardPawnMove =
+             (pawn_attacks_bb(us, from) & (self_capture(PAWN) ? pieces() : pieces(~us)) & to)
+          || ((step1 == to) && !(pieces() & to))
+          || (   (step2 == to)
+              && (double_step_region(pc) & from)
+              && !(pieces() & (to | step1)))
+          || (   (step3 == to)
+              && (triple_step_region(pc) & from)
+              && !(pieces() & (to | step1 | step2)));
+
+      // Custom pawn Betza (e.g. royal-race) can define non-orthodox pawn movement.
+      if (!isStandardPawnMove
+          && !is_self_destruct(m)
+          && !(pushMove ? (push_targets_from(us, type_of(pc), from) & to)
+                        : ((capture(m) ? attacks_from(us, type_of(pc), from)
+                                       : moves_from(us, type_of(pc), from)) & to)))
           return false;
   }
   else if (!is_self_destruct(m)
@@ -4191,15 +4684,8 @@ bool Position::pseudo_legal(const Move m) const {
   // Hopper-type pieces can optionally be configured to avoid hopping over
   // or capturing selected piece types (e.g. Janggi cannons vs cannons).
   PieceType movePt = type_of(pc);
-  if ((var->mutuallyHopIllegalTypes & movePt) && (AttackRiderTypes[movePt] & HOPPING_RIDERS))
-  {
-      Bitboard between = between_bb(from, to);
-      Bitboard hopIllegalPieces = 0;
-      for (PieceSet ps = var->mutuallyHopIllegalTypes; ps;)
-          hopIllegalPieces |= pieces(pop_lsb(ps));
-      if ((between & pieces()) && ((between | to) & hopIllegalPieces))
-          return false;
-  }
+  if (violates_mutual_hop_restriction(from, to, movePt))
+      return false;
 
   // Evasions generator already takes care to avoid some kind of illegal moves
   // and legal() relies on this. We therefore have to take care that the same
@@ -4214,7 +4700,7 @@ bool Position::pseudo_legal(const Move m) const {
               if (pushMove)
               {
                   PushInfo info;
-                  if (!analyze_push(*this, m, info))
+                  if (!analyze_push(m, info))
                       return false;
                   Square cur = info.tail;
                   Square next = SQ_NONE;
@@ -4237,27 +4723,15 @@ bool Position::pseudo_legal(const Move m) const {
           }
           else
           {
-          auto checker_targets = [&](Square checksq) {
-              PieceType checkerPt = type_of(piece_on(checksq));
-              Bitboard checkerMask = square_bb(checksq);
-              Bitboard t = (AttackRiderTypes[checkerPt] & RIDER_ROSE)
-                         ? rose_between_intersection_bb(square<KING>(us), checksq, pieces())
-                         : between_bb(square<KING>(us), checksq, checkerPt);
-
-              bool blockableNightrider = AttackRiderTypes[checkerPt] & RIDER_NIGHTRIDER;
-              if ((checkerMask & non_sliding_riders()) && !blockableNightrider)
-                  t = ~pieces(us);
-              if (LeaperAttacks[~us][checkerPt][checksq] & square<KING>(us))
-                  t = checkerMask;
-              return t;
-          };
-
           Bitboard evasionTargets = AllSquares;
           Bitboard remaining = evasion_checkers();
           while (remaining)
-              evasionTargets &= checker_targets(pop_lsb(remaining));
+              evasionTargets &= checker_evasion_targets(us, square<KING>(us), pop_lsb(remaining));
 
-          if (!(evasionTargets & to))
+          const bool blastEvasion = ((capture(m) || rifle_capture(m)) && blast_on_capture(m)) ||
+                                    (!capture(m) && !rifle_capture(m) && !is_self_destruct(m) && blast_on_move()) ||
+                                    (is_self_destruct(m) && blast_on_self_destruct());
+          if (!blastEvasion && !(evasionTargets & to))
               return false;
           }
       }
@@ -4270,24 +4744,24 @@ bool Position::pseudo_legal(const Move m) const {
   return !violates_same_player_board_repetition(m);
 }
 
+Bitboard Position::checker_evasion_targets(Color us, Square royalSq, Square checksq) const {
+    PieceType checkerPt = type_of(piece_on(checksq));
+    Bitboard checkerMask = square_bb(checksq);
+    Bitboard t = (AttackRiderTypes[checkerPt] & RIDER_ROSE)
+               ? rose_between_intersection_bb(royalSq, checksq, pieces())
+               : between_bb(royalSq, checksq, checkerPt);
+
+    bool blockableNightrider = AttackRiderTypes[checkerPt] & RIDER_NIGHTRIDER;
+    if ((checkerMask & non_sliding_riders()) && !blockableNightrider)
+        t = ~pieces(us);
+    if (LeaperAttacks[~us][checkerPt][checksq] & royalSq)
+        t = checkerMask;
+    return t;
+}
+
 bool Position::push_move(Move m) const {
   PushInfo info;
-  return analyze_push(*this, m, info);
-}
-
-bool Position::push_captures(Move m) const {
-  PushInfo info;
-  return analyze_push(*this, m, info) && info.captures;
-}
-
-bool Position::push_ejects(Move m) const {
-  PushInfo info;
-  return analyze_push(*this, m, info) && info.ejects;
-}
-
-Square Position::push_capture_square(Move m) const {
-  PushInfo info;
-  return analyze_push(*this, m, info) && info.captures ? info.tail : SQ_NONE;
+  return analyze_push(m, info);
 }
 
 
@@ -4296,56 +4770,67 @@ Square Position::push_capture_square(Move m) const {
 bool Position::gives_check(Move m) const {
 
   assert(is_ok(m));
+  if (is_pass(m))
+      return false;
   Piece mover = moved_piece(m);
   // Setup/pass-style pseudo-legal moves can exist without a board mover.
   if (mover == NO_PIECE)
       return false;
-  assert(color_of(mover) == sideToMove);
 
   Square from = from_sq(m);
   Square to = to_sq(m);
   bool dropMove = is_drop_move(m);
+  assert(color_of(mover) == (dropMove ? drop_hand_color(sideToMove, in_hand_piece_type(m)) : sideToMove));
 
-  Bitboard freezeExtra = 0;
-  Bitboard jumpRemoved = 0;
-  Variant::PotionType gatingPotion = Variant::POTION_TYPE_NB;
-  if (is_gating(m))
-  {
-      gatingPotion = potion_type_from_piece(var, gating_type(m));
-      if (gatingPotion != Variant::POTION_TYPE_NB)
-      {
-          if (!can_cast_potion(sideToMove, gatingPotion))
-              return false;
-          if (gatingPotion == Variant::POTION_FREEZE)
-              freezeExtra = freeze_zone_from_square(gating_square(m));
-          else if (gatingPotion == Variant::POTION_JUMP)
-          {
-              jumpRemoved = square_bb(gating_square(m));
-              if (!piece_on(gating_square(m)))
-                  return false;
-          }
-      }
-  }
+  PotionContext potCtx = setup_potion_context(m, sideToMove);
+  if (!potCtx.valid)
+      return false;
 
-  ScopedSpellContext spellScope(freezeExtra, jumpRemoved);
+  ScopedSpellContext spellScope(potCtx.freezeExtra, potCtx.jumpRemoved);
 
   if (!dropMove && (freeze_squares() & from))
       return false;
-  if (jumpRemoved && (square_bb(to) & jumpRemoved))
+  if (potCtx.jumpRemoved && (square_bb(to) & potCtx.jumpRemoved))
       return false;
 
   bool rifleShot = rifle_capture(m) && capture(m) && type_of(m) != CASTLING;
   Square shotSq = capture(m) ? capture_square(m) : to;
   Square attackFrom = rifleShot ? from : to;
 
-  // No check possible without king
-  if (!count<KING>(~sideToMove))
+  const bool usingPhysicalKingTarget = count<KING>(~sideToMove) == 1;
+  Square royalSq = usingPhysicalKingTarget ? square<KING>(~sideToMove)
+                                           : royal_square(~sideToMove);
+  if (royalSq == SQ_NONE && count<KING>(~sideToMove) != 1)
+      return false;
+  if (royalSq == SQ_NONE)
+      royalSq = square<KING>(~sideToMove);
+  if (!is_ok(royalSq))
+      return false;
+  const Piece royalPiece = piece_on(royalSq);
+  const PieceType royalType = royalPiece != NO_PIECE ? type_of(royalPiece) : king_type();
+  if (!is_ok(attackFrom))
       return false;
 
-  Bitboard occupied = rifleShot ? (pieces() ^ square_bb(shotSq))
-                                : (((!dropMove ? pieces() ^ from : pieces()) ^ square_bb(shotSq)) | to);
+  Bitboard occupied;
+  if (type_of(m) == CASTLING)
+  {
+      Square kfrom = from;
+      Square rfrom = to;
+      Square kto, rto;
+      castling_destinations(sideToMove, kfrom, rfrom, kto, rto);
+      occupied = (pieces() ^ kfrom ^ rfrom) | kto | rto;
+  }
+  else
+  {
+      occupied = rifleShot ? (pieces() ^ square_bb(shotSq))
+                           : (((!dropMove ? pieces() ^ from : pieces()) ^ square_bb(shotSq)) | to);
+  }
   if (paired_drop(m))
       occupied |= square_bb(secondary_drop_square(m));
+
+  if (gating_move_blocks_occupancy(m))
+      occupied |= square_bb(gating_square(m));
+
   Bitboard janggiCannons = pieces(JANGGI_CANNON);
   if (type_of(mover) == JANGGI_CANNON)
       janggiCannons = rifleShot ? (janggiCannons & ~square_bb(shotSq))
@@ -4353,44 +4838,49 @@ bool Position::gives_check(Move m) const {
   else if (janggiCannons & to)
       janggiCannons ^= to;
 
-  if (topology_wraps() || has_pushing() || has_adjacent_swapping() || is_swap_move(m))
+  if (topology_wraps()
+      || has_pushing()
+      || has_adjacent_swapping()
+      || is_swap_move(m)
+      || type_of(m) == PULL
+      || type_of(m) == DROP2
+      || type_of(m) == INSERT)
   {
-      Position* pos = const_cast<Position*>(this);
       StateInfo nextState;
-      pos->do_move(m, nextState, false);
-      bool givesCheck = bool(pos->evasion_checkers());
-      pos->undo_move(m);
+      ScopedProbeMove probe(*this, m, nextState);
+      bool givesCheck = bool(evasion_checkers());
       return givesCheck;
   }
 
-  if (type_of(m) == PULL)
-  {
-      Square pullFrom = pull_square(m);
-      occupied ^= square_bb(pullFrom) ^ square_bb(from);
-      if (janggiCannons & pullFrom)
-          janggiCannons ^= square_bb(pullFrom) ^ square_bb(from);
-  }
+  if (usingPhysicalKingTarget
+      && (attackers_to_king(royalSq, occupied, sideToMove, janggiCannons) & square_bb(attackFrom)))
+      return !(var->captureForbidden[type_of(mover)] & royalType);
 
   // Is there a direct check?
-  if (type_of(m) != PROMOTION && type_of(m) != PIECE_PROMOTION && type_of(m) != PIECE_DEMOTION && type_of(m) != CASTLING
+  if (!is_promotion_move(m) && type_of(m) != PIECE_PROMOTION && type_of(m) != PIECE_DEMOTION && type_of(m) != CASTLING
       && !((var->petrifyOnCaptureTypes & type_of(mover)) && capture(m)))
   {
       PieceType pt = type_of(mover);
-      if (!(var->captureForbidden[pt] & KING))
+      if (!(var->captureForbidden[pt] & royalType))
       {
           if (pt == JANGGI_CANNON)
           {
-              if (attacks_bb(sideToMove, pt, attackFrom, occupied) & attacks_bb(sideToMove, pt, attackFrom, occupied & ~janggiCannons) & square<KING>(~sideToMove))
+              if (attacks_bb(sideToMove, pt, attackFrom, occupied) & attacks_bb(sideToMove, pt, attackFrom, occupied & ~janggiCannons) & royalSq)
                   return true;
           }
-          else if (AttackRiderTypes[pt] & HOPPING_RIDERS)
+          else if (pieceMap.get(pt)->has_hopper_like_capture())
           {
-              if (attacks_bb(sideToMove, pt, attackFrom, occupied) & square<KING>(~sideToMove))
+              if (attacks_bb(sideToMove, pt, attackFrom, occupied) & royalSq)
                   return true;
           }
           else if (AttackRiderTypes[pt] & ASYMMETRICAL_RIDERS)
           {
-              if ((check_squares(pt) & attackFrom) && (attacks_bb(sideToMove, pt, attackFrom, occupied) & square<KING>(~sideToMove)))
+              if ((check_squares(pt) & attackFrom) && (attacks_bb(sideToMove, pt, attackFrom, occupied) & royalSq))
+                  return true;
+          }
+          else if (usingPhysicalKingTarget)
+          {
+              if (attacks_bb(sideToMove, pt, attackFrom, occupied) & royalSq)
                   return true;
           }
           else if (check_squares(pt) & attackFrom)
@@ -4398,29 +4888,28 @@ bool Position::gives_check(Move m) const {
       }
       if (var->blastPassiveTypes && (var->blastPassiveTypes & piece_set(pt)))
       {
-          Square ksq = square<KING>(~sideToMove);
-          if (!(blast_immune_bb() & square_bb(ksq)) && (blast_pattern(ksq) & to))
+          if (!(blast_immune_bb() & royalSq) && (blast_pattern(royalSq) & to))
               return true;
       }
   }
 
   // Is there a discovered check?
-  Bitboard discCheckSq = rifleShot ? square_bb(to) : square_bb(from);
-  if (type_of(m) == PULL)
-      discCheckSq |= square_bb(pull_square(m));
+  Bitboard discCheckSq = 0;
+  if (!dropMove)
+      discCheckSq = rifleShot ? square_bb(to) : square_bb(from);
 
   if (  ((!dropMove && (blockers_for_king(~sideToMove) & discCheckSq)) || (non_sliding_riders() & pieces(sideToMove)))
-      && attackers_to_king(square<KING>(~sideToMove), occupied, sideToMove, janggiCannons) & occupied)
+      && attackers_to_king(royalSq, occupied, sideToMove, janggiCannons) & occupied)
       return true;
 
   // Is there a check by gated pieces?
   if (    is_gating(m)
-      && gatingPotion == Variant::POTION_TYPE_NB
+      && potCtx.potion == Variant::POTION_TYPE_NB
       && gating_type(m) != NO_PIECE_TYPE)
   {
-      if (attacks_bb(sideToMove, gating_type(m), gating_square(m), occupied ^ square_bb(gating_square(m))) & square<KING>(~sideToMove))
+      if (attacks_bb(sideToMove, gating_type(m), gating_square(m), occupied ^ square_bb(gating_square(m))) & royalSq)
           return true;
-      if (paired_drop(m) && (attacks_bb(sideToMove, gating_type(m), secondary_drop_square(m), occupied ^ square_bb(secondary_drop_square(m))) & square<KING>(~sideToMove)))
+      if (paired_drop(m) && (attacks_bb(sideToMove, gating_type(m), secondary_drop_square(m), occupied ^ square_bb(secondary_drop_square(m))) & royalSq))
           return true;
   }
 
@@ -4429,15 +4918,13 @@ bool Position::gives_check(Move m) const {
       return false;
 
   // Is there a check by special diagonal moves?
-  if (more_than_one(diagonal_lines() & (to | square<KING>(~sideToMove))))
+  if (more_than_one(diagonal_lines() & (to | royalSq)))
   {
       PieceType pt = type_of(mover);
       PieceType diagType = pt == WAZIR ? FERS : pt == SOLDIER ? PAWN : pt == ROOK ? BISHOP : NO_PIECE_TYPE;
-      if (diagType && (attacks_bb(sideToMove, diagType, attackFrom, occupied) & square<KING>(~sideToMove)))
+      if (diagType && (attacks_bb(sideToMove, diagType, attackFrom, occupied) & royalSq))
           return true;
-      else if (pt == JANGGI_CANNON && (  rider_attacks_bb<RIDER_CANNON_DIAG>(attackFrom, occupied)
-                                       & rider_attacks_bb<RIDER_CANNON_DIAG>(attackFrom, occupied & ~janggiCannons)
-                                       & square<KING>(~sideToMove)))
+      else if (pt == JANGGI_CANNON && (janggi_cannon_diagonal_targets(attackFrom, occupied) & royalSq))
           return true;
   }
 
@@ -4449,16 +4936,18 @@ bool Position::gives_check(Move m) const {
   case SPECIAL:
   case PULL:
   case SWAP:
+  case DROP2:
       return false;
 
   case PROMOTION:
-      return attacks_bb(sideToMove, promotion_type(m), to, pieces() ^ from) & square<KING>(~sideToMove);
+  case PROMOTION_POTION:
+      return attacks_bb(sideToMove, promotion_type(m), to, pieces() ^ from) & royalSq;
 
   case PIECE_PROMOTION:
-      return attacks_bb(sideToMove, promoted_piece_type(type_of(mover)), to, pieces() ^ from) & square<KING>(~sideToMove);
+      return attacks_bb(sideToMove, promoted_piece_type(type_of(mover)), to, pieces() ^ from) & royalSq;
 
   case PIECE_DEMOTION:
-      return attacks_bb(sideToMove, type_of(unpromoted_piece_on(from)), to, pieces() ^ from) & square<KING>(~sideToMove);
+      return attacks_bb(sideToMove, type_of(unpromoted_piece_on(from)), to, pieces() ^ from) & royalSq;
 
   // En passant capture with check? We have already handled the case
   // of direct checks and ordinary discovered check, so the only case we
@@ -4469,39 +4958,218 @@ bool Position::gives_check(Move m) const {
       Square capsq = capture_square(to);
       Bitboard b = rifleShot ? (pieces() ^ capsq) : ((pieces() ^ from ^ capsq) | to);
 
-      return attackers_to_king(square<KING>(~sideToMove), b, sideToMove) & pieces(sideToMove) & b;
+      return attackers_to_king(royalSq, b, sideToMove) & pieces(sideToMove) & b;
   }
-  default: //CASTLING
+  case CASTLING:
   {
       // Castling is encoded as 'king captures the rook'
       Square kfrom = from;
       Square rfrom = to;
-      Square kto = make_square(rfrom > kfrom ? castling_kingside_file() : castling_queenside_file(), castling_rank(sideToMove));
-      Square rto = kto + (rfrom > kfrom ? WEST : EAST);
+      Square kto, rto;
+      castling_destinations(sideToMove, kfrom, rfrom, kto, rto);
 
       // Is there a discovered check?
       if (   castling_rank(WHITE) > RANK_1
           && ((blockers_for_king(~sideToMove) & rfrom) || (non_sliding_riders() & pieces(sideToMove)))
-          && attackers_to_king(square<KING>(~sideToMove), (pieces() ^ kfrom ^ rfrom) | rto | kto, sideToMove))
+          && attackers_to_king(royalSq, (pieces() ^ kfrom ^ rfrom) | rto | kto, sideToMove))
           return true;
 
-      return   (PseudoAttacks[sideToMove][type_of(piece_on(rfrom))][rto] & square<KING>(~sideToMove))
-            && (attacks_bb(sideToMove, type_of(piece_on(rfrom)), rto, (pieces() ^ kfrom ^ rfrom) | rto | kto) & square<KING>(~sideToMove));
+      return   (PseudoAttacks[sideToMove][type_of(piece_on(rfrom))][rto] & royalSq)
+            && (attacks_bb(sideToMove, type_of(piece_on(rfrom)), rto, (pieces() ^ kfrom ^ rfrom) | rto | kto) & royalSq);
   }
+  default:
+      assert(false);
+      return false;
   }
+}
+
+PotionContext Position::setup_potion_context(Move m, Color us) const {
+    PotionContext pc;
+    bool hasPotion = (is_gating(m) && gating_type(m) != NO_PIECE_TYPE) || (type_of(m) == PROMOTION_POTION);
+    if (hasPotion)
+    {
+        Square gs = (type_of(m) == PROMOTION_POTION) ? potion_target_square(m) : gating_square(m);
+        if (!is_ok(gs))
+        {
+            pc.valid = false;
+            return pc;
+        }
+        pc.potion = (type_of(m) == PROMOTION_POTION)
+                     ? static_cast<Variant::PotionType>(potion_type(m))
+                     : potion_type_from_piece(var, gating_type(m));
+        if (pc.potion != Variant::POTION_TYPE_NB)
+        {
+            if (!can_cast_potion(us, pc.potion))
+            {
+                pc.valid = false;
+                return pc;
+            }
+            if (pc.potion == Variant::POTION_FREEZE)
+                pc.freezeExtra = freeze_zone_from_square(gs);
+            else if (pc.potion == Variant::POTION_JUMP)
+            {
+                pc.jumpRemoved = square_bb(gs);
+                if (!piece_on(gs))
+                    pc.valid = false;
+            }
+        }
+    }
+    return pc;
+}
+
+bool Position::analyze_push(Move m, PushInfo& info) const {
+    info = PushInfo{};
+    return type_of(m) == INSERT || !stepwise_pushing()
+               ? analyze_push_direct(*this, m, info)
+               : analyze_push_stepwise(*this, m, info);
 }
 
 /// Position::do_move() makes a move, and saves all information necessary
 /// to a StateInfo object. The move is assumed to be legal. Pseudo-legal
 /// moves should be filtered out before this function is called.
 
-void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
+inline void clear_dirty_piece(StateInfo* st) {
+  st->dirtyPiece.dirty_num = 0;
+  for (int i = 0; i < DIRTY_PIECE_MAX; ++i) {
+      st->dirtyPiece.handPiece[i] = NO_PIECE;
+  }
+}
+
+inline void clear_move_undo_state(StateInfo* st) {
+  st->MoveUndoInfo::clear();
+}
+
+#ifndef NDEBUG
+inline void assert_no_move_undo_payload(const StateInfo* st) {
+  assert(st->MoveUndoInfo::empty());
+}
+#endif
+
+CaptureTransferTarget Position::capture_transfer_target(Piece transferPiece, bool suppressedCaptureTransfer) const {
+    if (suppressedCaptureTransfer || !captures_to_hand())
+        return {};
+    if (!(capture_to_hand_types() & type_of(transferPiece)))
+        return {};
+
+    if (capture_type() == HAND)
+    {
+        return {transferPiece,
+                pieceCountInHand[color_of(transferPiece)][type_of(transferPiece)],
+                false,
+                true};
+    }
+
+    if (capture_type() == PRISON)
+    {
+        return {~transferPiece,
+                pieceCountInPrison[color_of(transferPiece)][type_of(transferPiece)],
+                true,
+                true};
+    }
+
+    return {};
+}
+
+bool Position::add_capture_transfer(StateInfo* state, Piece transferPiece, Key* k) {
+    CaptureTransferTarget target = capture_transfer_target(transferPiece, state->suppressedCaptureTransfer);
+    if (!target.valid)
+        return false;
+
+    if (target.prison)
+        add_to_prison(target.hashedPiece);
+    else
+        add_to_hand(target.hashedPiece);
+    if (k)
+        xor_in_hand_count(*k, target.hashedPiece, target.oldCount, target.oldCount + 1);
+    return true;
+}
+
+bool Position::undo_capture_transfer(StateInfo* state, Piece transferPiece, Key* k) {
+    CaptureTransferTarget target = capture_transfer_target(transferPiece, state->suppressedCaptureTransfer);
+    if (!target.valid)
+        return false;
+
+    if (target.prison)
+        remove_from_prison(target.hashedPiece);
+    else
+        remove_from_hand(target.hashedPiece);
+    if (k)
+        xor_in_hand_count(*k, target.hashedPiece, target.oldCount, target.oldCount - 1);
+    return true;
+}
+
+bool Position::simulate_capture_transfer(Key& k, Piece transferPiece, bool suppressedCaptureTransfer) const {
+    CaptureTransferTarget target = capture_transfer_target(transferPiece, suppressedCaptureTransfer);
+    if (!target.valid)
+        return false;
+
+    xor_in_hand_count(k, target.hashedPiece, target.oldCount, target.oldCount + 1);
+    return true;
+}
+
+void Position::apply_drop_hash_delta(Key& k, Move m, Piece pc, Color dropColor, PieceType exchanged) const {
+    Piece pc_hand = make_piece(dropColor, in_hand_piece_type(m));
+    k ^= Zobrist::psq[pc][to_sq(m)];
+    if (paired_drop(m))
+    {
+        Square to2 = secondary_drop_square(m);
+        k ^= Zobrist::psq[pc][to2];
+        int n = pieceCountInHand[color_of(pc_hand)][type_of(pc_hand)];
+        xor_in_hand_count(k, pc_hand, n - 2, n);
+    }
+    else if (exchanged == NO_PIECE_TYPE)
+    {
+        int n = pieceCountInHand[color_of(pc_hand)][type_of(pc_hand)];
+        xor_in_hand_count(k, pc_hand, n - 1, n);
+    }
+    else
+    {
+        Color us = dropColor;
+        Color them = ~us;
+        Piece exchangedPiece = make_piece(them, exchanged);
+
+        // Exchange drop mutates one hand bucket and two prison buckets.
+        int handOld = pieceCountInHand[them][exchanged];
+        int handNew = handOld + 1;
+        xor_in_hand_count(k, exchangedPiece, handOld, handNew);
+
+        int prisonOldEx = pieceCountInPrison[us][exchanged];
+        int prisonNewEx = prisonOldEx - 1;
+        xor_in_hand_count(k, exchangedPiece, prisonOldEx, prisonNewEx);
+
+        int prisonOldDrop = pieceCountInPrison[them][type_of(pc)];
+        int prisonNewDrop = prisonOldDrop - 1;
+        xor_in_hand_count(k, pc, prisonOldDrop, prisonNewDrop);
+    }
+}
+
+void Position::add_capture_points(StateInfo* state, Color us, Piece captured) const {
+    int points = var->piecePoints[type_of(captured)];
+    switch (points_rule_captures()) {
+        case POINTS_US:
+            state->pointsCount[us] += points;
+            break;
+        case POINTS_THEM:
+            state->pointsCount[~us] += points;
+            break;
+        case POINTS_OWNER:
+            state->pointsCount[color_of(captured)] += points;
+            break;
+        case POINTS_NON_OWNER:
+            state->pointsCount[~color_of(captured)] += points;
+            break;
+        default:
+            break;
+    }
+}
+
+void Position::do_move(Move m, StateInfo& newSt, bool countNode) {
 
   assert(is_ok(m));
   assert(&newSt != st);
 
 #ifndef NO_THREADS
-  if (thisThread)
+  if (countNode && thisThread)
       thisThread->nodes.fetch_add(1, std::memory_order_relaxed);
 #endif
   Key k = st->key ^ Zobrist::side;
@@ -4509,47 +5177,17 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   // Copy some fields of the old state to our new StateInfo object except the
   // ones which are going to be recalculated from scratch anyway and then switch
   // our state pointer to point to the new (ready to be updated) state.
-  std::memcpy(static_cast<void*>(&newSt), static_cast<void*>(st), offsetof(StateInfo, key));
+  static_cast<StateInfoCopied&>(newSt) = static_cast<const StateInfoCopied&>(*st);
+  const bool previousClaimPass = st->pendingClaimPass;
   newSt.previous = st;
   st = &newSt;
   st->extinctionSeen[WHITE] = newSt.previous->extinctionSeen[WHITE];
   st->extinctionSeen[BLACK] = newSt.previous->extinctionSeen[BLACK];
   st->move = m;
-  st->legalCapture = NO_VALUE;
-  st->legalEnPassant = NO_VALUE;
-  st->blastPromotedSquares = 0;
-  st->bycatchSquares = 0;
-  st->captured.clear();
-  st->consumedPromotionHandPiece = NO_PIECE;
-  st->dead.clear();
-
-  if (commit_gates()) {
-      st->removedGatingType = NO_PIECE_TYPE;
-      st->removedCastlingGatingType = NO_PIECE_TYPE;
-      st->capturedGatingType = NO_PIECE_TYPE;
-  }
-  st->didMorph = false;
-  st->morphedFrom = NO_PIECE;
-  st->morphSquare = SQ_NONE;
-  st->didColorChange = false;
-  st->colorChanged.clear();
-  st->colorChangeSquare = SQ_NONE;
-  st->didPush = false;
-  st->didPull = false;
-  st->pushStepwise = false;
-  st->pushTailSquare = SQ_NONE;
-  st->pushStepF = 0;
-  st->pushStepR = 0;
-  st->pushCount = 0;
-  st->pushEjected = false;
-  st->pushBlockedCapture = false;
-  st->pushSnapshotCount = 0;
-  st->pushTransferCount = 0;
-  st->pullFromSquare = SQ_NONE;
-  st->pulled.clear();
+  clear_move_undo_state(st);
   // Mandatory multimove pass plies should not advance the halfmove clock.
   const bool currentMultimovePass = is_pass(m) && multimove_pass(gamePly);
-  const bool currentClaimPass = is_pass(m) && st->pendingClaimPass;
+  const bool currentClaimPass = is_pass(m) && previousClaimPass;
 
   // Increment ply counters. In particular, rule50 will be reset to zero later on
   // in case of a capture or a pawn move.
@@ -4560,43 +5198,60 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   if (st->countingLimit)
       ++st->countingPly;
 
-  // Used by NNUE
-  st->accumulator.computed[WHITE] = false;
-  st->accumulator.computed[BLACK] = false;
-  st->nnueRefreshNeeded = false;
-  auto& dp = st->dirtyPiece;
-  dp.dirty_num = 1;
-
   Color us = sideToMove;
   Color them = ~us;
   bool dropMove = is_drop_move(m);
   Square from = from_sq(m);
   Square to = to_sq(m);
   Piece pc = moved_piece(m);
+
+  // Used by NNUE
+  st->accumulator.computed[WHITE] = false;
+  st->accumulator.computed[BLACK] = false;
+  st->nnueRefreshNeeded = false;
+  clear_dirty_piece(st);
+  auto& dp = st->dirtyPiece;
+  dp.dirty_num = 1;
+  init_dirty_piece_entry(dp, 0, pc, from, to, NO_PIECE, 0);
+
   Color dropColor = dropMove ? drop_hand_color(us, in_hand_piece_type(m)) : us;
   PieceType movedType = type_of(pc);
+  PieceType movedMoveType = effective_piece_type(movedType);
+  const PieceInfo* pi = movedMoveType != NO_PIECE_TYPE ? pieceMap.get(movedMoveType) : nullptr;
   Piece captured = captured_piece(m);
-  if (type_of(m) == CASTLING && captured == NO_PIECE)
-      captured = piece_on(to);
-  const bool blastOnCaptureMove = blast_on_capture(pc, captured);
-  const bool zeroRangeBlastOnCaptureMove = zero_range_blast_on_capture(pc, captured);
+  Piece castlingRook = NO_PIECE;
+  if (type_of(m) == CASTLING)
+  {
+      castlingRook = captured;
+      if (castlingRook == NO_PIECE)
+          castlingRook = piece_on(to);
+      captured = NO_PIECE;
+  }
+  const Piece capturedBeforeStepwisePush = captured;
   PushInfo pushInfo;
-  bool pushMove = analyze_push(*this, m, pushInfo);
-  bool stepwisePush = pushMove && type_of(m) == NORMAL && pushInfo.distance > 1;
+  bool pushMove = false;
+  bool stepwisePush = false;
   Square pushSquares[MAX_PUSH_SNAPSHOT];
   PushTempPiece pushFinalLine[MAX_PUSH_SNAPSHOT];
   PushTempPiece pushTransfers[MAX_PUSH_SNAPSHOT];
   int pushLineCount = 0;
   int pushTransferCount = 0;
   bool recomputeDerivedState = false;
-  if (stepwisePush)
+
+  if (stepwise_pushing() && type_of(m) == NORMAL)
   {
-      PushInfo resolved;
-      if (!analyze_push_stepwise(*this, m, resolved, pushSquares, &pushLineCount, pushFinalLine, pushTransfers, &pushTransferCount))
-          stepwisePush = false;
-      else
-          pushInfo = resolved;
+      pushMove = analyze_push_stepwise(*this, m, pushInfo, pushSquares, &pushLineCount, pushFinalLine, pushTransfers, &pushTransferCount);
+      stepwisePush = pushMove && pushInfo.distance > 1;
   }
+  else
+  {
+      pushMove = analyze_push(m, pushInfo);
+  }
+
+  if (pushMove)
+      captured = (!stepwisePush && pushInfo.captures) ? piece_on(pushInfo.tail) : NO_PIECE;
+
+  const bool blastOnCaptureMove = blast_on_capture(pc, captured);
   int pushRightsMask = 0;
   int pullRightsMask = 0;
   bool rifleShot = rifle_capture(m) && captured != NO_PIECE && type_of(m) != CASTLING;
@@ -4605,7 +5260,15 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   bool swapMove = is_swap_move(m);
   bool capturedDeadSquare = !dropMove && from != to && bool(st->deadSquares & to);
   PieceType exchanged = exchange_piece(m);
-  Square jumpCapsq = is_jump_capture(m) ? jump_capture_square(from, to) : SQ_NONE;
+  Square jumpCapsq = SQ_NONE;
+  Bitboard locust_all_mask = 0;
+  if (pi && pi->has_universal_hopper())
+  {
+      HopperMoveDetails details = resolve_hopper_move_details(from, to, byTypeBB[ALL_PIECES]);
+      jumpCapsq = details.primaryCaptureSq;
+      locust_all_mask = details.locustAllMask;
+  }
+
   Square moverSq = rifleShot ? from : to;
   bool openingSelfRemoval = in_opening_self_removal_phase() && is_opening_self_removal_move(m);
   auto set_castling_right_hashed = [&](Color c, Square sq) {
@@ -4641,65 +5304,61 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           }
       }
   };
-  Square capturedSq = captured ? capture_square(m) : SQ_NONE;
-  st->captured.set(captured, captured ? is_promoted(capturedSq) : false,
-                   captured ? unpromoted_piece_on(capturedSq) : NO_PIECE);
-  st->captureSquare = capturedSq;
-  st->didPush = pushMove;
+  Square capturedSq = captured ? (pushMove && !stepwisePush ? pushInfo.tail : capture_square(m)) : SQ_NONE;
+  if (captured)
+  {
+      st->captured.set(captured, is_promoted(capturedSq), unpromoted_piece_on(capturedSq), capturedSq);
+  }
+  else
+  {
+      st->captured.clear();
+  }
+  st->push.didPush = pushMove;
   st->didPull = pullMove;
-  st->pushStepwise = stepwisePush;
-  st->pushTailSquare = pushMove ? pushInfo.tail : SQ_NONE;
-  st->pushStepF = pushMove ? pushInfo.stepF : 0;
-  st->pushStepR = pushMove ? pushInfo.stepR : 0;
-  st->pushCount = pushMove ? pushInfo.count : 0;
-  st->pushEjected = pushMove && pushInfo.ejects;
-  st->pushBlockedCapture = pushMove && pushInfo.captures && !pushInfo.ejects;
+  st->push.stepwise = stepwisePush;
+  st->push.tailSquare = pushMove ? pushInfo.tail : SQ_NONE;
+  st->push.stepF = pushMove ? pushInfo.stepF : 0;
+  st->push.stepR = pushMove ? pushInfo.stepR : 0;
+  st->push.count = pushMove ? pushInfo.count : 0;
+  st->push.ejected = pushMove && pushInfo.ejects;
+  st->push.blockedCapture = pushMove && pushInfo.captures && !pushInfo.ejects;
   st->pass = is_pass(m) && !openingSelfRemoval;
   st->claimedSquares = 0;
-  st->pendingClaimPass = false;
   st->dropHandColor = COLOR_NB;
   st->suppressedCaptureTransfer = false;
-
-  if (stepwisePush)
-      captured = NO_PIECE;
 
   if (pullMove)
   {
       Square pullFrom = pull_square(m);
-      st->pullFromSquare = pullFrom;
       Piece pulled = piece_on(pullFrom);
       st->pulled.set(pulled, pulled != NO_PIECE && is_promoted(pullFrom),
-                     pulled != NO_PIECE ? unpromoted_piece_on(pullFrom) : NO_PIECE);
+                     pulled != NO_PIECE ? unpromoted_piece_on(pullFrom) : NO_PIECE, pullFrom);
   }
 
-  Variant::PotionType gatingPotion = Variant::POTION_TYPE_NB;
-  Bitboard freezeExtra = 0;
-  Bitboard jumpRemoved = 0;
-  if (is_gating(m))
-  {
-      gatingPotion = potion_type_from_piece(var, gating_type(m));
-      if (gatingPotion == Variant::POTION_FREEZE)
-          freezeExtra = freeze_zone_from_square(gating_square(m));
-      else if (gatingPotion == Variant::POTION_JUMP)
-          jumpRemoved = square_bb(gating_square(m));
-  }
-  bool pureWallMove = is_gating(m) && gatingPotion == Variant::POTION_TYPE_NB
+  PotionContext potCtx = setup_potion_context(m, us);
+  assert(potCtx.valid);
+
+  bool pureWallMove = is_gating(m) && potCtx.potion == Variant::POTION_TYPE_NB
                    && walling(us) && wall_or_move() && from == to;
 
   if (to == from)
   {
-      assert((type_of(m) == PROMOTION && sittuyin_promotion()) || is_pass(m) || openingSelfRemoval || pureWallMove);
+      assert((is_promotion_move(m) && sittuyin_promotion()) || is_pass(m) || is_self_destruct(m) || openingSelfRemoval || pureWallMove);
       captured = NO_PIECE;
   }
 
-  ScopedSpellContext spellScope(freezeExtra, jumpRemoved);
+  ScopedSpellContext spellScope(potCtx.freezeExtra, potCtx.jumpRemoved);
 
-  assert(pureWallMove || color_of(pc) == dropColor);
+  assert(pureWallMove || is_pass(m) || color_of(pc) == dropColor);
   assert(captured == NO_PIECE
-         || (type_of(m) == CASTLING ? color_of(captured) == us
-                                    : (color_of(captured) == them
-                                       || (((self_capture(type_of(pc)) || (anti_royal_self_capture_only() && (anti_royal_types() & piece_set(type_of(pc)))))
-                                           && color_of(captured) == us)))));
+         || (type_of(m) == CASTLING
+                 ? color_of(captured) == us
+                 : (color_of(captured) == them
+                    || (((self_capture(type_of(pc))
+                          || (anti_royal_self_capture_only()
+                              && (anti_royal_types() & piece_set(type_of(pc)))))
+                         && color_of(captured) == us))
+                    || (pushMove && color_of(captured) == us))));
   assert(type_of(captured) != KING || allow_checks() || !checking_permitted());
 
   auto trigger_matches = [](ColorChangeTrigger trigger, bool isCapture) {
@@ -4720,13 +5379,12 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   if (type_of(m) == CASTLING)
   {
       assert(type_of(pc) != NO_PIECE_TYPE);
-      assert(castling_rook_pieces(us) & type_of(captured));
+      assert(castling_rook_pieces(us) & type_of(castlingRook));
 
       Square rfrom, rto;
       do_castling<true>(us, from, to, rfrom, rto);
 
-      k ^= Zobrist::psq[captured][rfrom] ^ Zobrist::psq[captured][rto];
-      captured = NO_PIECE;
+      k ^= Zobrist::psq[castlingRook][rfrom] ^ Zobrist::psq[castlingRook][rto];
 
       if (commit_gates() && st->removedCastlingGatingType > NO_PIECE_TYPE)
       {
@@ -4747,19 +5405,21 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       }
   }
 
-  if (captured)
+  if (captured && !stepwisePush)
   {
       st->suppressedCaptureTransfer = var->petrifyOnCaptureSuppressTransfer
                                    && bool(var->petrifyOnCaptureTypes & type_of(pc));
 
-      Square capsq = st->captureSquare != SQ_NONE ? st->captureSquare : to;
+      Square capsq = st->captured.square != SQ_NONE ? st->captured.square : to;
       if (jumpCapsq != SQ_NONE)
+      {
           capsq = jumpCapsq;
+      }
 
       if (type_of(m) == EN_PASSANT)
       {
           capsq = capture_square(to);
-          st->captureSquare = capsq;
+          st->captured.square = capsq;
 
           assert(st->epSquares & to);
           assert(var->enPassantRegion[us] & to);
@@ -4778,16 +5438,12 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           if (rifleShot)
           {
               dp.dirty_num = 1;
-              dp.piece[0] = captured;
-              dp.from[0] = capsq;
-              dp.to[0] = SQ_NONE;
+              init_dirty_piece_entry(dp, 0, captured, capsq, SQ_NONE, NO_PIECE, 0);
           }
           else
           {
               dp.dirty_num = 2;  // 1 piece moved, 1 piece captured
-              dp.piece[1] = captured;
-              dp.from[1] = capsq;
-              dp.to[1] = SQ_NONE;
+              init_dirty_piece_entry(dp, 1, captured, capsq, SQ_NONE, NO_PIECE, 0);
           }
       }
 
@@ -4801,53 +5457,24 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       Piece transferPiece = reserve_transfer_piece(us, captured, capturedPromoted, unpromotedCaptured,
                                                    drop_loop(), var->captureToHandSide,
                                                    main_promotion_pawn_type(color_of(captured)));
-      if (capture_type() == HAND && !st->suppressedCaptureTransfer && (capture_to_hand_types() & type_of(transferPiece)))
+      bool transferred = add_capture_transfer(st, transferPiece, &k);
+      if (Eval::useNNUE)
       {
-          Piece pieceToHand = transferPiece;
-          add_to_hand(pieceToHand);
-          int newN = pieceCountInHand[color_of(pieceToHand)][type_of(pieceToHand)];
-          xor_in_hand_count(k, pieceToHand, newN - 1, newN);
-
-          if (Eval::useNNUE)
+          int captureDirtyIdx = rifleShot ? 0 : 1;
+          if (transferred && capture_type() == HAND)
           {
-              dp.handPiece[1] = pieceToHand;
-              dp.handCount[1] = pieceCountInHand[color_of(pieceToHand)][type_of(pieceToHand)];
+              dp.handPiece[captureDirtyIdx] = transferPiece;
+              dp.handCount[captureDirtyIdx] = pieceCountInHand[color_of(transferPiece)][type_of(transferPiece)];
+          }
+          else if (capture_type() != PRISON)
+          {
+              dp.handPiece[captureDirtyIdx] = NO_PIECE;
           }
       }
-      else if (capture_type() == PRISON && !st->suppressedCaptureTransfer)
-      {
-          Piece pieceToPrison = !capturedPromoted || drop_loop()
-                  ? captured
-                  : unpromotedCaptured
-                      ? unpromotedCaptured
-                      : make_piece(color_of(captured), main_promotion_pawn_type(color_of(captured)));
-          int n = add_to_prison(pieceToPrison);
-          xor_in_hand_count(k, pieceToPrison, n - 1, n);
-      }
-      else if (Eval::useNNUE)
-          dp.handPiece[1] = NO_PIECE;
 
       // Points assignment logic
       if (points_counting()) {
-          PointsRule pointsOwner = points_rule_captures();
-          int points = var->piecePoints[type_of(captured)];
-
-          switch (pointsOwner) {
-              case POINTS_US:
-                  st->pointsCount[us] += points;
-                  break;
-              case POINTS_THEM:
-                  st->pointsCount[them] += points;
-                  break;
-              case POINTS_OWNER:
-                  st->pointsCount[color_of(captured)] += points;
-                  break;
-              case POINTS_NON_OWNER:
-                  st->pointsCount[~color_of(captured)] += points;
-                  break;
-              case POINTS_NONE:
-                  break;
-          }
+          add_capture_points(st, us, captured);
       }
 
       // Update material hash key and prefetch access to materialTable
@@ -4873,34 +5500,36 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   if (pushMove)
   {
       st->nnueRefreshNeeded = true;
+      if (captured && stepwisePush)
+      {
+          st->captured.clear();
+          captured = NO_PIECE;
+      }
+
       if (stepwisePush)
       {
           recomputeDerivedState = true;
-          st->pushSnapshotCount = pushLineCount;
-          st->pushTransferCount = pushTransferCount;
-          st->pushSnapshotPromoted = 0;
+          st->push.snapshotCount = pushLineCount;
+          st->push.transferCount = pushTransferCount;
           for (int i = 0; i < pushLineCount; ++i)
           {
               Square sq = pushSquares[i];
-              st->pushSnapshotSquares[i] = sq;
-              st->pushSnapshotPieces[i] = piece_on(sq);
-              if (st->pushSnapshotPieces[i] != NO_PIECE && is_promoted(sq))
-                  st->pushSnapshotPromoted |= (1U << i);
-              st->pushSnapshotUnpromoted[i] = (st->pushSnapshotPromoted & (1U << i)) ? unpromoted_piece_on(sq) : NO_PIECE;
+              st->push.snapshots[i].sq = sq;
+              st->push.snapshots[i].piece = piece_on(sq);
+              st->push.snapshots[i].promoted = (st->push.snapshots[i].piece != NO_PIECE && is_promoted(sq));
+              st->push.snapshots[i].unpromoted = st->push.snapshots[i].promoted ? unpromoted_piece_on(sq) : NO_PIECE;
               pushRightsMask |= castlingRightsMask[sq];
           }
-          st->pushTransferPromoted = 0;
           for (int i = 0; i < pushTransferCount; ++i)
           {
-              st->pushTransferPieces[i] = pushTransfers[i].piece;
-              if (pushTransfers[i].promoted)
-                  st->pushTransferPromoted |= (1U << i);
-              st->pushTransferUnpromoted[i] = pushTransfers[i].unpromoted;
+              st->push.transfers[i].piece = pushTransfers[i].piece;
+              st->push.transfers[i].promoted = pushTransfers[i].promoted;
+              st->push.transfers[i].unpromoted = pushTransfers[i].unpromoted;
           }
 
           for (int i = pushLineCount - 1; i >= 0; --i)
           {
-              Piece original = st->pushSnapshotPieces[i];
+              Piece original = st->push.snapshots[i].piece;
               if (original == NO_PIECE)
                   continue;
 
@@ -4914,44 +5543,39 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
               if (finalSq == SQ_NONE)
               {
+                  k ^= Zobrist::psq[original][pushSquares[i]];
                   remove_piece(pushSquares[i]);
                   board[pushSquares[i]] = NO_PIECE;
+
+                  st->materialKey ^= Zobrist::psq[original][pieceCount[original]];
+                  if (type_of(original) == PAWN)
+                      st->pawnKey ^= Zobrist::psq[original][pushSquares[i]];
+                  else
+                      st->nonPawnMaterial[color_of(original)] -= PieceValue[MG][original];
               }
               else if (finalSq != pushSquares[i])
+              {
+                  k ^= Zobrist::psq[original][pushSquares[i]] ^ Zobrist::psq[original][finalSq];
+                  if (type_of(original) == PAWN)
+                      st->pawnKey ^= Zobrist::psq[original][pushSquares[i]] ^ Zobrist::psq[original][finalSq];
+
                   move_piece(pushSquares[i], finalSq);
+              }
           }
 
           for (int i = 0; i < pushTransferCount; ++i)
           {
-              Piece transferred = st->pushTransferPieces[i];
+              Piece transferred = st->push.transfers[i].piece;
               Piece transferPiece = reserve_transfer_piece(us, transferred,
-                                                           (st->pushTransferPromoted & (1U << i)),
-                                                           st->pushTransferUnpromoted[i],
+                                                           st->push.transfers[i].promoted,
+                                                           st->push.transfers[i].unpromoted,
                                                            drop_loop(), var->captureToHandSide,
                                                            main_promotion_pawn_type(color_of(transferred)));
-              if (capture_type() == HAND && (capture_to_hand_types() & type_of(transferPiece)))
-                  add_to_hand(transferPiece);
-              else if (capture_type() == PRISON)
-              {
-                  Piece prisonPiece = !drop_loop() && (st->pushTransferPromoted & (1U << i))
-                        ? (st->pushTransferUnpromoted[i]
-                           ? st->pushTransferUnpromoted[i]
-                           : make_piece(color_of(transferred), main_promotion_pawn_type(color_of(transferred))))
-                        : transferred;
-                  add_to_prison(prisonPiece);
-              }
+              add_capture_transfer(st, transferPiece, &k);
 
               if (points_counting())
               {
-                  PointsRule pointsOwner = points_rule_captures();
-                  int points = var->piecePoints[type_of(transferred)];
-                  switch (pointsOwner) {
-                      case POINTS_US:        st->pointsCount[us] += points; break;
-                      case POINTS_THEM:      st->pointsCount[them] += points; break;
-                      case POINTS_OWNER:     st->pointsCount[color_of(transferred)] += points; break;
-                      case POINTS_NON_OWNER: st->pointsCount[~color_of(transferred)] += points; break;
-                      case POINTS_NONE:      break;
-                  }
+                  add_capture_points(st, us, transferred);
               }
           }
 
@@ -4970,9 +5594,15 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           }
 
           Square dest = pushInfo.tail;
-          if (!pushInfo.ejects && !pushInfo.captures
-              && !advance_square(*this, pushInfo.tail, pushInfo.stepF, pushInfo.stepR, dest))
-              assert(false && "validated push missing destination");
+          if (!pushInfo.ejects && !pushInfo.captures)
+          {
+#ifndef NDEBUG
+              bool advanced = advance_square(*this, pushInfo.tail, pushInfo.stepF, pushInfo.stepR, dest);
+              assert(advanced && "validated push missing destination");
+#else
+              advance_square(*this, pushInfo.tail, pushInfo.stepF, pushInfo.stepR, dest);
+#endif
+          }
 
           if (!(pushInfo.ejects && pushInfo.tail == to))
           {
@@ -5014,37 +5644,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   if (dropMove)
   {
       st->dropHandColor = dropColor;
-      Piece pc_hand = make_piece(dropColor, in_hand_piece_type(m));
-      k ^= Zobrist::psq[pc][to];
-      if (paired_drop(m))
-      {
-          Square to2 = secondary_drop_square(m);
-          k ^= Zobrist::psq[pc][to2];
-          int n = pieceCountInHand[color_of(pc_hand)][type_of(pc_hand)];
-          xor_in_hand_count(k, pc_hand, n - 2, n);
-      }
-      else if (exchanged == NO_PIECE_TYPE)
-      {
-          int n = pieceCountInHand[color_of(pc_hand)][type_of(pc_hand)];
-          xor_in_hand_count(k, pc_hand, n - 1, n);
-      }
-      else
-      {
-          Piece exchangedPiece = make_piece(them, exchanged);
-
-          // Exchange drop mutates one hand bucket and two prison buckets.
-          int handOld = pieceCountInHand[them][exchanged];
-          int handNew = handOld + 1;
-          xor_in_hand_count(k, exchangedPiece, handOld, handNew);
-
-          int prisonOldEx = pieceCountInPrison[us][exchanged];
-          int prisonNewEx = prisonOldEx - 1;
-          xor_in_hand_count(k, exchangedPiece, prisonOldEx, prisonNewEx);
-
-          int prisonOldDrop = pieceCountInPrison[them][type_of(pc)];
-          int prisonNewDrop = prisonOldDrop - 1;
-          xor_in_hand_count(k, pc, prisonOldDrop, prisonNewDrop);
-      }
+      apply_drop_hash_delta(k, m, pc, dropColor, exchanged);
 
       // Reset rule 50 counter for irreversible drops
       st->rule50 = 0;
@@ -5055,8 +5655,8 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
       else if (pullMove)
       {
-          Piece pulled = st->pulled.piece;
-          Square pullFrom = st->pullFromSquare;
+          Piece pulled = st->pulled.piece.piece;
+          Square pullFrom = st->pulled.square;
           k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
           if (pulled != NO_PIECE)
               k ^= Zobrist::psq[pulled][pullFrom] ^ Zobrist::psq[pulled][from];
@@ -5071,7 +5671,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       // - irreversible pawn/piece promotions
       // - irreversible pawn moves
       if (   !pureWallMove
-          && (   type_of(m) == PROMOTION
+          && (   is_promotion_move(m)
           || (type_of(m) == PIECE_PROMOTION && !piece_demotion())
           || (    (var->nMoveRuleTypes.get(us) & piece_set(type_of(pc)))
               && !(PseudoMoves[0][us][type_of(pc)][to] & from))))
@@ -5153,19 +5753,11 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       if (Eval::useNNUE)
       {
           // Add drop piece
-          dp.piece[0] = pc;
-          dp.handPiece[0] = make_piece(dropColor, in_hand_piece_type(m));
-          dp.handCount[0] = pieceCountInHand[dropColor][in_hand_piece_type(m)];
-          dp.from[0] = SQ_NONE;
-          dp.to[0] = to;
+          init_dirty_piece_entry(dp, 0, pc, SQ_NONE, to, make_piece(dropColor, in_hand_piece_type(m)), pieceCountInHand[dropColor][in_hand_piece_type(m)]);
           if (paired_drop(m))
           {
               dp.dirty_num = 2;
-              dp.piece[1] = pc;
-              dp.handPiece[1] = make_piece(dropColor, in_hand_piece_type(m));
-              dp.handCount[1] = pieceCountInHand[dropColor][in_hand_piece_type(m)] - 1;
-              dp.from[1] = SQ_NONE;
-              dp.to[1] = secondary_drop_square(m);
+              init_dirty_piece_entry(dp, 1, pc, SQ_NONE, secondary_drop_square(m), make_piece(dropColor, in_hand_piece_type(m)), pieceCountInHand[dropColor][in_hand_piece_type(m)] - 1);
           }
 
           // Exchange drops also add a piece to the opponent's hand without any board
@@ -5229,9 +5821,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
       if (Eval::useNNUE)
       {
-          dp.piece[0] = pc;
-          dp.from[0] = from;
-          dp.to[0] = SQ_NONE;
+          init_dirty_piece_entry(dp, 0, pc, from, SQ_NONE, NO_PIECE, 0);
       }
 
       remove_piece(from);
@@ -5251,15 +5841,13 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           if (pureWallMove)
           {
               dp.dirty_num = 0;
-              dp.piece[0] = NO_PIECE;
+              init_dirty_piece_entry(dp, 0, NO_PIECE, SQ_NONE, SQ_NONE, NO_PIECE, 0);
           }
           else if (rifleShot)
               dp.dirty_num = std::min(dp.dirty_num, 1);
           else
           {
-              dp.piece[0] = pc;
-              dp.from[0] = from;
-              dp.to[0] = to;
+              init_dirty_piece_entry(dp, 0, pc, from, to, NO_PIECE, 0);
           }
       }
 
@@ -5290,9 +5878,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
           if (Eval::useNNUE)
           {
-              dp.piece[0] = pc;
-              dp.from[0] = SQ_NONE;
-              dp.to[0] = to;
+              init_dirty_piece_entry(dp, 0, pc, SQ_NONE, to, NO_PIECE, 0);
           }
 
           put_piece(pc, to, clonedPromoted, clonedUnpromoted);
@@ -5305,18 +5891,14 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       }
       else if (pullMove)
       {
-          Piece pulled = st->pulled.piece;
-          Square pullFrom = st->pullFromSquare;
+          Piece pulled = st->pulled.piece.piece;
+          Square pullFrom = st->pulled.square;
 
           if (Eval::useNNUE)
           {
               dp.dirty_num = 2;
-              dp.piece[0] = pc;
-              dp.from[0] = from;
-              dp.to[0] = to;
-              dp.piece[1] = pulled;
-              dp.from[1] = pullFrom;
-              dp.to[1] = from;
+              init_dirty_piece_entry(dp, 0, pc, from, to, NO_PIECE, 0);
+              init_dirty_piece_entry(dp, 1, pulled, pullFrom, from, NO_PIECE, 0);
           }
 
           move_piece(from, to);
@@ -5328,15 +5910,13 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           if (Eval::useNNUE)
           {
               dp.dirty_num = 2;
-              dp.piece[0] = pc;
-              dp.from[0] = from;
-              dp.to[0] = to;
-              dp.piece[1] = piece_on(to);
-              dp.from[1] = to;
-              dp.to[1] = from;
+              init_dirty_piece_entry(dp, 0, pc, from, to, NO_PIECE, 0);
+              init_dirty_piece_entry(dp, 1, piece_on(to), to, from, NO_PIECE, 0);
           }
 
           swap_piece(from, to);
+          if (type_of(piece_on(from)) == PAWN || type_of(piece_on(to)) == PAWN)
+              st->rule50 = 0;
       }
       else if (!rifleShot)
           move_piece(from, to);
@@ -5345,9 +5925,10 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   // If the moving piece is a pawn do some special extra work
   if (type_of(pc) == PAWN)
   {
-      if (type_of(m) == PROMOTION || type_of(m) == PIECE_PROMOTION)
+      st->rule50 = 0;
+      if (is_promotion_move(m) || type_of(m) == PIECE_PROMOTION)
       {
-          Piece promotion = make_piece(us, type_of(m) == PROMOTION ? promotion_type(m) : promoted_piece_type(PAWN));
+          Piece promotion = make_piece(us, is_promotion_move(m) ? promotion_type(m) : promoted_piece_type(PAWN));
           Piece promotedHandPiece = make_piece(us, type_of(promotion));
 
           assert((promotion_zone(pc) & to) || sittuyin_promotion());
@@ -5357,7 +5938,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           remove_piece(to);
           // Preserve exact source piece for variants with multiple promotion pawn types.
           put_piece(promotion, to, true, pc);
-          if (prison_pawn_promotion() && type_of(m) == PROMOTION) {
+          if (prison_pawn_promotion() && is_promotion_move(m)) {
               int addedN = add_to_prison(st->promotionPawn);
               int removedN = remove_from_prison(promotion);
               // Keep prison inventory hash in sync with promotion swap.
@@ -5399,56 +5980,23 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   }
 
       // Set en passant square(s) if the moved pawn can be captured
-      else if (   !topology_wraps()
-          && !dropMove
-          && (   std::abs(int(to) - int(from)) == 2 * NORTH
-              || std::abs(int(to) - int(from)) == 3 * NORTH))
+      else if (!dropMove)
       {
-          if (   (var->enPassantRegion[them] & (to - pawn_push(us)))
-              && ((pawn_attacks_bb(us, to - pawn_push(us)) & pieces(them, PAWN)) || (var->enPassantTypes[them] & ~piece_set(PAWN)))
-              && !(walling(us) && gating_square(m) == to - pawn_push(us)))
-          {
-              st->epSquares |= to - pawn_push(us);
-              k ^= Zobrist::enpassant[to - pawn_push(us)];
-          }
-          if (   std::abs(int(to) - int(from)) == 3 * NORTH
-              && (var->enPassantRegion[them] & (to - 2 * pawn_push(us)))
-              && ((pawn_attacks_bb(us, to - 2 * pawn_push(us)) & pieces(them, PAWN)) || (var->enPassantTypes[them] & ~piece_set(PAWN)))
-              && !(walling(us) && gating_square(m) == to - 2 * pawn_push(us)))
-          {
-              st->epSquares |= to - 2 * pawn_push(us);
-              k ^= Zobrist::enpassant[to - 2 * pawn_push(us)];
-          }
-      }
-      else if (!dropMove && topology_wraps())
-      {
-          auto stepped = [&](Square start, int count) {
-              Square s = start;
-              int forwardDr = us == WHITE ? 1 : -1;
-              for (int i = 0; i < count; ++i)
-              {
-                  Square next;
-                  if (!wrapped_destination_square(s, 0, forwardDr, max_file(), max_rank(), wraps_files(), wraps_ranks(), next))
-                      break;
-                  s = next;
-              }
-              return s;
-          };
+          Square step1 = pawn_step(from, us, 1);
+          Square step2 = pawn_step(from, us, 2);
+          Square step3 = pawn_step(from, us, 3);
 
           auto maybe_add_ep = [&](Square epSq) {
               if (   epSq != SQ_NONE
                   && (var->enPassantRegion[them] & epSq)
-                  && ((attacks_from(us, PAWN, epSq) & pieces(them, PAWN)) || (var->enPassantTypes[them] & ~piece_set(PAWN)))
+                  && (((topology_wraps() ? attacks_from(us, PAWN, epSq) : pawn_attacks_bb(us, epSq)) & pieces(them, PAWN))
+                      || (var->enPassantTypes[them] & ~piece_set(PAWN)))
                   && !(walling(us) && gating_square(m) == epSq))
               {
                   st->epSquares |= epSq;
                   k ^= Zobrist::enpassant[epSq];
               }
           };
-
-          Square step1 = stepped(from, 1);
-          Square step2 = stepped(from, 2);
-          Square step3 = stepped(from, 3);
 
           if (to == step2)
               maybe_add_ep(step1);
@@ -5462,9 +6010,9 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       // Update pawn hash key
       st->pawnKey ^= (!dropMove ? Zobrist::psq[pc][from] : 0) ^ Zobrist::psq[pc][to];
   }
-  else if (type_of(m) == PROMOTION || type_of(m) == PIECE_PROMOTION)
+  else if (is_promotion_move(m) || type_of(m) == PIECE_PROMOTION)
   {
-      Piece promotion = make_piece(us, type_of(m) == PROMOTION ? promotion_type(m) : promoted_piece_type(type_of(pc)));
+      Piece promotion = make_piece(us, is_promotion_move(m) ? promotion_type(m) : promoted_piece_type(type_of(pc)));
       Piece promotedHandPiece = make_piece(us, type_of(promotion));
 
       st->promotionPawn = piece_on(to);
@@ -5523,14 +6071,14 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       st->materialKey ^=  Zobrist::psq[demotion][pieceCount[demotion]-1]
                         ^ Zobrist::psq[pc][pieceCount[pc]];
 
-      // Update material
-      st->nonPawnMaterial[us] += PieceValue[MG][demotion] - PieceValue[MG][pc];
-  }
-  // Set en passant square(s) if the moved piece can be captured
-  else if (   !dropMove
-           && ((PseudoMoves[1][us][type_of(pc)][from] & ~PseudoMoves[0][us][type_of(pc)][from]) & to))
-  {
-      assert(type_of(pc) != PAWN);
+       // Update material
+       st->nonPawnMaterial[us] += PieceValue[MG][demotion] - PieceValue[MG][pc];
+   }
+   // Set en passant square(s) if the moved piece can be captured
+   else if (   !dropMove
+            && ((PseudoMoves[1][us][type_of(pc)][from] & ~PseudoMoves[0][us][type_of(pc)][from]) & to))
+   {
+       assert(type_of(pc) != PAWN);
       st->epSquares = between_bb(from, to) & var->enPassantRegion[them];
       if (st->epSquares)
       {
@@ -5558,11 +6106,9 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           return;
 
       Piece morphed = make_piece(color_of(cur), targetType);
-      if (!st->didMorph)
+      if (!st->transforms.morphedFrom)
       {
-          st->didMorph = true;
-          st->morphedFrom = cur;
-          st->morphSquare = sq;
+          st->transforms.morphedFrom.set(cur, is_promoted(sq), unpromoted_piece_on(sq), sq);
       }
 
       remove_piece(sq);
@@ -5591,7 +6137,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       && captured != NO_PIECE
       && !dropMove
       && type_of(m) != CASTLING
-      && type_of(m) != PROMOTION
+      && !is_promotion_move(m)
       && type_of(m) != PIECE_PROMOTION
       && !is_pass(m))
   {
@@ -5604,7 +6150,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
   if (   !dropMove
       && type_of(m) != CASTLING
-      && type_of(m) != PROMOTION
+      && !is_promotion_move(m)
       && type_of(m) != PIECE_PROMOTION
       && !is_pass(m))
   {
@@ -5614,12 +6160,12 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           apply_morph(moverSq, moveMorphType);
   }
   // Add gating piece
-  if (is_gating(m) && !rifleShot)
+  if (is_gating(m) && gating_type(m) != NO_PIECE_TYPE)
   {
       Square gate = gating_square(m);
       Piece gating_piece = make_piece(us, gating_type(m));
 
-      if (gatingPotion != Variant::POTION_TYPE_NB)
+      if (potCtx.potion != Variant::POTION_TYPE_NB)
       {
           int oldCount = pieceCountInHand[us][gating_type(m)];
           remove_from_hand(gating_piece);
@@ -5629,7 +6175,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           if (Eval::useNNUE)
               append_dirty(st, gating_piece, SQ_NONE, SQ_NONE, gating_piece, pieceCountInHand[us][gating_type(m)]);
       }
-      else
+      else if (!rifleShot)
       {
           if (Eval::useNNUE)
               // Add gating piece
@@ -5646,7 +6192,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
           st->gatesBB[us] ^= gate;
           k ^= Zobrist::psq[gating_piece][gate];
-          st->materialKey ^= Zobrist::psq[gating_piece][pieceCount[gating_piece]];
+          st->materialKey ^= Zobrist::psq[gating_piece][pieceCount[gating_piece] - 1];
           st->nonPawnMaterial[us] += PieceValue[MG][gating_piece];
 
           if (paired_drop(m))
@@ -5665,9 +6211,25 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
               }
 
               k ^= Zobrist::psq[gating_piece][gate2];
-              st->materialKey ^= Zobrist::psq[gating_piece][pieceCount[gating_piece]];
+              st->materialKey ^= Zobrist::psq[gating_piece][pieceCount[gating_piece] - 1];
               st->nonPawnMaterial[us] += PieceValue[MG][gating_piece];
           }
+      }
+  }
+
+  if (type_of(m) == PROMOTION_POTION && potCtx.potion != Variant::POTION_TYPE_NB)
+  {
+      PieceType potionPiece = potion_piece(potCtx.potion);
+      if (potionPiece != NO_PIECE_TYPE)
+      {
+          Piece gating_piece = make_piece(us, potionPiece);
+          int oldCount = pieceCountInHand[us][potionPiece];
+          remove_from_hand(gating_piece);
+          int newCount = pieceCountInHand[us][potionPiece];
+          xor_in_hand_count(k, gating_piece, oldCount, newCount);
+
+          if (Eval::useNNUE)
+              append_dirty(st, gating_piece, SQ_NONE, SQ_NONE, gating_piece, pieceCountInHand[us][potionPiece]);
       }
   }
 
@@ -5683,13 +6245,13 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
               xor_committed_gate(k, BLACK, file_of(from), st->removedGatingType);
           }
       }
-      if (captured) {
+      if (capturedBeforeStepwisePush) {
           // remove uncommitted musketeer piece if piece at the front row is captured
           Rank r = rank_of(to);
-          if (r == RANK_1 && color_of(captured) == WHITE){
+          if (r == RANK_1 && color_of(capturedBeforeStepwisePush) == WHITE){
               st->capturedGatingType = uncommit_piece(WHITE, file_of(to));
               xor_committed_gate(k, WHITE, file_of(to), st->capturedGatingType);
-          } else if (r == max_rank() && color_of(captured) == BLACK) {
+          } else if (r == max_rank() && color_of(capturedBeforeStepwisePush) == BLACK) {
               st->capturedGatingType = uncommit_piece(BLACK, file_of(to));
               xor_committed_gate(k, BLACK, file_of(to), st->capturedGatingType);
           }
@@ -5737,7 +6299,8 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
          ( blast_on_move() && !captured && !is_self_destruct(m) ) ||
          ( blast_on_self_destruct() && is_self_destruct(m) ) ||
          var->blastPassiveTypes ||
-         ( remove_connect_n() > 0 )
+         ( remove_connect_n() > 0 ) ||
+         ( pi && pi->has_universal_hopper() && jumpCapsq != SQ_NONE )
        )
        && !is_pass(m)
      )
@@ -5755,7 +6318,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
            ( blast_on_move() && !captured && !is_self_destruct(m) ) ||
            ( blast_on_self_destruct() && is_self_destruct(m) ) ) {
 
-          blast_mask = (blastOnCaptureMove || blast_on_move() || blast_on_self_destruct()) ? blast_squares(captured ? st->captureSquare : to)
+          blast_mask = (blastOnCaptureMove || blast_on_move() || blast_on_self_destruct()) ? blast_squares(captured ? (blast_on_capture_mover_center() ? moverSq : st->captured.square) : to)
               : (var->petrifyOnCaptureTypes & type_of(pc) ? square_bb(moverSq) : Bitboard(0));
           if (captured && blastOnCaptureMove && (blast_immune_types() & movedType))
               blast_mask &= ~square_bb(moverSq);
@@ -5783,128 +6346,34 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       //A piece could be immune to blast but not immune to custodial.
 
       if ( surround_capture_opposite() || surround_capture_intervene() || surround_capture_edge() ) {
-          for (int sign : {-1, 1}) {
-
-              for (const Direction& d : var->connectDirections)
-              //using getConnectDirections to determine whether two pieces are connected
-              //in that they can capture a piece between them. if there was a
-              //variant with connection as a victory condition, and different
-              //directions for surround-capture, yes, we'd have to separate them
-              {
-                  Direction mod_d = d * sign;
-                  Square s = moverSq + mod_d;
-                  if (!is_ok(s)) continue;
-                  if (!(s&pieces(~us))) continue;
-                  Square oppSquare = s + mod_d;
-
-                  if (s & surround_capture_max_region()) {
-                      bool surrounded = true;
-                      Bitboard b = attacks_bb(us, WAZIR, s, pieces(~us));
-                      while(b) {
-                          Square s2 = pop_lsb(b);
-                          if (!((s2 & surround_capture_hostile_region()) || (s2 & pieces(us)))) {
-                              surrounded = false;
-                              break;
-                          };
-                      };
-                      if (surrounded) { removal_mask |= s; } else continue;
-                  };
-
-                  if (!is_ok(oppSquare)) {
-                      if (surround_capture_edge()) removal_mask |= s;
-                  }
-                  else {
-                      if (surround_capture_opposite() && ((pieces(us) & oppSquare) || (surround_capture_hostile_region() & oppSquare))) removal_mask |= s;
-                  };
-              };
-          };
-      };
-
-      if (surround_capture_intervene()) {
-          for (const Direction& d : var->connectDirections)
-          {
-              Square s1 = moverSq + d;
-              Square s2 = moverSq - d;
-              if (!is_ok(s1) || !is_ok(s2))
-                  continue;
-              if ((s1 & pieces(~us)) && (s2 & pieces(~us)))
-                  removal_mask |= s1 | s2;
-          }
+          removal_mask |= compute_surround_capture_mask(moverSq, pieces(us), pieces(~us), pieces());
       }
 
-      if (remove_connect_n() > 0) {
-          auto mark_line = [&](Bitboard line) {
-              for (Direction d : var->connectDirections) {
-                  Bitboard temp = line;
-                  for (int i = 1; i < remove_connect_n(); ++i)
-                      temp &= shift(d, temp);
+      if (pi && pi->has_universal_hopper() && jumpCapsq != SQ_NONE)
+      {
+          removal_mask |= locust_all_mask;
+      }
 
-                  Bitboard lineStarts = temp;
-                  while (lineStarts) {
-                      Square start = pop_lsb(lineStarts);
-                      for (int i = 0; i < remove_connect_n(); ++i) {
-                          Square sq = start - i * d;
-                          if (is_ok(sq)) {
-                              removal_mask |= sq;
-                              connect_mask |= sq;
-                          }
-                      }
-                  }
-              }
-          };
-
-          if (remove_connect_n_by_type()) {
-              for (PieceSet ps = variant()->pieceTypes; ps; ) {
+      if (remove_connect_n() > 0)
+      {
+          std::vector<Bitboard> baseLines;
+          if (remove_connect_n_by_type())
+          {
+              baseLines.resize(PIECE_TYPE_NB, 0);
+              for (PieceSet ps = variant()->pieceTypes; ps; )
+              {
                   PieceType pt = pop_lsb(ps);
-                  Bitboard line = pieces(pt);
-
-                  // removeConnectN is evaluated after move effects. With blastPromotion,
-                  // adjust per-type occupancy to the post-promotion type map.
-                  if (blast_promotion() && blast_mask) {
-                      Bitboard b = blast_mask;
-                      while (b) {
-                          Square sq = pop_lsb(b);
-                          Piece p = piece_on(sq);
-                          if (p == NO_PIECE)
-                              continue;
-
-                          PieceType fromPt = type_of(p);
-                          PieceType toPt = promoted_piece_type(fromPt);
-
-                          if (fromPt == pt)
-                              line &= ~square_bb(sq);
-                          if (toPt == pt)
-                              line |= square_bb(sq);
-                      }
-                  }
-
-                  mark_line(line);
+                  baseLines[pt] = pieces(pt);
               }
-          } else {
-              Bitboard whiteLine = pieces(WHITE);
-              Bitboard blackLine = pieces(BLACK);
-
-              // Color ownership is stable under blastPromotion, except when a piece
-              // has no promoted target and is therefore removed.
-              if (blast_promotion() && blast_mask) {
-                  Bitboard b = blast_mask;
-                  while (b) {
-                      Square sq = pop_lsb(b);
-                      Piece p = piece_on(sq);
-                      if (p == NO_PIECE)
-                          continue;
-                      if (promoted_piece_type(type_of(p)) == NO_PIECE_TYPE) {
-                          if (color_of(p) == WHITE)
-                              whiteLine &= ~square_bb(sq);
-                          else
-                              blackLine &= ~square_bb(sq);
-                      }
-                  }
-              }
-
-              mark_line(whiteLine);
-              mark_line(blackLine);
           }
+          else
+          {
+              baseLines.resize(COLOR_NB, 0);
+              baseLines[WHITE] = pieces(WHITE);
+              baseLines[BLACK] = pieces(BLACK);
+          }
+          Bitboard removalMask = compute_remove_connect_n_mask(baseLines, removal_mask, blast_mask, connect_mask);
+          removal_mask |= removalMask;
       }
 
       while (removal_mask)
@@ -5930,6 +6399,10 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
                   }
 
                   k ^= Zobrist::psq[bpc][bsq] ^ Zobrist::psq[promotedPiece][bsq];
+                  if (type_of(bpc) == PAWN)
+                      st->pawnKey ^= Zobrist::psq[bpc][bsq];
+                  if (type_of(promotedPiece) == PAWN)
+                      st->pawnKey ^= Zobrist::psq[promotedPiece][bsq];
                   st->materialKey ^= Zobrist::psq[promotedPiece][pieceCount[promotedPiece] - 1]
                                   ^ Zobrist::psq[bpc][pieceCount[bpc]];
                   st->nonPawnMaterial[bc] += PieceValue[MG][promotedPiece]
@@ -5962,35 +6435,19 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
           // Points assignment logic
           if (points_counting()) {
-              int pts = var->piecePoints[type_of(bpc)];
-              switch (points_rule_captures()) {
-                  case POINTS_US:    st->pointsCount[us]  += pts; break;
-                  case POINTS_THEM:  st->pointsCount[~us] += pts; break;
-                  case POINTS_OWNER: st->pointsCount[bc]  += pts; break;
-                  case POINTS_NON_OWNER: st->pointsCount[~bc] += pts; break;
-                 default: break;
-              }
+              add_capture_points(st, us, bpc);
           }
 
           bool petrifiedCenter = bsq == moverSq && (var->petrifyOnCaptureTypes & type_of(bpc));
           Piece transferPiece = reserve_transfer_piece(us, bpc, capturedPromoted, unpromotedCaptured,
                                                        drop_loop(), var->captureToHandSide,
                                                        main_promotion_pawn_type(color_of(bpc)));
-          if (captures_to_hand() && !petrifiedCenter && !st->suppressedCaptureTransfer && (capture_to_hand_types() & type_of(transferPiece)))
+          if (!petrifiedCenter)
           {
-              Piece pieceToHand = transferPiece;
-              int n;
-              if (capture_type() == PRISON) {
-                  pieceToHand = ~pieceToHand;
-                  n = add_to_prison(pieceToHand);
-              } else {
-                  add_to_hand(pieceToHand);
-                  n = pieceCountInHand[color_of(pieceToHand)][type_of(pieceToHand)];
-              }
-              xor_in_hand_count(k, pieceToHand, n - 1, n);
-
-              if (Eval::useNNUE && bycatchDirtyIdx >= 0)
+              bool transferred = add_capture_transfer(st, transferPiece, &k);
+              if (Eval::useNNUE && bycatchDirtyIdx >= 0 && transferred)
               {
+                  Piece pieceToHand = capture_type() == PRISON ? ~transferPiece : transferPiece;
                   dp.handPiece[bycatchDirtyIdx] = pieceToHand;
                   dp.handCount[bycatchDirtyIdx] = pieceCountInHand[color_of(pieceToHand)][type_of(pieceToHand)];
               }
@@ -6106,16 +6563,12 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       }
   };
 
-  bool diesOnCapture = (death_on_capture_types() & piece_set(movedType))
-                    || (captured != NO_PIECE && zeroRangeBlastOnCaptureMove && !(blast_immune_types() & movedType));
+  bool diesOnCapture = (death_on_capture_types() & piece_set(movedType));
   if (!capturedDeadSquare && captured != NO_PIECE && !dropMove && diesOnCapture
       && piece_on(moverSq) != NO_PIECE)
   {
       bool makeDeadSquare = bool(death_on_capture_types() & piece_set(movedType));
       remove_destination_piece_no_capture_effects(moverSq, makeDeadSquare);
-
-      if (!allow_checks() && givesCheck && count<KING>(them))
-          givesCheck = bool(attackers_to_king(square<KING>(them), us) & pieces(us));
   }
 
   Bitboard localBycatch = st->bycatchSquares & (blast_pattern(moverSq) | square_bb(moverSq));
@@ -6129,12 +6582,10 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   {
       Piece cur = piece_on(moverSq);
       Piece changed = make_piece(them, type_of(cur));
-      st->didColorChange = true;
-      st->colorChanged.set(cur, is_promoted(moverSq), unpromoted_piece_on(moverSq));
-      st->colorChangeSquare = moverSq;
+      st->transforms.colorChanged.set(cur, is_promoted(moverSq), unpromoted_piece_on(moverSq), moverSq);
 
       remove_piece(moverSq);
-      put_piece(changed, moverSq, st->colorChanged.promoted, st->colorChanged.unpromoted);
+      put_piece(changed, moverSq, st->transforms.colorChanged.piece.promoted, st->transforms.colorChanged.piece.unpromoted);
 
       k ^= Zobrist::psq[cur][moverSq] ^ Zobrist::psq[changed][moverSq];
       st->materialKey ^= Zobrist::psq[cur][pieceCount[cur]]
@@ -6165,7 +6616,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
                                     : false;
           st->forcedJumpStep = st->previous->forcedJumpStep;
       }
-      else if (jumpCapsq != SQ_NONE && type_of(m) != PROMOTION && type_of(m) != PIECE_PROMOTION
+      else if (jumpCapsq != SQ_NONE && !is_promotion_move(m) && type_of(m) != PIECE_PROMOTION
             && piece_on(moverSq) != NO_PIECE
             && color_of(piece_on(moverSq)) == us)
       {
@@ -6210,7 +6661,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           if (potion_piece(potion) == NO_PIECE_TYPE)
               continue;
 
-          if (gatingPotion == potion)
+          if (potCtx.potion == potion)
           {
               int cooldown = var->potionCooldown[pt];
               st->potionCooldown[us][pt] = std::max(cooldown - 1, 0);
@@ -6219,7 +6670,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
               --st->potionCooldown[us][pt];
       }
 
-      st->potionZones[us][Variant::POTION_FREEZE] = gatingPotion == Variant::POTION_FREEZE ? freezeExtra : Bitboard(0);
+      st->potionZones[us][Variant::POTION_FREEZE] = potCtx.potion == Variant::POTION_FREEZE ? potCtx.freezeExtra : Bitboard(0);
       st->potionZones[us][Variant::POTION_JUMP] = Bitboard(0);
 
       st->potionZones[them][Variant::POTION_FREEZE] = Bitboard(0);
@@ -6264,7 +6715,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
           st->countingPly = 2 * count<ALL_PIECES>() - 1;
       }
 
-      if ((!st->countingLimit || ((captured || type_of(m) == PROMOTION) && count<ALL_PIECES>(sideToMove) == 1)) && count_limit(sideToMove))
+      if ((!st->countingLimit || ((captured || is_promotion_move(m)) && count<ALL_PIECES>(sideToMove) == 1)) && count_limit(sideToMove))
       {
           st->countingLimit = 2 * count_limit(sideToMove);
           st->countingPly = counting_rule() == ASEAN_COUNTING || count<ALL_PIECES>(sideToMove) > 1 ? 0 : 2 * count<ALL_PIECES>();
@@ -6318,9 +6769,18 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       }
   }
 
+#ifndef NDEBUG
+  if (Eval::useNNUE)
+  {
+      for (int i = 0; i < st->dirtyPiece.dirty_num; ++i) {
+          assert(st->dirtyPiece.piece[i] != NO_PIECE);
+          assert(st->dirtyPiece.from[i] != SQ_NONE || st->dirtyPiece.to[i] != SQ_NONE || st->dirtyPiece.handPiece[i] != NO_PIECE);
+      }
+  }
+#endif
+
   assert(pos_is_ok());
 }
-
 
 /// Position::undo_move() unmakes a move. When it returns, the position should
 /// be restored to exactly the same state as before the move was made.
@@ -6334,7 +6794,7 @@ void Position::undo_move(Move m) {
   Color us = sideToMove;
   Square from = from_sq(m);
   Square to = to_sq(m);
-  bool rifleShot = rifle_capture(m) && st->captured.piece != NO_PIECE && type_of(m) != CASTLING;
+  bool rifleShot = rifle_capture(m) && st->captured.piece.piece != NO_PIECE && type_of(m) != CASTLING;
   bool cloneMove = is_clone_move(m);
   bool pullMove = is_pull_move(m);
   bool swapMove = is_swap_move(m);
@@ -6348,14 +6808,14 @@ void Position::undo_move(Move m) {
                             && !st->pass;
 
   assert(is_drop_move(m) || empty(from) || type_of(m) == CASTLING || is_gating(m)
-         || (type_of(m) == PROMOTION && sittuyin_promotion())
+         || (is_promotion_move(m) && sittuyin_promotion())
          || is_pass(m)
          || pullMove
          || swapMove
          || wasOpeningSelfRemoval
          || (commit_gates() && st->removedGatingType > NO_PIECE_TYPE)
   );
-  assert(type_of(st->captured.piece) != KING || allow_checks() || !checking_permitted());
+  assert(type_of(st->captured.piece.piece) != KING || allow_checks() || !checking_permitted());
 
   // Reset wall squares
   byTypeBB[ALL_PIECES] ^= st->wallSquares ^ st->previous->wallSquares;
@@ -6365,8 +6825,8 @@ void Position::undo_move(Move m) {
   if (
        ( surround_capture_opposite() || surround_capture_intervene() || surround_capture_edge() ) ||
        ( st->bycatchSquares ) ||
-       ( st->captured.piece && var->petrifyOnCaptureTypes ) ||
-       ( blast_on_move() && !st->captured.piece && !is_self_destruct(st->move) ) ||
+       ( st->captured.piece.piece && var->petrifyOnCaptureTypes ) ||
+       ( blast_on_move() && !st->captured.piece.piece && !is_self_destruct(st->move) ) ||
        ( blast_on_self_destruct() && is_self_destruct(st->move) ) ||
        ( remove_connect_n() > 0 )
      )
@@ -6396,35 +6856,35 @@ void Position::undo_move(Move m) {
               Piece transferPiece = reserve_transfer_piece(us, bpc, bool((st->promotedBycatch | st->demotedBycatch) & bsq), unpromotedBpc,
                                                            drop_loop(), var->captureToHandSide,
                                                            main_promotion_pawn_type(color_of(unpromotedBpc)));
-              if (!wasBlastPromoted && !petrifiedCenter && !st->suppressedCaptureTransfer && capture_type() == HAND && (capture_to_hand_types() & type_of(transferPiece))) {
-                  remove_from_hand(transferPiece);
-              } else if (!wasBlastPromoted && !petrifiedCenter && !st->suppressedCaptureTransfer && capture_type() == PRISON) {
-                  remove_from_prison(!drop_loop() && (st->promotedBycatch & bsq)
-                                    ? make_piece(color_of(unpromotedBpc), main_promotion_pawn_type(color_of(unpromotedBpc)))
-                                    : unpromotedBpc);
-              }
+               if (!wasBlastPromoted && !petrifiedCenter)
+               {
+                   undo_capture_transfer(st, transferPiece);
+               }
           }
       }
       // Reset piece since it exploded itself
       pc = piece_on(moverSq);
   }
 
-  if (st->didMorph && st->morphSquare == moverSq)
+  // do_move applies morphing before color changes, so undo restores color first.
+  if (st->transforms.colorChanged && st->transforms.colorChanged.square == moverSq)
   {
       remove_piece(moverSq);
-      put_piece(st->morphedFrom, moverSq);
-      pc = st->morphedFrom;
+      put_piece(st->transforms.colorChanged.piece.piece, moverSq, st->transforms.colorChanged.piece.promoted, st->transforms.colorChanged.piece.unpromoted);
+      pc = st->transforms.colorChanged.piece.piece;
   }
 
-  if (st->didColorChange && st->colorChangeSquare == moverSq)
+  if (st->transforms.morphedFrom && st->transforms.morphedFrom.square == moverSq)
   {
       remove_piece(moverSq);
-      put_piece(st->colorChanged.piece, moverSq, st->colorChanged.promoted, st->colorChanged.unpromoted);
-      pc = st->colorChanged.piece;
+      put_piece(st->transforms.morphedFrom.piece.piece, moverSq,
+                st->transforms.morphedFrom.piece.promoted, st->transforms.morphedFrom.piece.unpromoted);
+      pc = st->transforms.morphedFrom.piece.piece;
   }
 
-  // Remove gated piece or restore potion
-  if (is_gating(m))
+  // Remove gated piece or restore potion. Pure wall moves use the gating
+  // square to encode the wall destination, but do not place a gated piece.
+  if (is_gating(m) && gating_type(m) != NO_PIECE_TYPE)
   {
       Piece gating_piece = make_piece(us, gating_type(m));
       Variant::PotionType potion = potion_type_from_piece(var, gating_type(m));
@@ -6440,6 +6900,26 @@ void Position::undo_move(Move m) {
           if (gating_from_hand())
               add_to_hand(gating_piece);
           st->gatesBB[us] |= gating_square(m);
+
+          if (paired_drop(m))
+          {
+              Square gate2 = secondary_drop_square(m);
+              remove_piece(gate2);
+              board[gate2] = NO_PIECE;
+              if (gating_from_hand())
+                  add_to_hand(gating_piece);
+          }
+      }
+  }
+
+  if (type_of(m) == PROMOTION_POTION)
+  {
+      Variant::PotionType potion = static_cast<Variant::PotionType>(potion_type(m));
+      PieceType potionPiece = potion_piece(potion);
+      if (potionPiece != NO_PIECE_TYPE)
+      {
+          Piece gating_piece = make_piece(us, potionPiece);
+          add_to_hand(gating_piece);
       }
   }
 
@@ -6469,10 +6949,10 @@ void Position::undo_move(Move m) {
   }
   if (commit_gates() && st->captured.piece && st->capturedGatingType > NO_PIECE_TYPE){
       // return musketeer piece fronted by the captured piece
-      commit_piece(make_piece(color_of(st->captured.piece), st->capturedGatingType), file_of(to));
+      commit_piece(make_piece(color_of(st->captured.piece.piece), st->capturedGatingType), file_of(to));
   }
 
-  if (type_of(m) == PROMOTION)
+  if (is_promotion_move(m))
   {
       assert((promotion_zone(st->promotionPawn) & to) || sittuyin_promotion());
       Piece promotedPiece = piece_on(moverSq);
@@ -6537,13 +7017,19 @@ void Position::undo_move(Move m) {
               put_piece(st->dead.piece, from, st->dead.promoted, st->dead.unpromoted);
               pc = piece_on(from);
           }
-          else if (st->dead.piece && type_of(m) != PROMOTION && type_of(m) != PIECE_PROMOTION)
+          else if (st->dead.piece && !is_promotion_move(m) && type_of(m) != PIECE_PROMOTION)
           {
               if (st->deadSquares & moverSq)
               {
                   st->deadSquares ^= moverSq;
                   put_piece(st->dead.piece, moverSq, st->dead.promoted, st->dead.unpromoted);
                   pc = piece_on(moverSq);
+              }
+              else if (st->deadSquares & to)
+              {
+                  st->deadSquares ^= to;
+                  put_piece(st->dead.piece, to, st->dead.promoted, st->dead.unpromoted);
+                  pc = piece_on(to);
               }
               else
               {
@@ -6562,7 +7048,7 @@ void Position::undo_move(Move m) {
           else if (pullMove)
           {
               if (piece_on(from) != NO_PIECE)
-                  move_piece(from, st->pullFromSquare);
+                  move_piece(from, st->pulled.square);
               move_piece(to, from);
           }
           else if (swapMove)
@@ -6571,64 +7057,58 @@ void Position::undo_move(Move m) {
               move_piece(to, from); // Put the piece back at the source square when the mover survived on 'to'
       }
 
-      if (st->didPush && st->pushStepwise)
+      if (st->push.didPush && st->push.stepwise)
       {
-          for (int i = 0; i < st->pushTransferCount; ++i)
+          for (int i = 0; i < st->push.transferCount; ++i)
           {
-              Piece transferred = st->pushTransferPieces[i];
+              Piece transferred = st->push.transfers[i].piece;
               Piece transferPiece = reserve_transfer_piece(us, transferred,
-                                                           (st->pushTransferPromoted & (1U << i)),
-                                                           st->pushTransferUnpromoted[i],
+                                                           st->push.transfers[i].promoted,
+                                                           st->push.transfers[i].unpromoted,
                                                            drop_loop(), var->captureToHandSide,
                                                            main_promotion_pawn_type(color_of(transferred)));
-              if (capture_type() == HAND && (capture_to_hand_types() & type_of(transferPiece)))
-                  remove_from_hand(transferPiece);
-              else if (capture_type() == PRISON)
-              {
-                  Piece prisonPiece = !drop_loop() && (st->pushTransferPromoted & (1U << i))
-                        ? (st->pushTransferUnpromoted[i]
-                           ? st->pushTransferUnpromoted[i]
-                           : make_piece(color_of(transferred), main_promotion_pawn_type(color_of(transferred))))
-                        : transferred;
-                  remove_from_prison(prisonPiece);
-              }
+              undo_capture_transfer(st, transferPiece);
           }
 
-          for (int i = 0; i < st->pushSnapshotCount; ++i)
-              if (piece_on(st->pushSnapshotSquares[i]) != NO_PIECE)
-                  remove_piece(st->pushSnapshotSquares[i]);
+          for (int i = 0; i < st->push.snapshotCount; ++i)
+              if (piece_on(st->push.snapshots[i].sq) != NO_PIECE)
+                  remove_piece(st->push.snapshots[i].sq);
 
-          for (int i = 0; i < st->pushSnapshotCount; ++i)
+          for (int i = 0; i < st->push.snapshotCount; ++i)
           {
-              if (st->pushSnapshotPieces[i] == NO_PIECE)
+              if (st->push.snapshots[i].piece == NO_PIECE)
               {
-                  board[st->pushSnapshotSquares[i]] = NO_PIECE;
+                  board[st->push.snapshots[i].sq] = NO_PIECE;
                   continue;
               }
-              put_piece(st->pushSnapshotPieces[i], st->pushSnapshotSquares[i],
-                        (st->pushSnapshotPromoted & (1U << i)), st->pushSnapshotUnpromoted[i]);
+              put_piece(st->push.snapshots[i].piece, st->push.snapshots[i].sq,
+                        st->push.snapshots[i].promoted, st->push.snapshots[i].unpromoted);
           }
       }
-      else if (st->didPush)
+      else if (st->push.didPush)
       {
           Square source = SQ_NONE;
           Square finalSource = SQ_NONE;
-          if (st->pushBlockedCapture)
+          if (st->push.blockedCapture)
           {
-              if (st->pushCount > 1)
+              if (st->push.count > 1)
               {
-                  source = st->pushTailSquare;
-                  finalSource = make_square(File(int(file_of(to)) + st->pushStepF),
-                                            Rank(int(rank_of(to)) + st->pushStepR));
+                  source = st->push.tailSquare;
+                  finalSource = make_square(File(int(file_of(to)) + st->push.stepF),
+                                            Rank(int(rank_of(to)) + st->push.stepR));
               }
           }
-          else if (advance_square(*this, to, st->pushStepF, st->pushStepR, source))
+          else if (advance_square(*this, to, st->push.stepF, st->push.stepR, source))
           {
-              finalSource = st->pushTailSquare;
-              if (!st->pushEjected)
+              finalSource = st->push.tailSquare;
+              if (!st->push.ejected)
               {
-                  if (!advance_square(*this, st->pushTailSquare, st->pushStepF, st->pushStepR, finalSource))
-                      assert(false && "stored push state missing tail destination");
+#ifndef NDEBUG
+                  bool advanced = advance_square(*this, st->push.tailSquare, st->push.stepF, st->push.stepR, finalSource);
+                  assert(advanced && "stored push state missing tail destination");
+#else
+                  advance_square(*this, st->push.tailSquare, st->push.stepF, st->push.stepR, finalSource);
+#endif
               }
           }
 
@@ -6636,45 +7116,33 @@ void Position::undo_move(Move m) {
           {
               while (true)
               {
-                  Square dest = make_square(File(int(file_of(source)) - st->pushStepF),
-                                            Rank(int(rank_of(source)) - st->pushStepR));
+                  Square dest = make_square(File(int(file_of(source)) - st->push.stepF),
+                                            Rank(int(rank_of(source)) - st->push.stepR));
                   move_piece(source, dest);
                   if (source == finalSource)
                       break;
-                  if (!advance_square(*this, source, st->pushStepF, st->pushStepR, source))
+                  if (!advance_square(*this, source, st->push.stepF, st->push.stepR, source))
                       break;
               }
           }
       }
 
-      if (st->captured.piece)
+      if (st->captured)
       {
-          Square capsq = to;
+          Square capsq = st->captured.square != SQ_NONE ? st->captured.square : to;
 
           if (type_of(m) == EN_PASSANT)
           {
-              capsq = st->captureSquare;
-
               assert(st->previous->epSquares & to);
               assert(var->enPassantRegion[sideToMove] & to);
               assert(piece_on(capsq) == NO_PIECE);
           }
-          else if (st->captureSquare != SQ_NONE)
-              capsq = st->captureSquare;
 
-          put_piece(st->captured.piece, capsq, st->captured.promoted, st->captured.unpromoted); // Restore the captured piece
-          Piece transferPiece = reserve_transfer_piece(us, st->captured.piece, st->captured.promoted, st->captured.unpromoted,
+          put_piece(st->captured.piece.piece, capsq, st->captured.piece.promoted, st->captured.piece.unpromoted); // Restore the captured piece
+          Piece transferPiece = reserve_transfer_piece(us, st->captured.piece.piece, st->captured.piece.promoted, st->captured.piece.unpromoted,
                                                        drop_loop(), var->captureToHandSide,
-                                                       main_promotion_pawn_type(color_of(st->captured.piece)));
-          if (!st->suppressedCaptureTransfer && capture_type() == HAND && (capture_to_hand_types() & type_of(transferPiece))) {
-              remove_from_hand(transferPiece);
-          } else if (!st->suppressedCaptureTransfer && capture_type() == PRISON) {
-              remove_from_prison(!drop_loop() && st->captured.promoted
-                               ? (st->captured.unpromoted
-                                  ? st->captured.unpromoted
-                                  : make_piece(color_of(st->captured.piece), main_promotion_pawn_type(color_of(st->captured.piece))))
-                               : st->captured.piece);
-          }
+                                                       main_promotion_pawn_type(color_of(st->captured.piece.piece)));
+          undo_capture_transfer(st, transferPiece);
       }
   }
 
@@ -6705,10 +7173,8 @@ void Position::undo_move(Move m) {
 template<bool Do>
 void Position::do_castling(Color us, Square from, Square& to, Square& rfrom, Square& rto) {
 
-  bool kingSide = to > from;
   rfrom = to; // Castling is encoded as "king captures friendly rook"
-  to = make_square(kingSide ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
-  rto = to + (kingSide ? WEST : EAST);
+  castling_destinations(us, from, rfrom, to, rto);
 
   Piece castlingKingPiece = piece_on(Do ? from : to);
   Piece castlingRookPiece = piece_on(Do ? rfrom : rto);
@@ -6757,16 +7223,24 @@ void Position::do_null_move(StateInfo& newSt) {
   assert(!evasion_checkers());
   assert(&newSt != st);
 
-  std::memcpy(static_cast<void*>(&newSt), static_cast<const void*>(st), offsetof(StateInfo, accumulator));
+  static_cast<StateInfoCopied&>(newSt) = static_cast<const StateInfoCopied&>(*st);
 
   newSt.previous = st;
   st = &newSt;
+  st->key = st->previous->key;
 
-  st->dirtyPiece.dirty_num = 0;
-  st->dirtyPiece.piece[0] = NO_PIECE; // Avoid checks in UpdateAccumulator()
+  clear_dirty_piece(st);
   st->accumulator.computed[WHITE] = false;
   st->accumulator.computed[BLACK] = false;
   st->nnueRefreshNeeded = false;
+
+  st->move = MOVE_NULL;
+  clear_move_undo_state(st);
+#ifndef NDEBUG
+  assert_no_move_undo_payload(st);
+#endif
+  st->shak = false;
+  st->bikjang = false;
 
   while (st->epSquares)
       st->key ^= Zobrist::enpassant[pop_lsb(st->epSquares)];
@@ -6820,55 +7294,13 @@ Key Position::key_after(Move m) const {
       Piece removedPiece = reserve_transfer_piece(sideToMove, captured, is_promoted(to), unpromoted_piece_on(to),
                                                   drop_loop(), var->captureToHandSide,
                                                   main_promotion_pawn_type(color_of(captured)));
-      if (captures_to_hand() && (capture_to_hand_types() & type_of(removedPiece))) {
-          int n;
-          if (capture_type() == HAND) {
-              n = pieceCountInHand[color_of(removedPiece)][type_of(removedPiece)];
-          } else {
-              n = pieceCountInPrison[color_of(removedPiece)][type_of(removedPiece)];
-              removedPiece = ~removedPiece;
-          }
-          {
-              xor_in_hand_count(k, removedPiece, n + 1, n);
-          }
-      }
+      simulate_capture_transfer(k, removedPiece, false);
   }
   if (is_drop_move(m))
   {
-      Piece pc_hand = make_piece(sideToMove, in_hand_piece_type(m));
       PieceType exchanged = exchange_piece(m);
-      k ^= Zobrist::psq[pc][to];
-      if (paired_drop(m))
-      {
-          Square to2 = secondary_drop_square(m);
-          k ^= Zobrist::psq[pc][to2];
-          int n = pieceCountInHand[color_of(pc_hand)][type_of(pc_hand)];
-          xor_in_hand_count(k, pc_hand, n - 2, n);
-          return k;
-      }
-
-      if (exchanged == NO_PIECE_TYPE)
-      {
-          int n = pieceCountInHand[color_of(pc_hand)][type_of(pc_hand)];
-          xor_in_hand_count(k, pc_hand, n - 1, n);
-          return k;
-      }
-
-      Color us = sideToMove;
-      Color them = ~us;
-      Piece exchangedPiece = make_piece(them, exchanged);
-
-      int handOld = pieceCountInHand[them][exchanged];
-      int handNew = handOld + 1;
-      xor_in_hand_count(k, exchangedPiece, handOld, handNew);
-
-      int prisonOldEx = pieceCountInPrison[us][exchanged];
-      int prisonNewEx = prisonOldEx - 1;
-      xor_in_hand_count(k, exchangedPiece, prisonOldEx, prisonNewEx);
-
-      int prisonOldDrop = pieceCountInPrison[them][type_of(pc)];
-      int prisonNewDrop = prisonOldDrop - 1;
-      xor_in_hand_count(k, pc, prisonOldDrop, prisonNewDrop);
+      Color dropColor = drop_hand_color(sideToMove, in_hand_piece_type(m));
+      apply_drop_hash_delta(k, m, pc, dropColor, exchanged);
       return k;
   }
 
@@ -6882,12 +7314,9 @@ Value Position::blast_see(Move m) const {
   Square from = from_sq(m);
   Square to = to_sq(m);
   Piece mover = moved_piece(m);
-  Piece victim = captured_piece(m);
   Color us = color_of(mover);
   Bitboard fromto = is_drop_move(m) ? square_bb(to) | (paired_drop(m) ? square_bb(secondary_drop_square(m)) : Bitboard(0)) : from | to;
-  Bitboard blast = blast_squares(capture(m) ? capture_square(m) : to);
-  if (capture(m) && zero_range_blast_on_capture(mover, victim) && !(blast_immune_types() & type_of(mover)))
-      blast |= square_bb(is_drop_move(m) ? to : from);
+  Bitboard blast = blast_squares(capture(m) ? (blast_on_capture_mover_center() ? (rifle_capture(m) ? from : to) : capture_square(m)) : to);
 
   // If the explosion would capture an opponent royal or pseudo-royal piece,
   // treat the move as delivering immediate mate. This prevents the static
@@ -6966,6 +7395,7 @@ Value Position::blast_see(Move m) const {
 /// algorithm similar to alpha-beta pruning with a null window.
 
 bool Position::see_ge(Move m, Value threshold) const {
+  SimulatedMoveGuard guard(*this, m);
 
   assert(is_ok(m));
 
@@ -7219,7 +7649,7 @@ bool Position::n_fold_game_end(Value& result, int ply, int target) const {
 bool Position::is_optional_game_end(Value& result, int ply, int countStarted) const {
 
   // n-move rule
-  if (n_move_rule() && st->rule50 > (2 * n_move_rule() - 1) && (!evasion_checkers() || MoveList<LEGAL>(*this).size()))
+  if (n_move_rule() && st->rule50 > (2 * n_move_rule() - 1) && (!evasion_checkers() || has_legal_move_ignoring_immediate_end()))
   {
       int offset = 0;
       if (var->chasingRule == AXF_CHASING && st->pliesFromNull >= 20)
@@ -7250,7 +7680,7 @@ bool Position::is_optional_game_end(Value& result, int ply, int countStarted) co
   if (   counting_rule()
       && st->countingLimit
       && counting_ply(countStarted) > counting_limit(countStarted)
-      && (!evasion_checkers() || MoveList<LEGAL>(*this).size()))
+      && (!evasion_checkers() || has_legal_move_ignoring_immediate_end()))
   {
       result = VALUE_DRAW;
       return true;
@@ -7264,7 +7694,7 @@ bool Position::is_optional_game_end(Value& result, int ply, int countStarted) co
   {
       bool promotionsOnly = true;
       for (const auto& m : MoveList<LEGAL>(*this))
-          if (type_of(m) != PROMOTION)
+          if (!is_promotion_move(m))
           {
               promotionsOnly = false;
               break;
@@ -7285,13 +7715,30 @@ bool Position::is_optional_game_end(Value& result, int ply, int countStarted) co
 
 bool Position::is_immediate_game_end(Value& result, int ply) const {
 
-  // Direct king capture ends the game immediately in capture-the-royal flows,
-  // even when the variant is not modeled through extinction or pseudo-royals.
-  if (type_of(st->captured.piece) == king_type())
+  // Direct royal capture ends the game immediately in capture-the-royal flows.
+  // Some variants (e.g. Xiangqi/Janggi) use king_type() as movement semantics
+  // while the actual royal piece on board remains KING, so avoid treating
+  // non-royal king_type captures (e.g. advisors) as immediate game end.
+  if (st->captured.piece.piece != NO_PIECE)
   {
-      Color capturedColor = color_of(st->captured.piece);
-      result = capturedColor == sideToMove ? mated_in(ply) : mate_in(ply);
-      return true;
+      Color capturedColor = color_of(st->captured.piece.piece);
+      PieceType capturedType = type_of(st->captured.piece.piece);
+      bool capturedRoyal = capturedType == KING;
+
+      if (!capturedRoyal && king_type() != NO_PIECE_TYPE && capturedType == king_type())
+      {
+          // If the variant does not use physical KING pieces, capturing the
+          // king_type() piece is itself a direct royal capture.
+          // Otherwise require that side's physical KING to be gone.
+          const bool usesPhysicalKings = count(WHITE, KING) + count(BLACK, KING) > 0;
+          capturedRoyal = !usesPhysicalKings || count(capturedColor, KING) == 0;
+      }
+
+      if (capturedRoyal)
+      {
+          result = capturedColor == sideToMove ? mated_in(ply) : mate_in(ply);
+          return true;
+      }
   }
 
   // Some variants treat the runtime king piece as a real royal even when the
@@ -7301,34 +7748,20 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
   // because st->captured is empty in the reconstructed state.
   if (king_type() != NO_PIECE_TYPE)
       for (Color c : { ~sideToMove, sideToMove })
-          if (!count(c, king_type()) && (allow_checks() || flag_piece(c) == king_type()))
+          if (!count(c, king_type()) && is_actual_runtime_royal(c, king_type()))
           {
               result = c == sideToMove ? mated_in(ply) : mate_in(ply);
               return true;
           }
 
-  // Tablut-family variants model the escape king as a flag piece rather than
-  // the orthodox runtime king type. Once that piece is gone, the side has
-  // already lost even if the position was reconstructed from FEN and there are
-  // still other pieces left to move. Keep this scoped to surround-capture
-  // variants rather than all flag-piece games.
-  for (Color c : { ~sideToMove, sideToMove })
-      if (surround_capture_opposite()
-          && flag_piece(c) != NO_PIECE_TYPE
-          && flag_region(c)
-          && !count(c, flag_piece(c)))
-      {
-          result = c == sideToMove ? mated_in(ply) : mate_in(ply);
-          return true;
-      }
-
   // Pseudo-royal loss
   // Some variants transfer royal status across a family of piece types.
   // If a special capture removes the current pseudo-royal, the game ends
-  // immediately even though the family may include other off-board types.
+  // immediately only once the side has no remaining candidate pieces that can
+  // still become pseudo-royal later in the game.
   if (pseudo_royal_value() != VALUE_NONE)
       for (Color c : { ~sideToMove, sideToMove })
-          if (!(st->pseudoRoyals & pieces(c)))
+          if (!(st->pseudoRoyals & pieces(c)) && popcount(pieces(c) & st->pseudoRoyalCandidates) == 0)
           {
               result = c == sideToMove ? pseudo_royal_value(ply) : -pseudo_royal_value(ply);
               return true;
@@ -7337,10 +7770,13 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
   // Extinction
   // Extinction does not apply for pseudo-royal pieces in normal capture rules,
   // because they cannot be captured directly.
-  if (extinction_value() != VALUE_NONE)
+  if (var->extinctionValue.get(WHITE) != VALUE_NONE || var->extinctionValue.get(BLACK) != VALUE_NONE)
   {
       for (Color c : { ~sideToMove, sideToMove })
       {
+          if (var->extinctionValue.get(c) == VALUE_NONE)
+              continue;
+
           PieceSet extinctTargets = extinction_piece_types(c);
           if (!blast_on_capture())
               extinctTargets &= ~pseudo_royal_types();
@@ -7362,7 +7798,7 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
 
           if (sawEligibleType && (extinction_all_piece_types(c) ? allTypesExtinct : anyTypeExtinct))
           {
-              result = c == sideToMove ? extinction_value(ply) : -extinction_value(ply);
+              result = c == sideToMove ? extinction_value(c, ply) : -extinction_value(c, ply);
               return true;
           }
       }
@@ -7437,7 +7873,7 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
   // Immediate n-move adjudication (e.g. FIDE 75-move rule)
   if (   n_move_rule_immediate()
       && st->rule50 > (2 * n_move_rule_immediate() - 1)
-      && (!evasion_checkers() || MoveList<LEGAL>(*this).size()))
+      && (!evasion_checkers() || has_legal_move_ignoring_immediate_end()))
   {
       result = var->materialCounting ? convert_mate_value(material_counting_result(), ply) : VALUE_DRAW;
       return true;
@@ -7471,13 +7907,13 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
           }
           result = convert_mate_value(VALUE_DRAW, ply);
           return true;
-      };
+      }
       //Finally, rule on the simple cases.
       if (st->pointsCount[~sideToMove]>=points_goal())
       {
           result = convert_mate_value(-var->pointsGoalValue, ply);
           return true;
-      };
+      }
       if (st->pointsCount[sideToMove]>=points_goal())
       {
           result = convert_mate_value(var->pointsGoalValue, ply);
@@ -7485,32 +7921,90 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
       };
   };
 
-  if (connect_goal_by_type())
-  {
-      auto has_connect_goal = [&](Color c) {
-          const auto& goal = connect_piece_goal_types(c);
-          if (goal.empty())
-              return false;
+  auto wrapped_step = [&](Square cur, Direction d, Square& next) {
+      auto [dr, df] = decode_direction(d);
+      return wrapped_destination_square(cur, df, dr, max_file(), max_rank(), wraps_files(), wraps_ranks(), next);
+  };
 
-          if (!var->connectLines.empty() && goal.size() == var->connectLines.front().size())
+  auto has_connect_goal = [&](Color c) {
+      if (!connect_goal_by_type())
+          return false;
+
+      const auto& goal = connect_piece_goal_types(c);
+      if (goal.empty())
+          return false;
+
+      // Type-goal games such as Toot-Otto match piece types only; colors
+      // are intentionally ignored so either player's drops can complete
+      // either configured word.
+      const bool palindrome = std::equal(goal.begin(), goal.end(), goal.rbegin());
+
+      if (!var->connectLines.empty())
+      {
+          for (const auto& line : var->connectLines)
           {
-              for (const auto& line : var->connectLines)
+              if (line.size() < goal.size())
+                  continue;
+              for (size_t off = 0; off + goal.size() <= line.size(); ++off)
               {
                   bool forward = true;
-                  bool reverse = true;
-                  for (size_t i = 0; i < goal.size(); ++i)
+                  bool reverse = !palindrome;
+                  for (size_t i = 0; i < goal.size() && (forward || reverse); ++i)
                   {
-                      forward &= type_of(piece_on(line[i])) == goal[i] && color_of(piece_on(line[i])) == c;
-                      reverse &= type_of(piece_on(line[goal.size() - 1 - i])) == goal[i] && color_of(piece_on(line[goal.size() - 1 - i])) == c;
+                      if (forward)
+                      {
+                          Piece forwardPc = piece_on(line[off + i]);
+                          forward = forwardPc != NO_PIECE && type_of(forwardPc) == goal[i];
+                      }
+                      if (reverse)
+                      {
+                          Piece reversePc = piece_on(line[off + goal.size() - 1 - i]);
+                          reverse = reversePc != NO_PIECE && type_of(reversePc) == goal[i];
+                      }
                   }
                   if (forward || reverse)
                       return true;
               }
-              return false;
           }
+          return false;
+      }
 
+      if (topology_wraps())
+      {
           for (Direction d : var->connectDirections)
           {
+              Bitboard candidates = pieces(goal.front());
+              while (candidates)
+              {
+                  Square s = pop_lsb(candidates);
+
+                  auto matches = [&](Direction dir, const std::vector<PieceType>& sequence) {
+                      Square cur = s;
+                      for (size_t i = 1; i < sequence.size(); ++i)
+                      {
+                          Square next = SQ_NONE;
+                          if (!wrapped_step(cur, dir, next) || next == s)
+                              return false;
+                          Piece nextPc = piece_on(next);
+                          if (nextPc == NO_PIECE || type_of(nextPc) != sequence[i])
+                              return false;
+                          cur = next;
+                      }
+                      return true;
+                  };
+
+                  if (matches(d, goal) || (!palindrome && matches(-d, goal)))
+                      return true;
+              }
+          }
+          return false;
+      }
+
+      for (Direction d : var->connectDirections)
+      {
+          for (int pass = 0; pass < (palindrome ? 1 : 2); ++pass)
+          {
+              Direction dir = pass ? -d : d;
               Bitboard starts = pieces(goal.front());
               while (starts)
               {
@@ -7519,8 +8013,9 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
                   bool matched = true;
                   for (size_t i = 1; i < goal.size(); ++i)
                   {
-                      cur = shift(d, cur);
-                      if (!cur || type_of(piece_on(lsb(cur))) != goal[i])
+                      cur = shift(dir, cur);
+                      Piece pc = cur ? piece_on(lsb(cur)) : NO_PIECE;
+                      if (pc == NO_PIECE || type_of(pc) != goal[i])
                       {
                           matched = false;
                           break;
@@ -7530,187 +8025,337 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
                       return true;
               }
           }
+      }
+      return false;
+  };
+
+  auto check_connection_adjudications = [&](Color c) {
+      Bitboard eligible = 0;
+      for (PieceSet ps = connect_piece_types(); ps;)
+          eligible |= pieces(c, pop_lsb(ps));
+
+      // Connect-n
+      if (var->materialCounting != CONNECT_N_COUNT && (connect_n() > 0) && (popcount(eligible) >= connect_n()))
+      {
+          if (!var->connectLineMasks.empty())
+          {
+              for (size_t i = 0; i < var->connectLineMasks.size(); ++i)
+              {
+                  if (var->connectLines[i].size() != size_t(connect_n()))
+                      continue;
+                  Bitboard mask = var->connectLineMasks[i];
+                  if ((eligible & mask) == mask)
+                      return true;
+              }
+          }
+          else
+          {
+              if (topology_wraps())
+              {
+                  const int maxSteps = popcount(board_bb());
+
+                  for (Direction d : var->connectDirections)
+                  {
+                      Bitboard starts = eligible;
+                      while (starts)
+                      {
+                          Square s = pop_lsb(starts);
+                          Square cur = s;
+                          int steps = 1;
+                          while (steps < connect_n() && steps < maxSteps)
+                          {
+                              Square next = SQ_NONE;
+                              if (!wrapped_step(cur, d, next) || next == s)
+                                  break;
+                              if (!(eligible & square_bb(next)))
+                                  break;
+                              cur = next;
+                              ++steps;
+                          }
+                          if (steps >= connect_n())
+                              return true;
+                      }
+                  }
+              }
+              else
+              {
+                  Bitboard b;
+
+                  for (Direction d : var->connectDirections)
+                  {
+                      b = eligible;
+                      for (int i = 1; i < connect_n() && b; i++)
+                          b &= shift(d, b);
+                      if (b)
+                          return true;
+                  }
+              }
+          }
+      }
+
+      auto connected_regions = [&](Bitboard region1, Bitboard region2, Bitboard region3 = 0) {
+          Bitboard region1Pieces = region1 & eligible;
+          Bitboard region2Pieces = region2 & eligible;
+          Bitboard region3Pieces = region3 & eligible;
+
+          if (!region1Pieces || !region2Pieces || (region3 && !region3Pieces))
+              return false;
+
+          Bitboard visited = 0;
+
+          while (Bitboard frontierStart = region1Pieces & ~visited)
+          {
+              Bitboard frontier = frontierStart & -frontierStart;
+              Bitboard current = frontier;
+              bool hitsRegion2 = bool(frontier & region2Pieces);
+              bool hitsRegion3 = !region3 || bool(frontier & region3Pieces);
+              if (hitsRegion2 && hitsRegion3)
+                  return true;
+
+              while (frontier)
+              {
+                  Bitboard newBitboard = weak_connection_expansion(*this, frontier, eligible, c) & ~current;
+                  if (!newBitboard)
+                      break;
+
+                  current |= newBitboard;
+                  hitsRegion2 |= bool(newBitboard & region2Pieces);
+                  hitsRegion3 |= !region3 || bool(newBitboard & region3Pieces);
+                  if (hitsRegion2 && hitsRegion3)
+                      return true;
+
+                  frontier = newBitboard;
+              }
+
+              visited |= current;
+          }
+
           return false;
       };
 
-      bool prevMoverGoal = has_connect_goal(~sideToMove);
-      bool stmGoal = has_connect_goal(sideToMove);
-      if (prevMoverGoal && stmGoal)
-      {
-          result = convert_mate_value(VALUE_DRAW, ply);
+      if (connected_regions(var->connectRegion1[c], var->connectRegion2[c], var->connectRegion3[c]))
           return true;
-      }
-      if (prevMoverGoal)
-      {
-          result = convert_mate_value(-connect_value(), ply);
-          return true;
-      }
-      if (stmGoal)
-      {
-          result = convert_mate_value(connect_value(), ply);
-          return true;
-      }
-  }
 
-  //Calculate eligible pieces for connection once.
-  Bitboard connectPieces = 0;
-  for (PieceSet ps = connect_piece_types(); ps;){
-      PieceType pt = pop_lsb(ps);
-      connectPieces |= pieces(pt);
-  };
-  connectPieces &= pieces(~sideToMove);
-
-  // Connect-n
-  if (var->materialCounting != CONNECT_N_COUNT && (connect_n() > 0) && (popcount(connectPieces) >= connect_n()))
-  {
-      if (!var->connectLines.empty() && connect_n() == int(var->connectLines.front().size()))
+      if (connect_nxn() && popcount(eligible) >= connect_nxn() * connect_nxn())
       {
-          for (const auto& line : var->connectLines)
+          if (topology_wraps())
           {
-              bool complete = true;
-              for (Square s : line)
-                  complete &= bool(connectPieces & square_bb(s));
-              if (complete)
+              const int n = connect_nxn();
+              const int files = int(max_file()) + 1;
+              const int ranks = int(max_rank()) + 1;
+
+              if (files >= n && ranks >= n)
               {
-                  result = convert_mate_value(-connect_value(), ply);
+                  Bitboard starts = eligible;
+                  while (starts)
+                  {
+                      Square start = pop_lsb(starts);
+                      bool fits = true;
+
+                      for (int dr = 0; dr < n && fits; ++dr)
+                          for (int df = 0; df < n; ++df)
+                          {
+                              Square sq = SQ_NONE;
+                              if (!wrapped_destination_square(start, df, dr, max_file(), max_rank(), wraps_files(), wraps_ranks(), sq)
+                                  || !(eligible & square_bb(sq)))
+                              {
+                                  fits = false;
+                                  break;
+                              }
+                          }
+
+                      if (fits)
+                          return true;
+                  }
+              }
+          }
+          else
+          {
+              Bitboard connectors = eligible;
+              for (int i = 1; i < connect_nxn() && connectors; i++)
+                  connectors &= shift<SOUTH>(connectors) & shift<EAST>(connectors) & shift<SOUTH_EAST>(connectors);
+              if (connectors)
                   return true;
+          }
+      }
+
+      // Collinear-n
+      if ((collinear_n() > 0) && (popcount(eligible) >= collinear_n())) {
+          if (topology_wraps()) {
+              const int maxSteps = popcount(board_bb());
+
+              for (Direction d : var->connectDirections) {
+                  Bitboard visitedLine = 0;
+                  Bitboard starts = board_bb();
+                  while (starts) {
+                      Square s = pop_lsb(starts);
+                      if (visitedLine & square_bb(s))
+                          continue;
+
+                      int cnt = 0;
+                      Square cur = s;
+                      for (int steps = 0; steps < maxSteps; ++steps) {
+                          visitedLine |= square_bb(cur);
+                          if (eligible & square_bb(cur))
+                              ++cnt;
+                          Square next = SQ_NONE;
+                          if (!wrapped_step(cur, d, next) || next == s)
+                              break;
+                          cur = next;
+                      }
+                      if (cnt >= collinear_n())
+                          return true;
+                  }
+              }
+          } else {
+              for (Direction d : var->connectDirections) {
+                  // Line starts: on-board squares with no on-board predecessor along d.
+                  Bitboard starts = board_bb() & ~shift(d, board_bb());
+                  while (starts) {
+                      Square s = pop_lsb(starts);
+                      int cnt = 0;
+                      for (Bitboard cur = square_bb(s); cur; cur = shift(d, cur) & board_bb()) {
+                          if (cur & eligible) {
+                              ++cnt;
+                          }
+                      }
+                      if (cnt >= collinear_n())
+                          return true;
+                  }
               }
           }
       }
-      else
-      {
-          Bitboard b;
 
-          for (Direction d : var->connectDirections)
-          {
-              b = connectPieces;
-              for (int i = 1; i < connect_n() && b; i++)
-                  b &= shift(d, b);
-              if (b)
-              {
-                  result = convert_mate_value(-connect_value(), ply);
-                  return true;
+      // Connect-Group
+      if (connect_group() != 0) {
+          const auto& connectDirs = getConnectDirections();
+          if (connect_group() == -1) {
+              int totalPlayerPieces = popcount(eligible);
+              if (totalPlayerPieces > 0) {
+                  Bitboard connected = eligible & -eligible;
+                  Bitboard frontier = connected;
+
+                  if (!topology_wraps()) {
+                      while (frontier) {
+                          Bitboard expanded = 0;
+                          for (Direction d : connectDirs)
+                              expanded |= shift(d, frontier) & eligible;
+                          expanded &= ~connected;
+                          frontier = expanded;
+                          connected |= expanded;
+                      }
+                  } else {
+                      Bitboard visited = connected;
+                      std::deque<Square> q;
+                      q.push_back(lsb(connected));
+
+                      while (!q.empty()) {
+                          Square s = q.front();
+                          q.pop_front();
+
+                          for (Direction d : connectDirs) {
+                              Square next_sq = SQ_NONE;
+                              auto [dr, df] = decode_direction(d);
+                              if (!wrapped_destination_square(s, df, dr, max_file(), max_rank(), wraps_files(), wraps_ranks(), next_sq))
+                                  continue;
+                              if (!(square_bb(next_sq) & eligible) || (square_bb(next_sq) & visited))
+                                  continue;
+                              visited |= next_sq;
+                              connected |= next_sq;
+                              q.push_back(next_sq);
+                          }
+                      }
+                  }
+
+                  if (popcount(connected) == totalPlayerPieces)
+                      return true;
+              }
+          } else {
+              int targetGroupSize = connect_group();
+              int totalPlayerPieces = popcount(eligible);
+              if (targetGroupSize > 0 && totalPlayerPieces >= targetGroupSize) {
+                  Bitboard visited = 0;
+                  if (!topology_wraps()) {
+                      while (eligible & ~visited) {
+                          Bitboard group = eligible & ~visited;
+                          group &= -group;
+                          Bitboard frontier = group;
+
+                          while (frontier && popcount(group) < targetGroupSize) {
+                              Bitboard expanded = 0;
+                              for (Direction d : connectDirs)
+                                  expanded |= shift(d, frontier);
+                              expanded &= eligible & ~group;
+                              group |= expanded;
+                              frontier = expanded;
+                          }
+
+                          if (popcount(group) >= targetGroupSize)
+                              return true;
+                          visited |= group;
+                      }
+                  } else {
+                      while (eligible & ~visited) {
+                          Square start_sq = lsb(eligible & ~visited);
+                          std::deque<Square> q;
+
+                          q.push_back(start_sq);
+                          visited |= square_bb(start_sq);
+                          int group_size = 0;
+
+                          while (!q.empty()) {
+                              Square s = q.front();
+                              q.pop_front();
+                              if (++group_size >= targetGroupSize)
+                                  return true;
+
+                              for (Direction d : connectDirs) {
+                                  Square next_sq = SQ_NONE;
+                                  auto [dr, df] = decode_direction(d);
+                                  if (!wrapped_destination_square(s, df, dr, max_file(), max_rank(), wraps_files(), wraps_ranks(), next_sq))
+                                      continue;
+
+                                  Bitboard next = square_bb(next_sq);
+                                  if ((next & eligible) && !(next & visited)) {
+                                      visited |= next;
+                                      q.push_back(next_sq);
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
           }
-      }
-  }
-
-  auto connected_regions = [&](Bitboard region1, Bitboard region2, Bitboard region3 = 0) {
-      if (!(region1 & connectPieces) || !(region2 & connectPieces) || (region3 && !(region3 & connectPieces)))
-          return false;
-
-      Bitboard frontier = region1 & connectPieces;
-      Bitboard current = frontier;
-      bool hitsRegion2 = bool(current & region2);
-      bool hitsRegion3 = !region3 || bool(current & region3);
-
-      while (frontier) {
-          Bitboard newBitboard = weak_connection_expansion(*this, frontier, connectPieces, ~sideToMove) & ~current;
-
-          hitsRegion2 |= bool(newBitboard & region2);
-          hitsRegion3 |= !region3 || bool(newBitboard & region3);
-          if (hitsRegion2 && hitsRegion3)
-              return true;
-
-          frontier = newBitboard;
-          current |= newBitboard;
       }
 
       return false;
   };
 
-  if (connected_regions(var->connectRegion1[~sideToMove], var->connectRegion2[~sideToMove],
-                        var->connectRegion3[~sideToMove]))
+  auto connection_met = [&](Color c) {
+      return has_connect_goal(c) || check_connection_adjudications(c);
+  };
+
+  bool prevMoverConnected = connection_met(~sideToMove);
+  bool stmConnected = connection_met(sideToMove);
+  if (prevMoverConnected && stmConnected)
+  {
+      if (var->connectGoalSimulValueByMover != VALUE_NONE)
+      {
+          result = convert_mate_value(-var->connectGoalSimulValueByMover, ply);
+          return true;
+      }
+      result = convert_mate_value(VALUE_DRAW, ply); // default is draw
+      return true;
+  }
+  if (prevMoverConnected)
   {
       result = convert_mate_value(-connect_value(), ply);
       return true;
   }
-
-  if ((connect_nxn()) && (popcount(connectPieces) >= connect_nxn() * connect_nxn()))
+  if (stmConnected)
   {
-      Bitboard connectors = connectPieces;
-      for (int i = 1; i < connect_nxn() && connectors; i++)
-          connectors &= shift<SOUTH>(connectors) & shift<EAST>(connectors) & shift<SOUTH_EAST>(connectors);
-      if (connectors)
-      {
-          result = convert_mate_value(-connect_value(), ply);
-          return true;
-      }
-  }
-
-  // Collinear-n
-  if ((collinear_n() > 0) && (popcount(connectPieces) >= collinear_n())) {
-      // Directional line scan from border starts using shift() to avoid wraps.
-      auto next_square = [&](Square sq, Direction d) {
-          Bitboard n = shift(d, square_bb(sq));
-          return n ? Square(lsb(n)) : SQ_NONE;
-      };
-
-      for (Direction d : var->connectDirections) {
-          for (Square s = SQ_A1; s <= SQ_MAX; ++s) {
-              // Start only once per line: predecessor in -d must be off-board.
-              if (next_square(s, -d) != SQ_NONE)
-                  continue;
-
-              int cnt = 0;
-              for (Square cur = s; cur != SQ_NONE; cur = next_square(cur, d))
-                  cnt += int(bool(connectPieces & cur));
-
-              if (cnt >= collinear_n()) {
-                  result = convert_mate_value(-connect_value(), ply);
-                  return true;
-              }
-          }
-      }
-  }
-
-  // Connect-Group (ends game if a player has N pieces in any connected group)
-  if (connect_group() != 0 && (popcount(pieces(~sideToMove)) >= std::abs(connect_group()) || connect_group() == -1)) {
-      Bitboard playerPieces = pieces(~sideToMove); // Pieces of the player who just moved
-      Bitboard visited = 0;
-      int targetGroupSize = connect_group();
-      int totalPlayerPieces = popcount(playerPieces);
-
-      if (targetGroupSize == -1) {
-          targetGroupSize = totalPlayerPieces;
-      }
-
-      if (targetGroupSize > 0 && totalPlayerPieces >= targetGroupSize) { // Optimization: no need to check if not enough pieces
-          while (playerPieces & ~visited) {
-              Square start_sq = lsb(playerPieces & ~visited);
-              Bitboard current_group = 0;
-              std::deque<Square> q;
-
-              q.push_back(start_sq);
-              current_group |= start_sq;
-              visited |= start_sq;
-              int group_size = 0;
-
-              while (!q.empty()) {
-                  Square s = q.front();
-                  q.pop_front();
-                  group_size++;
-
-                  for (Direction d : getConnectDirections()) {
-                      Square next_sq = s + d;
-                      // Guard against horizontal/diagonal edge wrap when adding raw directions.
-                      if (!is_ok(next_sq) || distance(s, next_sq) != dist(d))
-                          continue;
-                      // Check if it's a player piece and not visited.
-                      if ((square_bb(next_sq) & playerPieces) && !(square_bb(next_sq) & visited)) {
-                          visited |= next_sq;
-                          current_group |= next_sq;
-                          q.push_back(next_sq);
-                      }
-                  }
-              }
-
-              if (group_size >= targetGroupSize) {
-                  result = convert_mate_value(-connect_value(), ply); // ~sideToMove won
-                  return true;
-              }
-          }
-      }
+      result = convert_mate_value(connect_value(), ply);
+      return true;
   }
 
   // Check for bikjang rule (Janggi), double passing, or board running full
@@ -7753,12 +8398,17 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
           return true;
       }
   }
-  if (var->prisonPawnPromotion &&
-      (pawn_attacks_bb(~sideToMove, square<KING>(~sideToMove))
-       & pieces(sideToMove, PAWN)
-       & ~pawnCannotCheckZone[sideToMove]) ){
-      result = mate_in(ply);
-      return true;
+  if (var->prisonPawnPromotion && count<KING>(~sideToMove) == 1)
+  {
+      Square royalSq = square<KING>(~sideToMove);
+      if (   (pawn_attacks_bb(~sideToMove, royalSq)
+             & pieces(sideToMove, PAWN)
+             & ~pawnCannotCheckZone[sideToMove])
+          )
+      {
+          result = mate_in(ply);
+          return true;
+      }
   }
 
   return false;
@@ -7768,7 +8418,7 @@ bool Position::is_immediate_game_end(Value& result, int ply) const {
 
 Bitboard Position::chased() const {
   Bitboard b = 0;
-  if (st->move == MOVE_NONE)
+  if (st->move == MOVE_NONE || st->move == MOVE_NULL)
       return b;
 
   Bitboard pins = blockers_for_king(sideToMove);
@@ -7786,7 +8436,7 @@ Bitboard Position::chased() const {
       int dr = int(rank_of(enemyKing)) - int(rank_of(ourKing));
       if (df == dr || df == -dr)
       {
-          Bitboard kingDiagonalPieces = line_bb(enemyKing, ourKing) & pieces(sideToMove);
+          Bitboard kingDiagonalPieces = Stockfish::line_bb(enemyKing, ourKing) & pieces(sideToMove);
           if ((kingDiagonalPieces & pieces(sideToMove, KING))
               && !more_than_one(kingDiagonalPieces & ~pieces(KING)))
               pins |= kingDiagonalPieces & ~pieces(KING);
@@ -7812,7 +8462,7 @@ Bitboard Position::chased() const {
               while (horses)
               {
                   Square s = pop_lsb(horses);
-                  if (attacks_bb(sideToMove, attackerType, s, pieces()) & attackerSq)
+                  if (attacks_from(sideToMove, attackerType, s, pieces()) & attackerSq)
                       attacks ^= s;
               }
           }
@@ -7823,6 +8473,16 @@ Bitboard Position::chased() const {
           {
               Square s = pop_lsb(attacks);
               Bitboard roots = attackers_to(s, pieces() ^ attackerSq, sideToMove) & ~pins;
+              Bitboard pinnedRoots = 0;
+              Square ksq = square<KING>(sideToMove);
+              Bitboard rootCandidates = roots & ~pieces(sideToMove, KING);
+              while (is_ok(ksq) && rootCandidates)
+              {
+                  Square root = pop_lsb(rootCandidates);
+                  if (attackers_to_king(ksq, pieces() ^ root, ~sideToMove))
+                      pinnedRoots |= square_bb(root);
+              }
+              roots &= ~pinnedRoots;
               if (!roots
                   || (var->flyingGeneral && roots == pieces(sideToMove, KING)
                       && (attacks_bb(sideToMove, ROOK, square<KING>(~sideToMove), pieces() ^ attackerSq) & s))
@@ -7837,12 +8497,12 @@ Bitboard Position::chased() const {
   Square from = from_sq(st->move);
   Square to = to_sq(st->move);
   PieceType movedPiece = type_of(piece_on(to));
-  if (movedPiece != KING && movedPiece != SOLDIER)
+  if (movedPiece != NO_PIECE_TYPE && movedPiece != KING && movedPiece != SOLDIER)
   {
       Bitboard directAttacks = attacks_from(~sideToMove, movedPiece, to) & pieces(sideToMove);
       // Only new attacks count. This avoids expensive comparison of previous and new attacks.
       if (movedPiece == ROOK || movedPiece == CANNON)
-          directAttacks &= ~line_bb(from, to);
+          directAttacks &= ~Stockfish::line_bb(from, to);
       addChased(to, movedPiece, directAttacks);
   }
 
@@ -7856,8 +8516,8 @@ Bitboard Position::chased() const {
       Square s = pop_lsb(discoveryCandidates);
       PieceType discoveryPiece = type_of(piece_on(s));
       Bitboard discoveries =   pieces(sideToMove)
-                            &  attacks_bb(~sideToMove, discoveryPiece, s, pieces())
-                            & ~attacks_bb(~sideToMove, discoveryPiece, s, (captured_piece() ? pieces() : pieces() ^ to) ^ from);
+                            &  attacks_from(~sideToMove, discoveryPiece, s, pieces())
+                            & ~attacks_from(~sideToMove, discoveryPiece, s, (captured_piece() ? pieces() : pieces() ^ to) ^ from);
       addChased(s, discoveryPiece, discoveries);
   }
 
@@ -7866,13 +8526,24 @@ Bitboard Position::chased() const {
   {
       // Fake roots
       Bitboard newPins = st->blockersForKing[sideToMove] & ~st->previous->blockersForKing[sideToMove] & pieces(sideToMove);
+      if (movedPiece != KING && movedPiece != SOLDIER)
+      {
+          Square ksq = square<KING>(sideToMove);
+          Bitboard blockerCandidates = pieces(sideToMove) & ~pieces(sideToMove, KING);
+          while (is_ok(ksq) && blockerCandidates)
+          {
+              Square blocker = pop_lsb(blockerCandidates);
+              if (attacks_from(~sideToMove, movedPiece, to, pieces() ^ blocker) & ksq)
+                  newPins |= square_bb(blocker);
+          }
+      }
       while (newPins)
       {
           Square s = pop_lsb(newPins);
           PieceType pinnedPiece = type_of(piece_on(s));
           Bitboard fakeRooted =  pieces(sideToMove)
                                & ~(pieces(sideToMove, KING, SOLDIER) ^ promoted_soldiers(sideToMove))
-                               & attacks_bb(sideToMove, pinnedPiece, s, pieces());
+                               & attacks_from(sideToMove, pinnedPiece, s, pieces());
           while (fakeRooted)
           {
               Square s2 = pop_lsb(fakeRooted);
@@ -7937,36 +8608,52 @@ bool Position::has_game_cycle(int ply) const {
   Key originalKey = useBoardKey ? st->boardKey : st->key;
   StateInfo* stp = st->previous;
 
+  enum class CuckooMatch { NoMatch, Rejected, Found };
+  auto check_cuckoo_slot = [&](int slot, int plyDistance, Key moveKey) {
+      if (cuckoo[slot] != moveKey)
+          return CuckooMatch::NoMatch;
+
+      Move move = cuckooMove[slot];
+      Square s1 = from_sq(move);
+      Square s2 = to_sq(move);
+
+      if ((between_bb(s1, s2) ^ s2) & pieces())
+          return CuckooMatch::NoMatch;
+
+      if (ply > plyDistance)
+          return CuckooMatch::Found;
+
+      // For nodes before or at the root, check that the move is a
+      // repetition rather than a move to the current position.
+      // In the cuckoo table, both moves Rc1c5 and Rc5c1 are stored in
+      // the same location, so we have to select which square to check.
+      Square checkSq = empty(s1) ? s2 : s1;
+      if (empty(checkSq) || color_of(piece_on(checkSq)) != side_to_move())
+          return CuckooMatch::Rejected;
+
+      // For repetitions before or at the root, require one more
+      return (useBoardKey ? stp->boardRepetition : stp->repetition)
+           ? CuckooMatch::Found
+           : CuckooMatch::NoMatch;
+  };
+
   for (int i = 3; i <= end; i += 2)
   {
       stp = stp->previous->previous;
 
       Key moveKey = originalKey ^ (useBoardKey ? stp->boardKey : stp->key);
-      if (   (j = H1(moveKey), cuckoo[j] == moveKey)
-          || (j = H2(moveKey), cuckoo[j] == moveKey))
+      j = H1(moveKey);
+      CuckooMatch match = check_cuckoo_slot(j, i, moveKey);
+      if (match == CuckooMatch::NoMatch)
       {
-          Move move = cuckooMove[j];
-          Square s1 = from_sq(move);
-          Square s2 = to_sq(move);
-
-          if (!((between_bb(s1, s2) ^ s2) & pieces()))
-          {
-              if (ply > i)
-                  return true;
-
-              // For nodes before or at the root, check that the move is a
-              // repetition rather than a move to the current position.
-              // In the cuckoo table, both moves Rc1c5 and Rc5c1 are stored in
-              // the same location, so we have to select which square to check.
-              Square checkSq = empty(s1) ? s2 : s1;
-              if (empty(checkSq) || color_of(piece_on(checkSq)) != side_to_move())
-                  continue;
-
-              // For repetitions before or at the root, require one more
-              if (useBoardKey ? stp->boardRepetition : stp->repetition)
-                  return true;
-          }
+          j = H2(moveKey);
+          match = check_cuckoo_slot(j, i, moveKey);
       }
+
+      if (match == CuckooMatch::Found)
+          return true;
+      if (match == CuckooMatch::Rejected)
+          continue;
   }
   return false;
 }
@@ -8100,11 +8787,14 @@ void Position::flip() {
       f += token;
   else
   {
-      File epFile = File(token[0] - 'a');
-      Rank epRank = Rank(std::atoi(token.substr(1).c_str()) - 1);
-      Square ep = make_square(epFile, epRank);
-      f += char('a' + file_of(ep));
-      f += std::to_string(relative_rank(~side_to_move(), ep, max_rank()) + 1);
+      Square ep = parse_fen_square(*this, token);
+      if (is_ok(ep))
+      {
+          f += char('a' + file_of(ep));
+          f += std::to_string(relative_rank(~side_to_move(), ep, max_rank()) + 1);
+      }
+      else
+          f += "-";
   }
 
   std::getline(ss, token); // Half and full moves
@@ -8147,7 +8837,11 @@ void Position::updatePawnCheckZone() {
 
 bool Position::pos_is_ok() const {
 
-  constexpr bool Fast = true; // Quick (default) or full check?
+#if defined(DEBUG_STATEINFO)
+  constexpr bool Fast = false;
+#else
+  constexpr bool Fast = true;
+#endif
 
   if (   (sideToMove != WHITE && sideToMove != BLACK)
       || (count<KING>(WHITE) && piece_on(square<KING>(WHITE)) != make_piece(WHITE, KING))
@@ -8181,7 +8875,27 @@ bool Position::pos_is_ok() const {
   ASSERT_ALIGNED(&si, Eval::NNUE::CacheLineSize);
 
   set_state(&si);
-  if (std::memcmp(&si, st, sizeof(StateInfo)))
+  bool sameState =
+         si.key == st->key
+      && si.boardKey == st->boardKey
+      && (!var->samePlayerBoardRepetitionIllegal || si.layoutKey == st->layoutKey)
+      && si.pawnKey == st->pawnKey
+      && si.materialKey == st->materialKey
+      && same_array(si.nonPawnMaterial, st->nonPawnMaterial)
+      && si.checkersBB == st->checkersBB
+      && si.evasionCheckersBB == st->evasionCheckersBB
+      && same_array(si.blockersForKing, st->blockersForKing)
+      && same_array(si.pinners, st->pinners)
+      && same_array(si.checkSquares, st->checkSquares)
+      && si.nonSlidingRiders == st->nonSlidingRiders
+      && si.pseudoRoyalCandidates == st->pseudoRoyalCandidates
+      && si.pseudoRoyals == st->pseudoRoyals
+      && same_array(si.extinctionSeen, st->extinctionSeen)
+      && si.chased == st->chased
+      && si.shak == st->shak
+      && si.bikjang == st->bikjang;
+
+  if (!sameState)
       assert(0 && "pos_is_ok: State");
 
   for (Color c : {WHITE, BLACK})
@@ -8214,26 +8928,36 @@ bool Position::pos_is_ok() const {
 PieceType Position::committed_piece_type(Move m, bool castlingRook) const {
     PieceType result = NO_PIECE_TYPE;
     if (commit_gates()) {
-        Square from = from_sq(m);
-        Rank r = rank_of(from);
-        if (castlingRook){
-            if (type_of(m) == CASTLING){
-                from = to_sq(m);
-            } else {
-                from = SQ_NONE;
-            }
-        }
-        if (from != SQ_NONE){
-            if (r == RANK_1){
-                result = committed_piece_type(WHITE, file_of(from));
-            } else if (r == max_rank()){
-                result = committed_piece_type(BLACK, file_of(from));
-            } else{
-                assert(false);
-            }
+        if (castlingRook && type_of(m) != CASTLING)
+            return result;
+
+        Square source = castlingRook ? to_sq(m) : from_sq(m);
+        if (!is_ok(source))
+            return result;
+
+        Rank r = rank_of(source);
+        if (r == RANK_1){
+            result = committed_piece_type(WHITE, file_of(source));
+        } else if (r == max_rank()){
+            result = committed_piece_type(BLACK, file_of(source));
+        } else{
+            assert(false);
         }
     }
     return result;
+}
+
+bool Position::violates_mutual_hop_restriction(Square from, Square to, PieceType movePt) const {
+  if ((var->mutuallyHopIllegalTypes & movePt) && (pieceMap.get(movePt)->has_hopper_like_movement()))
+  {
+      Bitboard between = between_bb(from, to);
+      Bitboard hopIllegalPieces = 0;
+      for (PieceSet ps = var->mutuallyHopIllegalTypes; ps;)
+          hopIllegalPieces |= pieces(pop_lsb(ps));
+      if ((between & pieces()) && ((between | to) & hopIllegalPieces))
+          return true;
+  }
+  return false;
 }
 
 } // namespace Stockfish

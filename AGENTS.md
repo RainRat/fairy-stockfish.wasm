@@ -56,6 +56,31 @@ make -f Makefile_js build
 npm install ffish
 ```
 
+### Browser Engine Artifacts for Fairyground
+Fairyground's in-browser search engine is copied from `src/emscripten/public`. Build it from `src/` before syncing:
+
+```bash
+make emscripten_clean ARCH=wasm
+make emscripten_build ARCH=wasm
+```
+
+For very-large-board Fairyground testing, include the build flag:
+
+```bash
+make emscripten_clean ARCH=wasm
+make emscripten_build ARCH=wasm verylargeboards=yes
+```
+
+After building, sync from the Fairyground checkout without committing local paths:
+
+```bash
+FAIRY_WASM_REPO=/path/to/fairy-stockfish.wasm \
+FAIRY_FSX_REPO=/path/to/Fairy-Stockfish-X \
+npm run sync-fsx-browser-stack
+```
+
+This repo provides only the browser engine artifacts in that workflow. The ffish rules helper can come from Fairy-Stockfish-X so Fairyground's board logic matches the experimental FSX variants. After syncing and `npm run debug-build` in Fairyground, the advanced page should show the runtime browser-stack fingerprint and the engine banner should report `VLB` for `verylargeboards=yes` builds.
+
 ## Testing & Validation
 
 All test commands below assume the current directory is `src/`.

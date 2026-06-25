@@ -258,7 +258,7 @@ inline Disambiguation disambiguation_level(const Position& pos, Move m, Notation
     {
         if (pos.capture(m))
             return FILE_DISAMBIGUATION;
-        if (type_of(m) == PROMOTION && from != to && pos.sittuyin_promotion())
+        if (is_promotion_move(m) && from != to && pos.sittuyin_promotion())
             return SQUARE_DISAMBIGUATION;
     }
 
@@ -358,7 +358,7 @@ inline const std::string move_to_san(Position& pos, Move m, Notation n) {
             san += square(pos, to, n);
 
         // Suffix
-        if (type_of(m) == PROMOTION)
+        if (is_promotion_move(m))
             san += std::string("=") + display_symbol(pos.piece_symbol(make_piece(us, promotion_type(m))));
         else if (type_of(m) == PIECE_PROMOTION)
             san += is_shogi(n) ? std::string("+") : std::string("=") + display_symbol(pos.piece_symbol(make_piece(us, pos.promoted_piece_type(type_of(pos.moved_piece(m))))));
@@ -414,6 +414,7 @@ inline bool has_insufficient_material(Color c, const Position& pos) {
         || pos.enclosing_drop()
         || pos.count_in_hand(c, ALL_PIECES)
         || (pos.extinction_value() != VALUE_NONE && (pos.extinction_piece_types(c) & ~pos.pseudo_royal_types()))
+        || (pos.variant()->nFoldRule && pos.variant()->nFoldValue != VALUE_DRAW)
         || (pos.flag_region(c) && pos.count(c, pos.flag_piece(c)))
         || pos.points_goal() > 0
         || pos.check_counting()
@@ -539,13 +540,20 @@ inline bool has_insufficient_material(Color c, const Position& pos) {
 }
 
 inline Bitboard checked(const Position& pos) {
-    return (pos.evasion_checkers() ? square_bb(pos.square<KING>(pos.side_to_move())) : Bitboard(0))
+    Square royalSq = pos.royal_square(pos.side_to_move());
+    if (royalSq == SQ_NONE && (pos.variant()->bikjangRule || pos.variant()->flyingGeneral) && pos.count<KING>(pos.side_to_move()) == 1)
+        royalSq = pos.square<KING>(pos.side_to_move());
+    Bitboard checkedKing = pos.evasion_checkers() && royalSq != SQ_NONE ? square_bb(royalSq) : Bitboard(0);
+    return checkedKing
         | (pos.pseudo_royal_types() ? pos.checked_pseudo_royals(pos.side_to_move()) : Bitboard(0))
         | (pos.anti_royal_types() ? pos.checked_anti_royals(pos.side_to_move()) : Bitboard(0));
 }
 
 inline Bitboard evasion_checked(const Position& pos) {
-    return pos.evasion_checkers() ? square_bb(pos.square<KING>(pos.side_to_move())) : Bitboard(0);
+    Square royalSq = pos.royal_square(pos.side_to_move());
+    if (royalSq == SQ_NONE && (pos.variant()->bikjangRule || pos.variant()->flyingGeneral) && pos.count<KING>(pos.side_to_move()) == 1)
+        royalSq = pos.square<KING>(pos.side_to_move());
+    return pos.evasion_checkers() && royalSq != SQ_NONE ? square_bb(royalSq) : Bitboard(0);
 }
 
 namespace FEN {
@@ -754,6 +762,7 @@ inline Validation check_promoted_pieces(const std::string& firstFenPart, const V
                          << "'. This piece cannot be promoted in variant." << std::endl;
                 return NOK;
             }
+            i = symbolIdx - 1;
         }
     }
     return OK;
@@ -966,7 +975,7 @@ inline std::string castling_rights_to_string(CastlingRights castlingRights) {
     case KING_SIDE:
         return "KING_SIDE";
     case QUEEN_SIDE:
-        return "QUEENS_SIDE";
+        return "QUEEN_SIDE";
     case WHITE_OO:
         return "WHITE_OO";
     case WHITE_OOO:
@@ -1508,17 +1517,20 @@ inline FenValidation validate_fen(const std::string& fen, const Variant* v, bool
 
     // 6) Part
     // check half move counter
-    if (fenParts.size() >= 3 + optionalInbetweenFields && check_digit_field(fenParts[fenParts.size() - 2 - optionalTrailingFields]) == NOK)
+    const size_t halfMoveIndex = fenParts.size() - 2 - optionalTrailingFields;
+    const size_t moveIndex = fenParts.size() - 1 - optionalTrailingFields;
+
+    if (fenParts.size() >= 3 + optionalInbetweenFields && check_digit_field(fenParts[halfMoveIndex]) == NOK)
     {
-        std::cerr << "Invalid half move counter: '" << fenParts[fenParts.size()-2] << "'." << std::endl;
+        std::cerr << "Invalid half move counter: '" << fenParts[halfMoveIndex] << "'." << std::endl;
         return FEN_INVALID_HALF_MOVE_COUNTER;
     }
 
     // 7) Part
     // check move counter
-    if (fenParts.size() >= 4 + optionalInbetweenFields && check_digit_field(fenParts[fenParts.size() - 1 - optionalTrailingFields]) == NOK)
+    if (fenParts.size() >= 4 + optionalInbetweenFields && check_digit_field(fenParts[moveIndex]) == NOK)
     {
-        std::cerr << "Invalid move counter: '" << fenParts[fenParts.size()-1] << "'." << std::endl;
+        std::cerr << "Invalid move counter: '" << fenParts[moveIndex] << "'." << std::endl;
         return FEN_INVALID_MOVE_COUNTER;
     }
 
@@ -1567,15 +1579,29 @@ inline FenValidation validate_fen(const std::string& fen, const Variant* v, bool
         if (potionCooldownInfo.front() != '<' || potionCooldownInfo.back() != '>')
             return FEN_INVALID_CHAR;
         std::string content = potionCooldownInfo.substr(1, potionCooldownInfo.size() - 2);
-        for (char& c : content)
-            if (!(std::isdigit(static_cast<unsigned char>(c)) || c == ' '))
-                c = ' ';
         std::vector<std::string> vals = get_fen_parts(content, ' ');
         if (!(vals.size() == 2 || vals.size() == 4))
             return FEN_INVALID_CHAR;
         for (const auto& value : vals)
-            if (check_digit_field(value) == NOK)
+        {
+            if (value.empty())
                 return FEN_INVALID_CHAR;
+
+            size_t start = value[0] == '-' ? 1 : 0;
+            if (start == value.size())
+                return FEN_INVALID_CHAR;
+
+            long long parsed = 0;
+            for (size_t i = start; i < value.size(); ++i)
+            {
+                unsigned char ch = static_cast<unsigned char>(value[i]);
+                if (!std::isdigit(ch))
+                    return FEN_INVALID_CHAR;
+                parsed = parsed * 10 + (value[i] - '0');
+                if (parsed > std::numeric_limits<int>::max())
+                    return FEN_INVALID_CHAR;
+            }
+        }
     }
 
     return FEN_OK;

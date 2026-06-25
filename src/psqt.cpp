@@ -154,37 +154,14 @@ constexpr Score PBonus[RANK_NB][FILE_NB] =
 
 
 // Scale down slider value based on distance
-int slider_fraction(const std::map<Direction, int>& slider) {
-    int s = 0;
-    for (auto const& [_, limit] : slider) {
-        if (limit == 0 || limit == MAX_SLIDER_LIMIT)
-            s += 100;
-        else if (limit == DYNAMIC_SLIDER_LIMIT)
-            s += 30;
-        else if (limit == SKI_SLIDER_LIMIT)
-            s += 97;
-        else if (is_slider_range(limit))
-        {
-            int minDistance = slider_min_distance(limit);
-            int maxDistance = slider_max_distance(limit);
-            int reach = (maxDistance ? maxDistance : 8) - minDistance + 1;
-            s += 200 * std::max(0, std::min(reach, 8)) / 16;
-        }
-        else
-            s += 200 * std::min(limit + 1, 8) / 16;
-    }
-    return s;
-}
-
-
 // Estimate piece value
 Value piece_value(Phase phase, PieceType pt)
 {
     const PieceInfo* pi = pieceMap.get(pt);
     int v0 =  (phase == MG ?  60 :  60) * pi->steps[0][MODALITY_CAPTURE].size()
             + (phase == MG ?  30 :  40) * pi->steps[0][MODALITY_QUIET].size()
-            + (phase == MG ? 185 : 185) * slider_fraction(pi->slider[0][MODALITY_CAPTURE]) / 100
-            + (phase == MG ?  55 :  45) * slider_fraction(pi->slider[0][MODALITY_QUIET]) / 100
+            + (phase == MG ? 185 : 185) * Stockfish::slider_fraction(pi->slider[0][MODALITY_CAPTURE]) / 100
+            + (phase == MG ?  55 :  45) * Stockfish::slider_fraction(pi->slider[0][MODALITY_QUIET]) / 100
             // Hoppers are more useful with more pieces on the board
             + (phase == MG ? 100 :  80) * pi->hopper[0][MODALITY_CAPTURE].size()
             + (phase == MG ?  85 :  60) * pi->hopper[0][MODALITY_QUIET].size()
@@ -193,7 +170,7 @@ Value piece_value(Phase phase, PieceType pt)
             + (phase == MG ?  30 :  50) * std::count_if(pi->slider[0][MODALITY_QUIET].begin(), pi->slider[0][MODALITY_QUIET].end(), [](const std::pair<const Direction, int>& d) { return std::abs(d.first) == NORTH || std::abs(d.first) == 1; });
     if (pi->diagonalLimitedSlider)
         v0 += 40;
-    if (pi->has_contra_hopper())
+    if (pi->has_universal_hopper())
         v0 += 160;
     if (pi->rose[0][MODALITY_QUIET] || pi->rose[0][MODALITY_CAPTURE])
         v0 += 1300;
@@ -265,14 +242,26 @@ void init(const Variant* v) {
       bool isPawn = !isSlider && pi->steps[0][MODALITY_QUIET].size() && !std::any_of(pi->steps[0][MODALITY_QUIET].begin(), pi->steps[0][MODALITY_QUIET].end(), [](const std::pair<const Direction, int>& d) { return d.first < SOUTH / 2; });
       bool isSlowLeaper = !isSlider && !std::any_of(pi->steps[0][MODALITY_QUIET].begin(), pi->steps[0][MODALITY_QUIET].end(), [](const std::pair<const Direction, int>& d) { return dist(d.first) > 1; });
 
-      // Scale slider piece values with board size
+      // Scale slider piece values with board size and range
       if (isSlider)
       {
           constexpr int lc = 5;
           constexpr int rm = 5;
           constexpr int r0 = rm + RANK_8;
           int r1 = rm + (v->maxRank + v->maxFile - 2 * (v->captureType != MOVE_OUT)) / 2;
+
           int leaper = pi->steps[0][MODALITY_QUIET].size() + pi->steps[0][MODALITY_CAPTURE].size();
+          int currentFraction = slider_fraction(pi->slider[0][MODALITY_QUIET]) + slider_fraction(pi->slider[0][MODALITY_CAPTURE]);
+          int standardFraction = (pi->slider[0][MODALITY_QUIET].size() + pi->slider[0][MODALITY_CAPTURE].size()) * 100;
+
+          // Scale base value by range factor
+          if (standardFraction > 0 && currentFraction < standardFraction)
+          {
+              // Using a conservative scaling factor to avoid underestimating range-limited pieces
+              int rangeFactor = (200 + currentFraction) * 100 / (200 + standardFraction);
+              score = make_score(mg_value(score) * rangeFactor / 100, eg_value(score) * rangeFactor / 100);
+          }
+
           int slider = pi->slider[0][MODALITY_QUIET].size() + pi->slider[0][MODALITY_CAPTURE].size() + pi->hopper[0][MODALITY_QUIET].size() + pi->hopper[0][MODALITY_CAPTURE].size();
           score = make_score(mg_value(score) * (lc * leaper + r1 * slider) / (lc * leaper + r0 * slider),
                              eg_value(score) * (lc * leaper + r1 * slider) / (lc * leaper + r0 * slider));
@@ -298,7 +287,7 @@ void init(const Variant* v) {
       {
           if (std::any_of(pi->steps[0][MODALITY_CAPTURE].begin(), pi->steps[0][MODALITY_CAPTURE].end(), [](const std::pair<const Direction, int>& d) { return dist(d.first) > 1 && !d.second; }))
               score = make_score(mg_value(score) * 4200 / (3500 + mg_value(score)),
-                                 eg_value(score) * 4700 / (3500 + mg_value(score)));
+                                 eg_value(score) * 4700 / (3500 + eg_value(score)));
       }
 
       // Adjust piece values for atomic captures
@@ -340,6 +329,7 @@ void init(const Variant* v) {
 
       // Determine pawn rank
       std::istringstream ss(v->startFen);
+      ss >> std::noskipws;
       unsigned char token;
       Rank rc = v->maxRank;
       Rank pawnRank = RANK_2;

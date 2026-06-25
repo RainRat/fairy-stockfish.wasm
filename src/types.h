@@ -82,7 +82,12 @@
 #if defined(USE_PEXT) && !defined(VERY_LARGE_BOARDS)
 #  include <immintrin.h> // Header for _pext_u64() intrinsic
 #  ifdef LARGEBOARDS
-#    define pext(b, m) (_pext_u64(b, m) ^ (_pext_u64(b >> 64, m >> 64) << popcount((m << 64) >> 64)))
+#    if defined(_MSC_VER)
+#      define pext_popcount64(m) int(__popcnt64(uint64_t(m)))
+#    else
+#      define pext_popcount64(m) __builtin_popcountll(uint64_t(m))
+#    endif
+#    define pext(b, m) (_pext_u64(b, m) ^ (_pext_u64(b >> 64, m >> 64) << pext_popcount64((m << 64) >> 64)))
 #  else
 #    define pext(b, m) _pext_u64(b, m)
 #  endif
@@ -493,9 +498,11 @@ private:
 };
 
 //When defined, move list will be stored in heap. Delete this if you want to use stack to store move list. Using stack can cause overflow (Segmentation Fault) when the search is too deep.
+#if !defined(USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST) && !defined(NO_HEAP_MOVE_LIST)
 #define USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+#endif
 
-#if defined(EXTRA_LARGE_MOVELISTS) || defined(ALLVARS)
+#if defined(ALLVARS)
 #if defined(VERY_LARGE_BOARDS)
 constexpr int MAX_MOVES = 65536;
 #else
@@ -549,7 +556,10 @@ enum MoveType : int {
   INSERT             = 9 << (2 * SQUARE_BITS),
   PULL               = 10 << (2 * SQUARE_BITS),
   SWAP               = 11 << (2 * SQUARE_BITS),
+  PROMOTION_POTION   = 12 << (2 * SQUARE_BITS),
 };
+
+enum MoveModality {MODALITY_QUIET, MODALITY_CAPTURE, MOVE_MODALITY_NB};
 
 constexpr int MOVE_TYPE_BITS = 4;
 
@@ -935,9 +945,8 @@ struct DirtyPiece {
   // Number of changed pieces
   int dirty_num;
 
-  // Max 3 pieces can change in one move. A promotion with capture moves
-  // both the pawn and the captured piece to SQ_NONE and the piece promoted
-  // to from SQ_NONE to the capture square.
+  // Up to 12 entries cover the high-dirty move families: blast moves, paired
+  // drops, pushes, pulls, morphs, color changes, and hand updates.
   Piece piece[DIRTY_PIECE_MAX];
   Piece handPiece[DIRTY_PIECE_MAX];
   int handCount[DIRTY_PIECE_MAX];
@@ -1033,11 +1042,11 @@ constexpr PieceSet operator& (PieceSet ps, PieceType pt) {
 }
 constexpr PieceSet operator^ (PieceSet ps1, PieceSet ps2) { return (PieceSet)((uint64_t)ps1 ^ (uint64_t)ps2); }
 constexpr PieceSet operator^ (PieceSet ps, PieceType pt) { return ps ^ piece_set(pt); }
-inline PieceSet& operator|= (PieceSet& ps1, PieceSet ps2) { return (PieceSet&)((uint64_t&)ps1 |= (uint64_t)ps2); }
+inline PieceSet& operator|= (PieceSet& ps1, PieceSet ps2) { ps1 = PieceSet(uint64_t(ps1) | uint64_t(ps2)); return ps1; }
 inline PieceSet& operator|= (PieceSet& ps, PieceType pt) { return ps |= piece_set(pt); }
-inline PieceSet& operator&= (PieceSet& ps1, PieceSet ps2) { return (PieceSet&)((uint64_t&)ps1 &= (uint64_t)ps2); }
+inline PieceSet& operator&= (PieceSet& ps1, PieceSet ps2) { ps1 = PieceSet(uint64_t(ps1) & uint64_t(ps2)); return ps1; }
 //inline PieceSet& operator&= (PieceSet& ps, PieceType pt) does not make sense
-inline PieceSet& operator^= (PieceSet& ps1, PieceSet ps2) { return (PieceSet&)((uint64_t&)ps1 ^= (uint64_t)ps2); }
+inline PieceSet& operator^= (PieceSet& ps1, PieceSet ps2) { ps1 = PieceSet(uint64_t(ps1) ^ uint64_t(ps2)); return ps1; }
 inline PieceSet& operator^= (PieceSet& ps, PieceType pt) { return ps ^= piece_set(pt); }
 
 static_assert(piece_set(PAWN) & PAWN);
@@ -1173,7 +1182,26 @@ inline int from_to(Move m) {
 }
 
 inline PieceType promotion_type(Move m) {
-  return type_of(m) == PROMOTION ? PieceType((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & (PIECE_TYPE_NB - 1)) : NO_PIECE_TYPE;
+  if (type_of(m) == PROMOTION)
+    return PieceType((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & (PIECE_TYPE_NB - 1));
+  if (type_of(m) == PROMOTION_POTION) {
+    int choice = (m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS)) & 3;
+    return choice == 0 ? KNIGHT : (choice == 1 ? BISHOP : (choice == 2 ? ROOK : QUEEN));
+  }
+  return NO_PIECE_TYPE;
+}
+
+inline bool is_promotion_move(Move m) {
+  return type_of(m) == PROMOTION || type_of(m) == PROMOTION_POTION;
+}
+
+inline Square potion_target_square(Move m) {
+  return Square((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & SQUARE_BIT_MASK);
+}
+
+inline int potion_type(Move m) {
+  assert(type_of(m) == PROMOTION_POTION);
+  return (m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS + 2)) & 1;
 }
 
 inline PieceType gating_type(Move m) {
@@ -1182,7 +1210,8 @@ inline PieceType gating_type(Move m) {
 
 inline Square gating_square(Move m) {
   const uint64_t raw = static_cast<uint64_t>(m);
-  const uint64_t gate = (raw >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SQUARE_BIT_MASK;
+  constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
+  const uint64_t gate = (raw >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask;
   if (gate)
       return Square(gate - 1);
   if (type_of(m) == CASTLING && gating_type(m) != NO_PIECE_TYPE)
@@ -1196,7 +1225,8 @@ inline Square pull_square(Move m) {
   if (type_of(m) != PULL)
       return SQ_NONE;
   const uint64_t raw = static_cast<uint64_t>(m);
-  const uint64_t sq = (raw >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SQUARE_BIT_MASK;
+  constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
+  const uint64_t sq = (raw >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask;
   return sq ? Square(sq - 1) : SQ_NONE;
 }
 
@@ -1206,11 +1236,14 @@ inline Square swap_square(Move m) {
 
 inline bool is_gating(Move m) {
   const MoveType mt = type_of(m);
+  constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
   if (mt == SPECIAL)
-      return ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SQUARE_BIT_MASK) != 0;
-  return (mt == NORMAL || mt == CASTLING)
-      && (gating_type(m) != NO_PIECE_TYPE
-          || ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SQUARE_BIT_MASK));
+      return ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask) != 0;
+  if (mt == NORMAL || mt == CASTLING)
+      return gating_type(m) != NO_PIECE_TYPE
+          || ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask);
+  return (mt == PROMOTION || mt == PIECE_PROMOTION || mt == PIECE_DEMOTION)
+      && ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask) != 0;
 }
 
 inline bool is_drop_move(Move m) {
@@ -1309,6 +1342,22 @@ constexpr Move make_pull(Square from, Square to, Square pullFrom) {
             + static_cast<uint64_t>(to));
 }
 
+constexpr Move make_promotion_potion(Square from, Square to, PieceType prom_pt, int potion, Square target) {
+  assert(prom_pt == KNIGHT || prom_pt == BISHOP || prom_pt == ROOK || prom_pt == QUEEN);
+  assert(potion == 0 || potion == 1);
+  uint64_t prom_val = (prom_pt == KNIGHT ? 0 : (prom_pt == BISHOP ? 1 : (prom_pt == ROOK ? 2 : 3)));
+  uint64_t potion_val = static_cast<uint64_t>(potion);
+  uint64_t target_val = static_cast<uint64_t>(target);
+  return Move(
+      (potion_val << (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS + 2))
+    + (prom_val << (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS))
+    + (target_val << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+    + static_cast<uint64_t>(PROMOTION_POTION)
+    + (static_cast<uint64_t>(from) << SQUARE_BITS)
+    + static_cast<uint64_t>(to)
+  );
+}
+
 constexpr PieceType dropped_piece_type(Move m) {
   return PieceType((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & (PIECE_TYPE_NB - 1));
 }
@@ -1322,7 +1371,11 @@ inline bool is_custom(PieceType pt) {
 }
 
 inline bool is_ok(Move m) {
-  return from_sq(m) != to_sq(m) || type_of(m) == PROMOTION || type_of(m) == SPECIAL; // Catch MOVE_NULL and MOVE_NONE
+  return from_sq(m) != to_sq(m)
+      || type_of(m) == PROMOTION
+      || type_of(m) == SPECIAL
+      || type_of(m) == CASTLING
+      || type_of(m) == PROMOTION_POTION; // Catch MOVE_NULL and MOVE_NONE, allow stationary castling and promotion/potions
 }
 
 inline int dist(Direction d) {

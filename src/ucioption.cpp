@@ -71,10 +71,8 @@ std::set<string, UCI::CaseInsensitiveLess> standard_variants = {
 
 void init_variant(const Variant* v) {
     const bool useBoardSizeMagics = bool(Options["DynamicMagicsByBoardSize"]) || v->cylindrical || v->toroidal;
-    if (!v->magicGeometry)
-        const_cast<Variant*>(v)->magicGeometry = useBoardSizeMagics
-                                               ? Bitboards::init_magics(v->maxFile, v->maxRank)
-                                               : Bitboards::init_magics(FILE_MAX, RANK_MAX);
+    v->magicGeometry = Bitboards::init_magics(useBoardSizeMagics ? v->maxFile : FILE_MAX,
+                                              useBoardSizeMagics ? v->maxRank : RANK_MAX);
     pieceMap.init(v);
     Bitboards::init_pieces();
 }
@@ -85,9 +83,9 @@ void on_hash_size(const Option& o) { TT.resize(size_t(o)); }
 void on_logger(const Option& o) { start_logger(o); }
 void on_threads(const Option& o) { Threads.set(size_t(o)); }
 void on_tb_path(const Option& o) { Tablebases::init(o); }
+void on_variant_load_warnings(const Option& o) { variants.set_verbose_load_warnings(bool(o)); }
 
-void on_use_NNUE(const Option& ) { Eval::NNUE::init(); }
-void on_eval_file(const Option& ) { Eval::NNUE::init(); }
+void on_nnue_change(const Option& ) { Eval::NNUE::init(); }
 
 void on_variant_path(const Option& o) {
     std::stringstream ss((std::string)o);
@@ -226,13 +224,14 @@ void init(OptionsMap& o) {
   o["SyzygyProbeDepth"]      << Option(1, 1, 100);
   o["Syzygy50MoveRule"]      << Option(true);
   o["SyzygyProbeLimit"]      << Option(7, 0, 7);
-  o["Use NNUE"]              << Option(true, on_use_NNUE);
+  o["Use NNUE"]              << Option(true, on_nnue_change);
 #ifndef NNUE_EMBEDDING_OFF
-  o["EvalFile"]              << Option(EvalFileDefaultName, on_eval_file);
+  o["EvalFile"]              << Option(EvalFileDefaultName, on_nnue_change);
 #else
-  o["EvalFile"]              << Option("<empty>", on_eval_file);
+  o["EvalFile"]              << Option("<empty>", on_nnue_change);
 #endif
   o["TsumeMode"]             << Option(false);
+  o["VerboseVariantLoadWarnings"] << Option(false, on_variant_load_warnings);
   o["VariantPath"]           << Option("<empty>", on_variant_path);
   o["DynamicMagicsByBoardSize"] << Option(false);
   o["usemillisec"]           << Option(true); // time unit for UCCI

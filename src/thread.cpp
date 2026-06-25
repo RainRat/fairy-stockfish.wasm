@@ -32,13 +32,8 @@ namespace Stockfish {
 
 ThreadPool Threads; // Global object
 
-ExtMove* acquire_thread_buffer(Thread* thread) {
-    return thread->acquire_buffer();
-}
 
-void release_thread_buffer(Thread* thread, ExtMove* buffer) {
-    thread->release_buffer(buffer);
-}
+
 
 
 /// Thread constructor launches the thread and waits until it goes to sleep
@@ -123,7 +118,7 @@ void Thread::idle_loop() {
       searching = false;
       cv.notify_one(); // Wake up anyone waiting for search finished
       // Start ponder search from separate thread to prevent deadlock
-      if (!Threads.stop && Threads.size() && this == Threads.main() && XBoard::stateMachine && XBoard::stateMachine->ponderMove)
+      if (!Threads.stop && Threads.size() && this == Threads.main() && XBoard::stateMachine && XBoard::stateMachine->ponderMove.load())
           XBoard::stateMachine->launch_ponder_worker();
       cv.wait(lk, [&]{ return searching; });
 
@@ -226,6 +221,8 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
   if (rootMoves.empty())
       rootMoves.emplace_back(MOVE_NONE);
 
+  const std::string rootFen = pos.fen();
+
   if (states.get())
       setupStates = std::move(states); // Ownership transfer, states is now empty
   else
@@ -241,7 +238,7 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
       th->nodes = th->tbHits = th->nmpMinPly = th->bestMoveChanges = 0;
       th->rootDepth = th->completedDepth = 0;
       th->rootMoves = rootMoves;
-      th->rootPos.set(pos.variant(), pos.fen(), pos.is_chess960(), &th->rootState, th);
+      th->rootPos.set(pos.variant(), rootFen, pos.is_chess960(), &th->rootState, th);
       if (setupStates && !setupStates->empty())
           th->rootState = setupStates->back();
   }
@@ -256,7 +253,7 @@ Thread* ThreadPool::get_best_thread() const {
         return bestThread;
 
     std::map<Move, int64_t> votes;
-    Value minScore = VALUE_NONE;
+    Value minScore = VALUE_NONE; // Seed with maximum value (VALUE_NONE is larger than any valid score)
     auto incomplete_iteration = [](const Thread* th) {
         return th->completedDepth != th->rootDepth;
     };

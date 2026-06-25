@@ -89,7 +89,6 @@ private:
   const Variant* v;
   StateListPtr states;
   Position pos;
-  Thread* thread = nullptr;
   std::vector<Move> moveStack;
   std::vector<std::string> moveStackUCI;
   bool is960;
@@ -203,7 +202,7 @@ public:
     resetStates();
     moveStack.clear();
     moveStackUCI.clear();
-    pos.set(v, fen, is960, &states->back(), thread);
+    pos.set(v, fen, is960, &states->back(), Threads.main());
   }
 
   // note: const identifier for pos not possible due to SAN::move_to_san()
@@ -305,6 +304,8 @@ public:
   }
 
   bool is_insufficient_material() const {
+    if (pos.count<KING>() == 0 && pos.king_type() == NO_PIECE_TYPE && !pos.pseudo_royal_types() && !pos.anti_royal_types())
+      return false;
     return Stockfish::has_insufficient_material(WHITE, pos) && Stockfish::has_insufficient_material(BLACK, pos);
   }
 
@@ -502,7 +503,7 @@ private:
     this->resetStates();
     if (fen == "")
       fen = v->startFen;
-    this->pos.set(this->v, fen, is960, &this->states->back(), this->thread);
+    this->pos.set(this->v, fen, is960, &this->states->back(), Threads.main());
     this->is960 = is960;
   }
 };

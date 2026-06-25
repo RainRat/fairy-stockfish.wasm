@@ -21,7 +21,6 @@
 #include <fstream>
 #include <sstream>
 #include <cctype>
-#include <charconv>
 
 #include "parser.h"
 #include "piece.h"
@@ -34,47 +33,23 @@ namespace Stockfish {
 VariantMap variants; // Global object
 
 namespace {
+    std::string trim_ascii_spaces(const std::string& s) {
+        const auto first = s.find_first_not_of(" \t");
+        if (first == std::string::npos)
+            return "";
+        const auto last = s.find_last_not_of(" \t");
+        return s.substr(first, last - first + 1);
+    }
+
     std::string lower_ascii(std::string s) {
         for (char& c : s)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return s;
     }
 
-    bool parse_positive_int(const std::string& raw, int& out) {
-        std::string value = raw;
-        const auto first = value.find_first_not_of(" \t");
-        if (first == std::string::npos)
-            return false;
-        const auto last = value.find_last_not_of(" \t");
-        value = value.substr(first, last - first + 1);
-
-        auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), out);
-        return ec == std::errc() && ptr == value.data() + value.size() && out >= 1;
-    }
-
-    bool parse_file_value(const std::string& raw, int& out) {
-        std::stringstream ss(raw);
-        ss >> std::ws;
-        if (ss.peek() == EOF)
-            return false;
-        if (std::isdigit(ss.peek()))
-        {
-            int i;
-            ss >> i;
-            ss >> std::ws;
-            if (ss.fail() || !ss.eof() || i < 1)
-                return false;
-            out = i - 1;
-            return true;
-        }
-        char c;
-        ss >> c;
-        ss >> std::ws;
-        if (ss.fail() || !ss.eof())
-            return false;
-        out = std::tolower(static_cast<unsigned char>(c)) - 'a';
-        return true;
-    }
+    struct VariantParseWarnings {
+        std::size_t boardSize = 0;
+    };
 
     template <typename CoordToSquare>
     std::vector<std::vector<Square>> generate_nd_ttt_lines(const std::vector<int>& dims, int lineLen, CoordToSquare coord_to_square) {
@@ -652,6 +627,7 @@ namespace {
         v->extinctionValue = -VALUE_MATE;
         v->extinctionPieceTypes = piece_set(COMMONER);
         v->blastOnCapture = true;
+        v->blastOnCaptureMoverCenter = true;
         v->nnueAlias = "atomic";
         return v;
     }
@@ -1925,20 +1901,7 @@ namespace {
         v->wallingRule = ARROW;
         return v;
     }
-    // Cowboys
-    // https://www.zillions-of-games.com/cgi-bin/zilligames/submissions.cgi?do=show;id=237
-    Variant* cowboys_variant() {
-        Variant* v = chess_variant_base()->init();
-        v->pieceToCharTable = ".N.....................n....................";
-        v->maxRank = RANK_7;
-        v->maxFile = FILE_G;
-        v->reset_pieces();
-        v->add_piece(CUSTOM_PIECE_1, 'n', "mN");
-        v->startFen = "2n1n2/7/n5n/7/N5N/7/2N1N2 w - - 0 1";
-        v->stalemateValue = -VALUE_MATE;
-        v->wallingRule = ARROW;
-        return v;
-    }
+
 #endif
     // Xiangqi (Chinese chess)
     // https://en.wikipedia.org/wiki/Xiangqi
@@ -2185,7 +2148,6 @@ void VariantMap::init() {
     add("clobber10", clobber10_variant());
     add("flipello10", flipello10_variant());
 #ifdef ALLVARS
-    add("cowboys", cowboys_variant());
     add("amazons", amazons_variant());
 #endif
     add("xiangqi", xiangqi_variant());
@@ -2423,7 +2385,8 @@ Variant* Variant::conclude() {
 
     // If not a connect variant, set connectPieceTypesTrimmed to no pieces.
     // connectPieceTypesTrimmed is separated so that connectPieceTypes is left unchanged for inheritance.
-    if ( !(connectRegion1[WHITE] || connectRegion1[BLACK] || connectRegion3[WHITE] || connectRegion3[BLACK]
+    if ( !(connectRegion1[WHITE] || connectRegion1[BLACK] || connectRegion2[WHITE] || connectRegion2[BLACK]
+        || connectRegion3[WHITE] || connectRegion3[BLACK]
         || connectN || connectNxN || collinearN || connectGroup) )
     {
           connectPieceTypesTrimmed = NO_PIECE_SET;
@@ -2449,6 +2412,15 @@ Variant* Variant::conclude() {
             }
             connectPieceGoalTypes[c].push_back(pt);
         }
+    }
+
+    connectLineMasks.clear();
+    for (const auto& line : connectLines)
+    {
+        Bitboard mask = 0;
+        for (Square s : line)
+            mask |= square_bb(s);
+        connectLineMasks.push_back(mask);
     }
       // Initialize multimove passing parameters
       multimoveOffset = 0;
@@ -2477,15 +2449,21 @@ Variant* Variant::conclude() {
 
 template <bool DoCheck>
 void VariantMap::parse_istream(std::istream& file) {
+    VariantParseWarnings warnings;
     std::string variant, variant_template, key, value, input;
     while (file.peek() != '[' && std::getline(file, input)) {}
 
     std::vector<std::string> varsToErase = {};
+    std::set<std::string> skippedVariants = {};
+    std::set<std::string> missingTemplates = {};
+    std::set<std::string> duplicateVariants = {};
     while (file.get() && std::getline(std::getline(file, variant, ']'), input))
     {
         // Extract variant template, if specified
         if (!std::getline(std::getline(std::stringstream(variant), variant, ':'), variant_template))
             variant_template = "";
+        variant = trim_ascii_spaces(variant);
+        variant_template = trim_ascii_spaces(variant_template);
 
         // Read variant rules
         Config attribs = {};
@@ -2493,17 +2471,33 @@ void VariantMap::parse_istream(std::istream& file) {
         {
             if (!input.empty() && input.back() == '\r')
                 input.pop_back();
+            if (input.find_first_not_of(" \t") == std::string::npos)
+                continue;
             std::stringstream ss(input);
             if (ss.peek() != ';' && ss.peek() != '#')
             {
-                if (DoCheck && !input.empty() && input.find('=') == std::string::npos)
-                    std::cerr << "Invalid syntax: '" << input << "'." << std::endl;
-                if (std::getline(std::getline(ss, key, '=') >> std::ws, value))
+                if (input.find('=') == std::string::npos)
                 {
+                    if (DoCheck)
+                        std::cerr << "Invalid syntax: '" << input << "'." << std::endl;
+                    continue;
+                }
+                if (std::getline(ss, key, '='))
+                {
+                    ss >> std::ws;
+                    value.clear();
+                    std::getline(ss, value);
                     const auto first = key.find_first_not_of(" \t");
                     if (first == std::string::npos)
                         continue;
                     const auto last = key.find_last_not_of(" \t");
+                    if (value.find_first_not_of(" \t") == std::string::npos)
+                        value.clear();
+                    else
+                    {
+                        const auto value_first = value.find_first_not_of(" \t");
+                        value.erase(0, value_first);
+                    }
                     attribs[key.substr(first, last - first + 1)] = value;
                 }
             }
@@ -2511,9 +2505,34 @@ void VariantMap::parse_istream(std::istream& file) {
 
         // Create variant
         if (variants.has(variant))
-            std::cerr << "Variant '" << variant << "' already exists." << std::endl;
-        else if (!variant_template.empty() && !variants.has(variant_template))
-            std::cerr << "Variant template '" << variant_template << "' does not exist." << std::endl;
+        {
+            if (!DoCheck && !verboseLoadWarnings)
+                duplicateVariants.insert(variant);
+            else
+                std::cerr << "Variant '" << variant << "' already exists." << std::endl;
+        }
+        else if (!variant_template.empty() && (skippedVariants.count(variant_template) || !variants.has(variant_template)))
+        {
+            skippedVariants.insert(variant);
+            if (!variants.has(variant_template))
+            {
+                if (verboseLoadWarnings)
+                    std::cerr << "Variant template '" << variant_template << "' does not exist." << std::endl;
+                else
+                    missingTemplates.insert(variant_template);
+            }
+            else
+            {
+                if constexpr (!DoCheck)
+                {
+                    if (verboseLoadWarnings)
+                        std::cerr << "Variant '" << variant << "' inherits from skipped template '" << variant_template << "'. Skipping." << std::endl;
+                    else
+                        ++warnings.boardSize;
+                }
+            }
+            continue;
+        }
         else
         {
             int cfgMaxRank = -1;
@@ -2525,12 +2544,18 @@ void VariantMap::parse_istream(std::istream& file) {
                     cfgMaxRank = parsedRank - 1;
             }
             if (attribs.count("maxFile"))
-                parse_file_value(attribs["maxFile"], cfgMaxFile);
+                parse_file_index(attribs["maxFile"], cfgMaxFile);
             if ((cfgMaxRank > 0 && cfgMaxRank > RANK_MAX) || (cfgMaxFile >= 0 && cfgMaxFile > FILE_MAX))
             {
+                skippedVariants.insert(variant);
                 if constexpr (!DoCheck)
-                    std::cerr << "Variant '" << variant << "' exceeds build board limits (maxFile=" << int(FILE_MAX) + 1
-                              << ", maxRank=" << int(RANK_MAX) + 1 << "). Skipping." << std::endl;
+                {
+                    if (verboseLoadWarnings)
+                        std::cerr << "Variant '" << variant << "' exceeds build board limits (maxFile=" << int(FILE_MAX) + 1
+                                  << ", maxRank=" << int(RANK_MAX) + 1 << "). Skipping." << std::endl;
+                    else
+                        ++warnings.boardSize;
+                }
                 continue;
             }
 
@@ -2539,7 +2564,7 @@ void VariantMap::parse_istream(std::istream& file) {
             Variant* v = nullptr;
             if (!variant_template.empty())
             {
-                Variant* inherited = (new Variant(*variants.get(variant_template)))->init();
+                Variant* inherited = (new Variant(*variants.get(variant_template)))->conclude();
                 v = VariantParser<DoCheck>(attribs).parse(inherited);
                 if (!v)
                     delete inherited;
@@ -2562,11 +2587,47 @@ void VariantMap::parse_istream(std::istream& file) {
             }
             else
             {
+                skippedVariants.insert(variant);
                 if constexpr (!DoCheck)
-                    std::cerr << "Variant '" << variant << "' exceeds build board limits (maxFile=" << int(FILE_MAX) + 1
-                              << ", maxRank=" << int(RANK_MAX) + 1 << "). Skipping." << std::endl;
+                {
+                    if (verboseLoadWarnings)
+                        std::cerr << "Variant '" << variant << "' exceeds build board limits (maxFile=" << int(FILE_MAX) + 1
+                                  << ", maxRank=" << int(RANK_MAX) + 1 << "). Skipping." << std::endl;
+                    else
+                        ++warnings.boardSize;
+                }
                 delete v;
             }
+        }
+    }
+    if constexpr (!DoCheck)
+    {
+        if (!verboseLoadWarnings && warnings.boardSize)
+        {
+            std::cerr << "[" << warnings.boardSize
+                      << "] variants skipped because of board size limits."
+                      << " Set option VerboseVariantLoadWarnings to true to see full details."
+                      << std::endl;
+        }
+        if (!verboseLoadWarnings && !missingTemplates.empty())
+        {
+            std::cerr << "[" << missingTemplates.size()
+                      << "] variant templates not found or skipped because of board size limits (";
+            bool first = true;
+            for (const auto& t : missingTemplates)
+            {
+                if (!first) std::cerr << ", ";
+                std::cerr << t;
+                first = false;
+            }
+            std::cerr << ")." << std::endl;
+        }
+        if (!verboseLoadWarnings && !duplicateVariants.empty())
+        {
+            std::cerr << "[" << duplicateVariants.size()
+                      << "] variants already existed."
+                      << " Set option VerboseVariantLoadWarnings to true to see full details."
+                      << std::endl;
         }
     }
     // Clean up temporary variants
@@ -2590,11 +2651,14 @@ void VariantMap::parse(std::string path) {
         return;
     }
     parse_istream<DoCheck>(file);
-    file.close();
 }
 
 template void VariantMap::parse<true>(std::string path);
 template void VariantMap::parse<false>(std::string path);
+
+void VariantMap::set_verbose_load_warnings(bool verbose) {
+    verboseLoadWarnings = verbose;
+}
 
 void VariantMap::add(std::string s, Variant* v) {
   const Variant* concluded = v->conclude();
@@ -2626,6 +2690,8 @@ const Variant* VariantMap::get(const std::string& name) const {
   std::string folded = lower_ascii(name);
   if (folded != name)
   {
+      // Optimization: Try a fast O(log N) lookup using the folded key
+      // before falling back to a full linear scan over all keys.
       it = find(folded);
       if (it != end())
           return it->second;

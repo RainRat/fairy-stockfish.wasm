@@ -19,11 +19,60 @@
 #ifndef PARSER_H_INCLUDED
 #define PARSER_H_INCLUDED
 
+#include <charconv>
+#include <cctype>
 #include <iostream>
+#include <string>
 
 #include "variant.h"
 
 namespace Stockfish {
+
+inline bool parse_file_index(const std::string& raw, int& out) {
+    if (raw.empty())
+        return false;
+
+    const auto first = raw.find_first_not_of(" \t\r\n\f\v");
+    if (first == std::string::npos)
+        return false;
+    const auto last = raw.find_last_not_of(" \t\r\n\f\v");
+    const std::string value = raw.substr(first, last - first + 1);
+
+    if (std::isdigit(static_cast<unsigned char>(value[0])))
+    {
+        int file = 0;
+        auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), file);
+        if (ec != std::errc() || ptr != value.data() + value.size() || file < 1)
+            return false;
+        out = file - 1;
+        return true;
+    }
+
+    if (value.size() != 1)
+        return false;
+    if (!std::isalpha(static_cast<unsigned char>(value[0])))
+        return false;
+    out = std::tolower(static_cast<unsigned char>(value[0])) - 'a';
+    return true;
+}
+
+inline bool parse_int_strict(const std::string& raw, int& out) {
+    if (raw.empty())
+        return false;
+
+    const auto first = raw.find_first_not_of(" \t\r\n\f\v");
+    if (first == std::string::npos)
+        return false;
+    const auto last = raw.find_last_not_of(" \t\r\n\f\v");
+    const char* begin = raw.data() + first;
+    const char* end = raw.data() + last + 1;
+    auto [ptr, ec] = std::from_chars(begin, end, out);
+    return ec == std::errc() && ptr == end;
+}
+
+inline bool parse_positive_int(const std::string& raw, int& out) {
+    return parse_int_strict(raw, out) && out >= 1;
+}
 
 class Config {
 public:
@@ -45,8 +94,10 @@ public:
         constexpr bool PrintOptions = false; // print config options?
         if (PrintOptions)
             std::cout << s << std::endl;
-        consumedKeys.insert(s);
-        return data.find(s);
+        const auto it = data.find(s);
+        if (it != data.end())
+            consumedKeys.insert(s);
+        return it;
     }
 
     const_iterator begin() const { return data.begin(); }
@@ -69,6 +120,7 @@ public:
 
 private:
     Config config;
+    bool parseHadError = false;
     template <bool Current = true, class T> bool parse_attribute(const std::string& key, T& target);
     template <bool Current = true, class T> bool parse_attribute(const std::string& key, T& target, const Variant* v);
 
@@ -77,17 +129,16 @@ private:
     bool parse_legacy_attributes(Variant* v);
     bool parse_official_options(Variant* v);
     bool check_consistency(Variant* v);
+    bool parse_gating_piece_after(Variant* v);
+    bool parse_capture_maps(Variant* v);
+    bool parse_edge_insert(Variant* v);
+    bool parse_priority_drops(Variant* v);
+    bool parse_multimoves(Variant* v);
 
-    template <typename T> bool require_attribute(bool enabled, const std::string& key, T& target);
-    template <typename T, typename U> bool require_attributes(bool enabled,
-                                                              const std::string& key1, T& target1,
-                                                              const std::string& key2, U& target2);
-    template <typename T> void parse_both_colors(const std::string& key, T& target);
-    template <typename T> void parse_both_colors_piece(const std::string& key, T& target, const Variant* v);
-    template <typename T> void parse_both_colors_with_overrides(const std::string& key, T& target);
-    template <typename T> void parse_both_colors_with_overrides_piece(const std::string& key, T& target, const Variant* v);
+    template <typename T> void apply_color_setting(ColorSetting<T>& target, Color color, const T& parsed);
     template <typename T> void parse_color_setting(const std::string& key, ColorSetting<T>& target);
-    template <typename T> void parse_color_setting_piece(const std::string& key, ColorSetting<T>& target, const Variant* v);
+    bool parse_color_setting_first_piece(const std::string& key, ColorSetting<PieceType>& target, const Variant* v);
+    template <typename T> bool parse_color_setting_piece(const std::string& key, ColorSetting<T>& target, const Variant* v);
 };
 
 } // namespace Stockfish

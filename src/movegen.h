@@ -32,19 +32,11 @@ namespace Stockfish {
 class Position;
 
 enum GenType {
-  /// yjf2002ghty: I think it's better to add some explanations here so that new developers can understand what these means, as some of the terms cannot be found in chessprogramming wiki. I'm not sure if my explanations are correct. If there are anything wrong, please point it out.
-
-  //Moves that a piece is removed from the board as part of the completion of the move
   CAPTURES,
-  //Moves which do not alter material, thus no captures nor promotions
   QUIETS,
-  //Moves which do not alter material, and give check to opponent
   QUIET_CHECKS,
-  //Check evasion moves, including interpositions, attacker capture and king withdrawal
   EVASIONS,
-  //Moves that are not check evasion moves
   NON_EVASIONS,
-  //Moves that are legal
   LEGAL
 };
 
@@ -61,9 +53,6 @@ struct ExtMove {
 };
 
 class Thread;
-
-ExtMove* acquire_thread_buffer(Thread* thread);
-void release_thread_buffer(Thread* thread, ExtMove* buffer);
 
 
 inline bool operator<(const ExtMove& f, const ExtMove& s) {
@@ -82,7 +71,6 @@ ExtMove* append_potions(const Position& pos, ExtMove* listBegin, ExtMove* baseEn
 // Some variant-specific generators (potions, exchanges) can exceed MAX_MOVES.
 // Keep a larger shared capacity so move lists stay in-bounds.
 constexpr int MOVEGEN_OVERFLOW_CAPACITY = MAX_MOVES * 4;
-constexpr size_t moveListSize = sizeof(ExtMove) * MAX_MOVES;
 constexpr size_t moveListSizeOverflow = sizeof(ExtMove) * MOVEGEN_OVERFLOW_CAPACITY;
 
 /// The MoveList struct is a simple wrapper around generate(). It sometimes comes

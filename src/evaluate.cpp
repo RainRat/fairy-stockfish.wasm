@@ -144,10 +144,12 @@ namespace Eval {
             {
                 // C++ way to prepare a buffer for a memory stream
                 class MemoryBuffer : public basic_streambuf<char> {
-                    public: MemoryBuffer(char* p, size_t n) { setg(p, p, p + n); setp(p, p + n); }
+                    public: MemoryBuffer(const char* p, size_t n) {
+                        setg(const_cast<char*>(p), const_cast<char*>(p), const_cast<char*>(p) + n);
+                    }
                 };
 
-                MemoryBuffer buffer(const_cast<char*>(reinterpret_cast<const char*>(gEmbeddedNNUEData)),
+                MemoryBuffer buffer(reinterpret_cast<const char*>(gEmbeddedNNUEData),
                                     size_t(gEmbeddedNNUESize));
 
                 istream stream(&buffer);
@@ -347,23 +349,17 @@ namespace {
 
 #undef S
 
-  // Map promotion distance on arbitrary board heights into the 8x8-tuned
-  // PassedRank buckets, preserving exact mapping on 8x8.
-  inline int scaled_passed_rank_bucket(int distanceToPromo, Rank maxRank) {
-    int maxDistance = int(maxRank);
-    int clamped = std::clamp(distanceToPromo, 0, maxDistance);
-    return maxDistance > 0
-         ? (int(RANK_8) * (maxDistance - clamped) + maxDistance / 2) / maxDistance
-         : 0;
-  }
-
   inline int passed_rank_bucket(const Position& pos, Color c, Square s) {
     Square promo = pos.promotion_square(c, s);
     if (promo == SQ_NONE)
       return 0;
 
     int distanceToPromo = relative_rank(c, promo, pos.max_rank()) - relative_rank(c, s, pos.max_rank());
-    return scaled_passed_rank_bucket(distanceToPromo, pos.max_rank());
+    int maxDistance = int(pos.max_rank());
+    int clamped = std::clamp(distanceToPromo, 0, maxDistance);
+    return maxDistance > 0
+         ? (int(RANK_8) * (maxDistance - clamped) + maxDistance / 2) / maxDistance
+         : 0;
   }
 
   inline Score mobility_bonus(PieceType pt, int mobility) {
@@ -1014,9 +1010,8 @@ namespace {
     int kingFlankAttack  = popcount(b1) + popcount(b2);
     int kingFlankDefense = popcount(b3);
 
-    kingDanger +=        kingAttackersCount[Them] * kingAttackersWeight[Them]
-                 +       kingAttackersCountInHand[Them] * kingAttackersWeight[Them]
-                 +       kingAttackersCount[Them] * kingAttackersWeightInHand[Them]
+    kingDanger +=        (kingAttackersCount[Them] + kingAttackersCountInHand[Them])
+                       * (kingAttackersWeight[Them] + kingAttackersWeightInHand[Them])
                  + 183 * popcount(kingRing[Us] & (weak | ~pos.board_bb(Us, KING))) * (1 + pos.captures_to_hand() + pos.check_counting())
                  + 148 * popcount(unsafeChecks) * (1 + pos.check_counting())
                  +  98 * popcount(pos.blockers_for_king(Us))
@@ -1051,7 +1046,7 @@ namespace {
     // For drop games, king danger is independent of game phase, but dependent on material density
     if (pos.captures_to_hand() || pos.two_boards())
         score = make_score(mg_value(score) * me->material_density() / 11000,
-                           mg_value(score) * me->material_density() / 11000);
+                           eg_value(score) * me->material_density() / 11000);
 
     if constexpr (T)
         Trace::add(KING, Us, score);
@@ -1484,9 +1479,12 @@ namespace {
                     : pos.points_goal_value() < VALUE_ZERO ? -1
                     : 0;
 
-        // Lead in current points and proximity to goal.
-        score += make_score(28, 20) * goalSign * std::clamp(usPoints - themPoints, -100, 100);
-        score += make_score(60, 44) * goalSign * std::clamp(themToGoal - usToGoal, -100, 100);
+        // Lead in current points and proximity to goal. Points-race games like
+        // Oshi need this term to dominate ordinary mobility/space heuristics,
+        // otherwise search can prefer flashy self-ejects that hand the opponent
+        // scoring progress without any immediate tactical punishment.
+        score += make_score(120, 90) * goalSign * std::clamp(usPoints - themPoints, -100, 100);
+        score += make_score(240, 180) * goalSign * std::clamp(themToGoal - usToGoal, -100, 100);
     }
 
     // Duple-check variants (e.g. Spartan): reward coordinated protection of
@@ -1809,7 +1807,7 @@ namespace {
         // In every other case use scale factor based on
         // the number of pawns of the strong side reduced if pawns are on a single flank.
         else
-            sf = std::min(sf, 36 + 7 * (pos.count<PAWN>(strongSide) + pos.count<SOLDIER>(strongSide))) - 4 * !pawnsOnBothFlanks;
+            sf = std::min(sf, 36 + 7 * (pos.count<PAWN>(strongSide) + pos.count<SOLDIER>(strongSide)));
 
         // Reduce scale factor in case of pawns being on a single flank
         sf -= 4 * !pawnsOnBothFlanks;
@@ -1855,6 +1853,29 @@ namespace {
     if (T)
         Trace::add(MATERIAL, score);
     score += me->imbalance() + pos.this_thread()->trend;
+
+    if (pos.topology_wraps())
+    {
+        Value mg = mg_value(score);
+        Value eg = eg_value(score);
+        Value v =  mg * int(me->game_phase())
+                 + eg * int(PHASE_MIDGAME - me->game_phase());
+        v /= PHASE_MIDGAME;
+
+        // Evaluation grain
+        v = (v / 16) * 16;
+
+        // Side to move point of view
+        v = (pos.side_to_move() == WHITE ? v : -v) + 80 * pos.captures_to_hand();
+
+        if constexpr (T)
+        {
+            Trace::add(IMBALANCE, me->imbalance());
+            Trace::add(TOTAL, make_score(mg, eg));
+        }
+
+        return v;
+    }
 
     // Probe the pawn hash table
     pe = Pawns::probe(pos);
@@ -1983,7 +2004,7 @@ Value Eval::evaluate(const Position& pos) {
 
   Value v;
 
-  if (!Eval::useNNUE || !pos.nnue_applicable())
+  if (!Eval::useNNUE || !pos.nnue_applicable() || pos.topology_wraps())
       v = Evaluation<NO_TRACE>(pos).value();
   else
   {

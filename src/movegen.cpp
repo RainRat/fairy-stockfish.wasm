@@ -17,6 +17,7 @@
 */
 
 #include <cassert>
+#include <cstdlib>
 
 #include "movegen.h"
 #include "position.h"
@@ -29,7 +30,7 @@ template<GenType T>
 MoveList<T>::MoveList(const Position& pos) {
     thread = pos.this_thread();
     if (thread)
-        moveList = acquire_thread_buffer(thread);
+        moveList = thread->acquire_buffer();
     else {
         moveListPtr = std::make_unique<ExtMove[]>(MOVEGEN_OVERFLOW_CAPACITY);
         moveList = moveListPtr.get();
@@ -41,7 +42,7 @@ MoveList<T>::MoveList(const Position& pos) {
 template<GenType T>
 MoveList<T>::~MoveList() {
     if (thread)
-        release_thread_buffer(thread, moveList);
+        thread->release_buffer(moveList);
 }
 
 // Explicit instantiations
@@ -54,6 +55,9 @@ template struct MoveList<NON_EVASIONS>;
 
 namespace {
 
+  template<GenType Type>
+  constexpr bool CanEmitPromotions = Type == CAPTURES || Type == QUIETS || Type == EVASIONS || Type == NON_EVASIONS;
+
   Bitboard useful_freeze_gates(const Position& pos, Color us) {
     Bitboard gates = 0;
     Bitboard enemies = pos.pieces(~us);
@@ -65,20 +69,19 @@ namespace {
   template<MoveType T>
   ExtMove* make_move_and_gating(const Position& pos, ExtMove* moveList, Color us, Square from, Square to, PieceType pt = NO_PIECE_TYPE) {
 
+    Move m = make<T>(from, to, pt);
     bool iguiShot = T == SPECIAL && from != to;
-    bool rifleShot = pos.rifle_capture(make<T>(from, to, pt)) && (T == NORMAL || T == PROMOTION);
+    bool captureIsRifle = pos.rifle_capture(m) && pos.capture(m);
+    bool rifleShot = captureIsRifle && (T == NORMAL || T == PROMOTION);
     Square effectiveTo = (rifleShot || iguiShot) ? from : to;
-    Square capSq = T == EN_PASSANT ? pos.capture_square(to)
-                 : pos.is_jump_capture(make<T>(from, to, pt)) ? pos.jump_capture_square(from, to)
-                 : pos.capture(make<T>(from, to, pt)) ? to
-                 : SQ_NONE;
+    Square capSq = pos.capture(m) ? pos.capture_square(m) : SQ_NONE;
     Bitboard occupancyAfter = pos.pieces();
     if (from != effectiveTo) occupancyAfter ^= square_bb(from) ^ square_bb(effectiveTo);
     if (capSq != SQ_NONE) occupancyAfter ^= square_bb(capSq);
     if (T == CASTLING)
     {
-        Square kto = make_square(to > from ? pos.castling_kingside_file() : pos.castling_queenside_file(), pos.castling_rank(us));
-        Square rto = kto - (to > from ? EAST : WEST);
+        Square kto, rto;
+        pos.castling_destinations(us, from, to, kto, rto);
         occupancyAfter = (pos.pieces() ^ square_bb(from) ^ square_bb(to)) | kto | rto;
     }
 
@@ -86,34 +89,9 @@ namespace {
     //if it's "wall or move", and they chose non-null move, skip even generating wall move
     if (pos.walling(us) && !(pos.wall_or_move() && (from!=to)))
     {
-        Bitboard b = pos.board_bb() & ~occupancyAfter & ~square_bb(to);
+        const bool pureWallMove = T == SPECIAL && from == to && pt == NO_PIECE_TYPE && pos.wall_or_move();
+        Bitboard b = pos.wall_target_mask(us, from, effectiveTo, pureWallMove ? SQ_NONE : to, occupancyAfter);
 
-        // Duck is by far the hottest walling mode: avoid extra rule checks.
-        if (pos.walling_rule() == DUCK)
-        {
-            b &= pos.walling_region(us);
-            while (b)
-                *moveList++ = make_gating<T>(from, to, pt, pop_lsb(b));
-            return moveList;
-        }
-
-        if (pos.walling_rule() == ARROW)
-            b &= pos.moves_bb(us, type_of(pos.piece_on(from)), effectiveTo,
-                              occupancyAfter ^ square_bb(effectiveTo));
-
-        //Any current or future wall variant must follow the walling region rule if set:
-        b &= pos.walling_region(us);
-
-        if (pos.walling_rule() == PAST)
-            b &= square_bb(from);
-        if (pos.walling_rule() == EDGE)
-        {
-            Bitboard wallsquares = pos.state()->wallSquares;
-
-            b &= (FileABB | file_bb(pos.max_file()) | Rank1BB | rank_bb(pos.max_rank())) |
-               ( shift<NORTH     >(wallsquares) | shift<SOUTH     >(wallsquares)
-               | shift<EAST      >(wallsquares) | shift<WEST      >(wallsquares));
-        }
         while (b)
             *moveList++ = make_gating<T>(from, to, pt, pop_lsb(b));
         return moveList;
@@ -135,80 +113,117 @@ namespace {
     if (forcedGate != NO_PIECE_TYPE)
         *moveList++ = make_gating<T>(from, to, forcedGate, forcedGateSquare);
     else
-        *moveList++ = make<T>(from, to, pt);
+        *moveList++ = m;
 
     // Gating moves
-    if (pos.seirawan_gating() && (pos.gates(us) & from) && !pos.rifle_capture(make<T>(from, to, pt)))
-        for (PieceSet ps = pos.piece_types(); ps;)
-        {
-            PieceType pt_gating = pop_lsb(ps);
-            if (pos.can_drop(us, pt_gating) && (pos.drop_region(us, pt_gating) & from))
-            {
-                if (pos.symmetric_drop_types() & pt_gating)
-                {
-                    Square gate2 = pos.mirrored_pair_drop_square(from);
-                    if (gate2 != from
-                        && (pos.drop_region(us, pt_gating) & gate2)
-                        && !(occupancyAfter & gate2)
-                        && pos.count_in_hand(us, pt_gating) >= 2)
-                        *moveList++ = make_gating<T>(from, to, pt_gating, from);
-                }
-                else
-                    *moveList++ = make_gating<T>(from, to, pt_gating, from);
-            }
-        }
-    if (pos.seirawan_gating() && T == CASTLING && (pos.gates(us) & to) && !pos.rifle_capture(make<T>(from, to, pt)))
-        for (PieceSet ps = pos.piece_types(); ps;)
-        {
-            PieceType pt_gating = pop_lsb(ps);
-            if (pos.can_drop(us, pt_gating) && (pos.drop_region(us, pt_gating) & to))
-            {
-                if (pos.symmetric_drop_types() & pt_gating)
-                {
-                    Square gate2 = pos.mirrored_pair_drop_square(to);
-                    if (gate2 != to
-                        && (pos.drop_region(us, pt_gating) & gate2)
-                        && !(occupancyAfter & gate2)
-                        && pos.count_in_hand(us, pt_gating) >= 2)
-                        *moveList++ = make_gating<T>(from, to, pt_gating, to);
-                }
-                else
-                    *moveList++ = make_gating<T>(from, to, pt_gating, to);
-            }
-        }
-
-    return moveList;
-  }
-
-  template<Color c, GenType Type, Direction D>
-  ExtMove* make_promotions(const Position& pos, ExtMove* moveList, Square to) {
-
-    if (Type == CAPTURES || Type == QUIETS || Type == EVASIONS || Type == NON_EVASIONS)
+    if (pos.seirawan_gating() && !captureIsRifle)
     {
-        for (PieceSet promotions = pos.promotion_piece_types(c, to); promotions;)
+        for (Square gateSq : {from, to})
         {
-            PieceType pt = pop_msb(promotions);
-            if (pos.prison_pawn_promotion() && pos.count_in_prison(~c, pt) == 0) {
-                continue;
+            if (gateSq == to && (T != CASTLING || gateSq == from)) continue;
+            if (!(pos.gates(us) & gateSq)) continue;
+
+            for (PieceSet ps = pos.piece_types(); ps;)
+            {
+                PieceType pt_gating = pop_lsb(ps);
+                if (pos.can_drop(us, pt_gating) && (pos.drop_region(us, pt_gating) & gateSq))
+                {
+                    if (pos.symmetric_drop_types() & piece_set(pt_gating))
+                    {
+                        Square gate2 = pos.mirrored_pair_drop_square(gateSq);
+                        if (gate2 != gateSq
+                            && (pos.drop_region(us, pt_gating) & gate2)
+                            && !(occupancyAfter & gate2)
+                            && pos.count_in_hand(us, pt_gating) >= 2)
+                            *moveList++ = make_gating<T>(from, to, pt_gating, gateSq);
+                    }
+                    else
+                        *moveList++ = make_gating<T>(from, to, pt_gating, gateSq);
+                }
             }
-            if (pos.promotion_allowed(c, pt, to))
-                moveList = make_move_and_gating<PROMOTION>(pos, moveList, pos.side_to_move(), to - D, to, pt);
         }
-        PieceType pt = pos.promoted_piece_type(PAWN);
-        if (pt && !(pos.piece_promotion_on_capture() && pos.empty(to)))
-            moveList = make_move_and_gating<PIECE_PROMOTION>(pos, moveList, pos.side_to_move(), to - D, to);
     }
 
     return moveList;
   }
 
+  bool has_any_promotion(const Position& pos, Color us, Square to) {
+      auto can_emit_promotion_variant = [&](PieceType pt) {
+          return pos.promotion_allowed(us, pt, to)
+              && !(pos.prison_pawn_promotion() && pos.count_in_prison(~us, pt) == 0);
+      };
+
+      for (PieceSet ps = pos.promotion_piece_types(us, to); ps;)
+          if (can_emit_promotion_variant(pop_lsb(ps)))
+              return true;
+      PieceType pt = pos.promoted_piece_type(PAWN);
+      if (pt && pos.promotion_allowed(us, pt, to) && !(pos.piece_promotion_on_capture() && pos.empty(to)))
+          return true;
+      return false;
+  }
+
+  template<GenType Type>
+  ExtMove* emit_promotion_variants(const Position& pos, ExtMove* moveList, Color us, Square from, Square to) {
+      if constexpr (Type != CAPTURES && Type != QUIETS && Type != EVASIONS && Type != NON_EVASIONS)
+          return moveList;
+
+      auto can_emit_promotion_variant = [&](PieceType pt) {
+          return pos.promotion_allowed(us, pt, to)
+              && !(pos.prison_pawn_promotion() && pos.count_in_prison(~us, pt) == 0);
+      };
+
+      for (PieceSet promotions = pos.promotion_piece_types(us, to); promotions;)
+      {
+          PieceType pt = pop_msb(promotions);
+          if (can_emit_promotion_variant(pt))
+          {
+              moveList = make_move_and_gating<PROMOTION>(pos, moveList, us, from, to, pt);
+          }
+      }
+      PieceType pt = pos.promoted_piece_type(type_of(pos.piece_on(from)));
+      if (pt && pos.promotion_allowed(us, pt, to) && !(pos.piece_promotion_on_capture() && pos.empty(to)))
+      {
+          moveList = make_move_and_gating<PIECE_PROMOTION>(pos, moveList, us, from, to, pt);
+      }
+      return moveList;
+  }
+
+  template<Color Us, GenType Type>
+  bool can_generate_drop(const Position& pos, PieceType pt) {
+      return pos.can_drop(Us, pt)
+          || (Type != NON_EVASIONS && pos.two_boards() && pos.virtual_drops() && pos.allow_virtual_drop(Us, pt));
+  }
+
+  template<Color Us, GenType Type>
+  ExtMove* emit_drop_forms(const Position& pos, ExtMove* moveList, PieceType pt, Bitboard b, bool restrictToCheckSquares) {
+      PieceSet dropForms = pos.drop_piece_types(pt);
+      while (dropForms)
+      {
+          PieceType dropped = pop_lsb(dropForms);
+          Bitboard b2 = b;
+          if (restrictToCheckSquares)
+              b2 &= pos.check_squares(dropped);
+          while (b2)
+              *moveList++ = make_drop(pop_lsb(b2), pt, dropped);
+      }
+      return moveList;
+  }
+
+
+
+
+
+
+
   template<Color Us, GenType Type>
   ExtMove* generate_drops(const Position& pos, ExtMove* moveList, PieceType pt, Bitboard b) {
+    [[maybe_unused]] constexpr bool QuietChecks = Type == QUIET_CHECKS;
+
     if (pos.edge_insert_only() && (pos.edge_insert_types() & piece_set(pt)))
         return moveList;
 
     // Do not generate virtual drops for perft and at root
-    if (pos.can_drop(Us, pt) || (Type != NON_EVASIONS && pos.two_boards() && pos.virtual_drops() && pos.allow_virtual_drop(Us, pt)))
+    if (can_generate_drop<Us, Type>(pos, pt))
     {
         // Restrict to valid target
         b &= pos.drop_region(Us, pt) & (~pos.pieces() | pos.opening_swap_drop_targets(Us, pt));
@@ -223,21 +238,15 @@ namespace {
                     continue;
                 if (to > to2)
                     continue;
-                *moveList++ = make_drop_pair(to, to2, pt, pt);
+                Move m = make_drop_pair(to, to2, pt, pt);
+                if (QuietChecks && !pos.gives_check(m))
+                    continue;
+                *moveList++ = m;
             }
             return moveList;
         }
 
-        PieceSet dropForms = pos.drop_piece_types(pt);
-        while (dropForms)
-        {
-            PieceType dropped = pop_lsb(dropForms);
-            Bitboard b2 = b;
-            if (Type == QUIET_CHECKS || !pos.can_drop(Us, pt))
-                b2 &= pos.check_squares(dropped);
-            while (b2)
-                *moveList++ = make_drop(pop_lsb(b2), pt, dropped);
-        }
+        moveList = emit_drop_forms<Us, Type>(pos, moveList, pt, b, QuietChecks || !pos.can_drop(Us, pt));
     }
 
     return moveList;
@@ -245,13 +254,18 @@ namespace {
 
   template<Color Us, GenType Type>
   ExtMove* generate_capture_drops(const Position& pos, ExtMove* moveList, PieceType pt, Bitboard b) {
+    [[maybe_unused]] constexpr bool GeneratesQuiets = Type == QUIETS || Type == QUIET_CHECKS;
+
+    if (GeneratesQuiets)
+        return moveList;
+
     if (pos.edge_insert_only() && (pos.edge_insert_types() & piece_set(pt)))
         return moveList;
 
     if (!(pos.capture_drop_types() & piece_set(pt)))
         return moveList;
 
-    if (!(pos.can_drop(Us, pt) || (Type != NON_EVASIONS && pos.two_boards() && pos.virtual_drops() && pos.allow_virtual_drop(Us, pt))))
+    if (!can_generate_drop<Us, Type>(pos, pt))
         return moveList;
 
     Bitboard capturable = pos.pieces(~Us);
@@ -264,14 +278,7 @@ namespace {
     }
     b = dropTargets & pos.drop_region(Us, pt) & capturable;
 
-    PieceSet dropForms = pos.drop_piece_types(pt);
-    while (dropForms)
-    {
-        PieceType dropped = pop_lsb(dropForms);
-        Bitboard b2 = b;
-        while (b2)
-            *moveList++ = make_drop(pop_lsb(b2), pt, dropped);
-    }
+    moveList = emit_drop_forms<Us, Type>(pos, moveList, pt, b, false);
 
     return moveList;
   }
@@ -295,62 +302,33 @@ namespace {
     while (entries)
     {
         Square to = pop_lsb(entries);
+        auto emit_insert = [&](Square from, PieceType insertPt) {
+            Move m = make_insert(from, to, insertPt, insertPt);
+            PushInfo pushInfo;
+            bool push = pos.analyze_push(m, pushInfo);
+            if (!pos.empty(to) && !push)
+                return;
+            bool cap = push && pushInfo.captures;
+            if ((Type == CAPTURES && cap)
+                || (Type == QUIETS && !cap)
+                || (Type == EVASIONS || Type == NON_EVASIONS))
+                *moveList++ = m;
+        };
         for (PieceSet ps = insertTypes; ps; )
         {
             PieceType pt = pop_lsb(ps);
-            if (!(pos.can_drop(Us, pt)
-                  || (Type != NON_EVASIONS && pos.two_boards() && pos.virtual_drops() && pos.allow_virtual_drop(Us, pt)))
+            if (!can_generate_drop<Us, Type>(pos, pt)
                 || !(pos.drop_region(Us, pt) & to))
                 continue;
 
-            if (pos.edge_insert_from_top(Us) && rank_of(to) == pos.max_rank() && rank_of(to) > RANK_1)
-            {
-                Move m = make_insert(to + SOUTH, to, pt, pt);
-                bool push = pos.push_move(m);
-                if (!pos.empty(to) && !push)
-                    continue;
-                bool cap = push && pos.push_captures(m);
-                if ((Type == CAPTURES && cap)
-                    || (Type == QUIETS && !cap)
-                    || (Type != CAPTURES && Type != QUIETS))
-                    *moveList++ = m;
-            }
-            if (pos.edge_insert_from_bottom(Us) && rank_of(to) == RANK_1 && rank_of(to) < pos.max_rank())
-            {
-                Move m = make_insert(to + NORTH, to, pt, pt);
-                bool push = pos.push_move(m);
-                if (!pos.empty(to) && !push)
-                    continue;
-                bool cap = push && pos.push_captures(m);
-                if ((Type == CAPTURES && cap)
-                    || (Type == QUIETS && !cap)
-                    || (Type != CAPTURES && Type != QUIETS))
-                    *moveList++ = m;
-            }
-            if (pos.edge_insert_from_left(Us) && file_of(to) == FILE_A && file_of(to) < pos.max_file())
-            {
-                Move m = make_insert(to + EAST, to, pt, pt);
-                bool push = pos.push_move(m);
-                if (!pos.empty(to) && !push)
-                    continue;
-                bool cap = push && pos.push_captures(m);
-                if ((Type == CAPTURES && cap)
-                    || (Type == QUIETS && !cap)
-                    || (Type != CAPTURES && Type != QUIETS))
-                    *moveList++ = m;
-            }
-            if (pos.edge_insert_from_right(Us) && file_of(to) == pos.max_file() && file_of(to) > FILE_A)
-            {
-                Move m = make_insert(to + WEST, to, pt, pt);
-                bool push = pos.push_move(m);
-                if (!pos.empty(to) && !push)
-                    continue;
-                bool cap = push && pos.push_captures(m);
-                if ((Type == CAPTURES && cap)
-                    || (Type == QUIETS && !cap)
-                    || (Type != CAPTURES && Type != QUIETS))
-                    *moveList++ = m;
-            }
+            if (pos.edge_insert_direction_ok(Us, to + SOUTH, to))
+                emit_insert(to + SOUTH, pt);
+            if (pos.edge_insert_direction_ok(Us, to + NORTH, to))
+                emit_insert(to + NORTH, pt);
+            if (pos.edge_insert_direction_ok(Us, to + EAST, to))
+                emit_insert(to + EAST, pt);
+            if (pos.edge_insert_direction_ok(Us, to + WEST, to))
+                emit_insert(to + WEST, pt);
         }
     }
 
@@ -375,53 +353,77 @@ namespace {
           }
           // Restrict to valid target
           b &= pos.drop_region(Us, pt);
-          // Add to move list
-          if (pos.drop_promoted() && pos.promoted_piece_type(pt)) {
-              Bitboard b2 = b;
-              if (Type == QUIET_CHECKS)
-                  b2 &= pos.check_squares(pos.promoted_piece_type(pt));
-              while (b2) {
-                  auto to = pop_lsb(b2);
+          auto emit_exchanges = [&](Bitboard targets, PieceType finalPt) {
+              while (targets) {
+                  auto to = pop_lsb(targets);
                   for (PieceSet r = rescue; r; ) {
                       PieceType ex = pop_lsb(r);
-                      *moveList++ = make_exchange(to, ex, pt, pos.promoted_piece_type(pt));
+                      *moveList++ = make_exchange(to, ex, pt, finalPt);
                   }
               }
+          };
+
+          if (pos.drop_promoted() && pos.promoted_piece_type(pt)) {
+              Bitboard promotedTargets = b;
+              if (Type == QUIET_CHECKS)
+                  promotedTargets &= pos.check_squares(pos.promoted_piece_type(pt));
+              emit_exchanges(promotedTargets, pos.promoted_piece_type(pt));
           }
           if (Type == QUIET_CHECKS)
               b &= pos.check_squares(pt);
-          while (b) {
-              auto to = pop_lsb(b);
-              for (PieceSet r = rescue; r; ) {
-                  PieceType ex = pop_lsb(r);
-                  *moveList++ = make_exchange(to, ex, pt, pt);
-              }
-          }
+          emit_exchanges(b, pt);
       }
       return moveList;
   }
 
-  template<Color Us, GenType Type>
-  ExtMove* generate_pawn_moves(const Position& pos, ExtMove* moveList, Bitboard target, Bitboard fromMask = AllSquares) {
+  struct MoveBuffer {
+      ExtMove* begin;
+      ExtMove* end;
+  };
 
-    if (!pos.pieces(Us, PAWN))
-        return moveList;
+  struct PawnGenSpec {
+      Bitboard target;
+      Bitboard fromMask = AllSquares;
+  };
+
+  struct PieceGenSpec {
+      PieceType pt;
+      Bitboard target;
+      Bitboard captureTarget;
+      Bitboard fromMask = AllSquares;
+  };
+
+  template<Color Us, GenType Type>
+  ExtMove* generate_pawn_moves(const Position& pos, ExtMove* moveList, PawnGenSpec spec) {
+    [[maybe_unused]] constexpr bool GeneratesCaptures = Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS;
+    [[maybe_unused]] constexpr bool GeneratesQuiets = Type != CAPTURES;
+    [[maybe_unused]] constexpr bool QuietChecks = Type == QUIET_CHECKS;
+
+    Bitboard target = spec.target;
+    Bitboard fromMask = spec.fromMask;
 
     constexpr Color     Them     = ~Us;
     constexpr Direction Up       = pawn_push(Us);
+    constexpr Direction Up2      = Direction(2 * int(Up));
+    constexpr Direction Up3      = Direction(3 * int(Up));
     constexpr Direction UpRight  = (Us == WHITE ? NORTH_EAST : SOUTH_WEST);
     constexpr Direction UpLeft   = (Us == WHITE ? NORTH_WEST : SOUTH_EAST);
 
-    /// yjf2002ghty: Since it's generate_pawn_moves, I assume the piece type is PAWN. It can cause problems if the pawn is something else (e.g. Custom pawn piece)
     const Bitboard promotionZone = pos.promotion_zone(Us, PAWN);
     const Bitboard standardPromotionZone = pos.sittuyin_promotion() ? Bitboard(0) : promotionZone;
-    /// yjf2002ghty: Since it's generate_pawn_moves, I assume the piece type is PAWN. It can cause problems if the pawn is something else (e.g. Custom pawn piece)
     const Bitboard doubleStepRegion = pos.double_step_region(Us, PAWN);
-    /// yjf2002ghty: Since it's generate_pawn_moves, I assume the piece type is PAWN. It can cause problems if the pawn is something else (e.g. Custom pawn piece)
     const Bitboard tripleStepRegion = pos.triple_step_region(Us, PAWN);
 
     const Bitboard frozen     = pos.freeze_squares();
     const Bitboard pawns      = pos.pieces(Us, PAWN) & fromMask & ~frozen;
+    if (!pawns)
+        return moveList;
+
+    Bitboard localCaptureTarget = target;
+    if (pos.self_capture(PAWN) && GeneratesCaptures)
+        localCaptureTarget |= pos.pieces(Us) & ~pos.pieces(Us, KING) & (Type == EVASIONS ? target : AllSquares);
+
+    const Bitboard unmovedPawns = pawns;
     const Bitboard neutral    = pos.dead_squares();
     const Bitboard movable    = pos.board_bb(Us, PAWN) & ~pos.pieces();
     const Bitboard friendlyCapturable = pos.pieces(Us) & ~pos.pieces(Us, KING);
@@ -429,39 +431,21 @@ namespace {
                               & (pos.self_capture(PAWN) ? (pos.pieces(Them) | friendlyCapturable | neutral)
                                                     :  (pos.pieces(Them) | neutral));
 
-    target = Type == EVASIONS ? target : AllSquares;
-
     if (pos.topology_wraps())
     {
         Bitboard mandatoryPromotionZone = pos.mandatory_promotion_zone(Us, PAWN);
         if (pos.mandatory_pawn_promotion())
             mandatoryPromotionZone |= standardPromotionZone;
 
-        auto has_promotion_for = [&](Square to) {
-            for (PieceSet ps = pos.promotion_piece_types(Us, to); ps;)
-                if (pos.promotion_allowed(Us, pop_lsb(ps), to))
-                    return true;
-            return false;
-        };
-
-        auto emit_promotions = [&](Square from, Square to) {
-            for (PieceSet promotions = pos.promotion_piece_types(Us, to); promotions;)
-            {
-                PieceType pt = pop_msb(promotions);
-                if (pos.prison_pawn_promotion() && pos.count_in_prison(~Us, pt) == 0)
-                    continue;
-                if (pos.promotion_allowed(Us, pt, to))
-                    moveList = make_move_and_gating<PROMOTION>(pos, moveList, Us, from, to, pt);
-            }
-        };
-
         Bitboard remaining = pawns;
         while (remaining)
         {
             Square from = pop_lsb(remaining);
             Bitboard quiets = pos.moves_from(Us, PAWN, from) & target;
-            Bitboard attacks = pos.attacks_from(Us, PAWN, from) & capturable & target;
-            Bitboard epSquares = pos.attacks_from(Us, PAWN, from) & pos.ep_squares() & ~pos.pieces() & target;
+            Bitboard attacks = pos.attacks_from(Us, PAWN, from) & capturable & localCaptureTarget;
+            Bitboard epSquares = pos.attacks_from(Us, PAWN, from) & pos.ep_squares() & ~pos.pieces() & localCaptureTarget;
+            Bitboard quietPromotions = quiets & standardPromotionZone;
+            Bitboard capturePromotions = attacks & standardPromotionZone;
 
             if (mandatoryPromotionZone)
             {
@@ -469,31 +453,25 @@ namespace {
                 for (Bitboard candidates = (quiets | attacks) & mandatoryPromotionZone; candidates; )
                 {
                     Square to = pop_lsb(candidates);
-                    if (!has_promotion_for(to))
+                    if (!has_any_promotion(pos, Us, to))
                         blocked |= to;
                 }
                 quiets &= ~blocked;
                 attacks &= ~blocked;
-            }
-
-            if (mandatoryPromotionZone)
-            {
-                Bitboard quietPromotions = quiets & mandatoryPromotionZone;
-                Bitboard capturePromotions = attacks & mandatoryPromotionZone;
+                quietPromotions &= ~blocked;
+                capturePromotions &= ~blocked;
                 quiets &= ~mandatoryPromotionZone;
                 attacks &= ~mandatoryPromotionZone;
-
-                while (quietPromotions)
-                    emit_promotions(from, pop_lsb(quietPromotions));
-                while (capturePromotions)
-                    emit_promotions(from, pop_lsb(capturePromotions));
             }
 
-            if (Type != CAPTURES)
+            if (QuietChecks)
+                quiets &= pos.check_squares(PAWN);
+
+            if (GeneratesQuiets)
                 while (quiets)
                     moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, from, pop_lsb(quiets));
 
-            if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+            if (GeneratesCaptures)
             {
                 while (attacks)
                     moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, from, pop_lsb(attacks));
@@ -505,40 +483,51 @@ namespace {
                     moveList = make_move_and_gating<EN_PASSANT>(pos, moveList, Us, from, epSquare);
                 }
             }
+
+            if constexpr (CanEmitPromotions<Type>)
+            {
+                while (quietPromotions)
+                    moveList = emit_promotion_variants<Type>(pos, moveList, Us, from, pop_lsb(quietPromotions));
+                if (GeneratesCaptures)
+                    while (capturePromotions)
+                        moveList = emit_promotion_variants<Type>(pos, moveList, Us, from, pop_lsb(capturePromotions));
+            }
         }
 
         return moveList;
     }
 
-    // Define single and double push, left and right capture, as well as respective promotion moves
     Bitboard b1 = shift<Up>(pawns) & movable & target;
-    Bitboard b2 = shift<Up>(shift<Up>(pawns & doubleStepRegion) & movable) & movable & target;
-    Bitboard b3 = shift<Up>(shift<Up>(shift<Up>(pawns & tripleStepRegion) & movable) & movable) & movable & target;
-    Bitboard brc = shift<UpRight>(pawns) & capturable & target;
-    Bitboard blc = shift<UpLeft >(pawns) & capturable & target;
+    Bitboard b2 = shift<Up>(shift<Up>(unmovedPawns & doubleStepRegion) & movable) & movable & target;
+    Bitboard b3 = shift<Up>(shift<Up>(shift<Up>(unmovedPawns & tripleStepRegion) & movable) & movable) & movable & target;
+    Bitboard brc = shift<UpRight>(pawns) & capturable & localCaptureTarget;
+    Bitboard blc = shift<UpLeft >(pawns) & capturable & localCaptureTarget;
 
     Bitboard b1p = b1 & standardPromotionZone;
     Bitboard b2p = b2 & standardPromotionZone;
     Bitboard b3p = b3 & standardPromotionZone;
     Bitboard brcp = brc & standardPromotionZone;
     Bitboard blcp = blc & standardPromotionZone;
-    Bitboard rifleBrcp = pos.rifle_capture(make_piece(Us, PAWN)) ? brcp : Bitboard(0);
-    Bitboard rifleBlcp = pos.rifle_capture(make_piece(Us, PAWN)) ? blcp : Bitboard(0);
-    if (pos.rifle_capture(make_piece(Us, PAWN)))
+    const bool pawnRifleCapture = pos.rifle_capture(make_piece(Us, PAWN));
+    Bitboard rifleBrcp = pawnRifleCapture ? brcp : Bitboard(0);
+    Bitboard rifleBlcp = pawnRifleCapture ? blcp : Bitboard(0);
+    if (pawnRifleCapture)
     {
         brcp = 0;
         blcp = 0;
     }
 
     Bitboard mandatoryPromotionZone = pos.mandatory_promotion_zone(Us, PAWN);
-    if (pos.mandatory_pawn_promotion())
+    if (pos.mandatory_pawn_promotion()) {
         mandatoryPromotionZone |= standardPromotionZone;
+    }
 
-    auto has_promotion_for = [&](Square to) {
-        for (PieceSet ps = pos.promotion_piece_types(Us, to); ps;)
-            if (pos.promotion_allowed(Us, pop_lsb(ps), to))
-                return true;
-        return false;
+    auto emit_normal_moves = [&](Bitboard bb, Direction delta) {
+        while (bb)
+        {
+            Square to = pop_lsb(bb);
+            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - delta, to);
+        }
     };
 
     auto filter_promotion_targets = [&](Bitboard bb) {
@@ -546,7 +535,7 @@ namespace {
         while (bb)
         {
             Square to = pop_lsb(bb);
-            if (has_promotion_for(to))
+            if (has_any_promotion(pos, Us, to))
                 filtered |= to;
         }
         return filtered;
@@ -566,72 +555,71 @@ namespace {
         blcp = filter_promotion_targets(blcp);
     }
 
-    if (Type == QUIET_CHECKS && pos.count<KING>(Them))
+    Square ksq = pos.royal_square(Them);
+    if (QuietChecks && ksq != SQ_NONE)
     {
         // To make a quiet check, you either make a direct check by pushing a pawn
         // or push a blocker pawn that is not on the same file as the enemy king.
         // Discovered check promotion has been already generated amongst the captures.
-        Square ksq = pos.square<KING>(Them);
         Bitboard dcCandidatePawns = pos.blockers_for_king(Them) & ~file_bb(ksq);
         b1 &= pawn_attacks_bb(Them, ksq) | shift<   Up>(dcCandidatePawns);
-        b2 &= pawn_attacks_bb(Them, ksq) | shift<Up+Up>(dcCandidatePawns);
+        b2 &= pawn_attacks_bb(Them, ksq) | shift<Up2>(dcCandidatePawns);
+        b3 &= pawn_attacks_bb(Them, ksq) | shift<Up3>(dcCandidatePawns);
     }
 
     // Single and double pawn pushes, no promotions
-    if (Type != CAPTURES)
+    if (GeneratesQuiets)
     {
-        while (b1)
-        {
-            Square to = pop_lsb(b1);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - Up, to);
-        }
-
-        while (b2)
-        {
-            Square to = pop_lsb(b2);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - Up - Up, to);
-        }
-
-        while (b3)
-        {
-            Square to = pop_lsb(b3);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - Up - Up - Up, to);
-        }
+        emit_normal_moves(b1, Up);
+        emit_normal_moves(b2, Up2);
+        emit_normal_moves(b3, Up3);
     }
 
     // Promotions and underpromotions
-    while (brcp)
-        moveList = make_promotions<Us, Type, UpRight>(pos, moveList, pop_lsb(brcp));
-
-    while (blcp)
-        moveList = make_promotions<Us, Type, UpLeft >(pos, moveList, pop_lsb(blcp));
-
-    while (b1p)
-        moveList = make_promotions<Us, Type, Up     >(pos, moveList, pop_lsb(b1p));
-
-    while (b2p)
-        moveList = make_promotions<Us, Type, Up+Up  >(pos, moveList, pop_lsb(b2p));
-
-    while (b3p)
-        moveList = make_promotions<Us, Type, Up+Up+Up>(pos, moveList, pop_lsb(b3p));
-
-    if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+    if constexpr (CanEmitPromotions<Type>)
     {
-        while (rifleBrcp)
+        if (GeneratesCaptures)
         {
-            Square to = pop_lsb(rifleBrcp);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - UpRight, to);
+            while (brcp)
+            {
+                Square to = pop_lsb(brcp);
+                moveList = emit_promotion_variants<Type>(pos, moveList, Us, to - UpRight, to);
+            }
+
+            while (blcp)
+            {
+                Square to = pop_lsb(blcp);
+                moveList = emit_promotion_variants<Type>(pos, moveList, Us, to - UpLeft, to);
+            }
         }
 
-        while (rifleBlcp)
+        while (b1p)
         {
-            Square to = pop_lsb(rifleBlcp);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - UpLeft, to);
+            Square to = pop_lsb(b1p);
+            moveList = emit_promotion_variants<Type>(pos, moveList, Us, to - Up, to);
+        }
+
+        while (b2p)
+        {
+            Square to = pop_lsb(b2p);
+            moveList = emit_promotion_variants<Type>(pos, moveList, Us, to - Up2, to);
+        }
+
+        while (b3p)
+        {
+            Square to = pop_lsb(b3p);
+            moveList = emit_promotion_variants<Type>(pos, moveList, Us, to - Up3, to);
         }
     }
 
+    if (GeneratesCaptures)
+    {
+        emit_normal_moves(rifleBrcp, UpRight);
+        emit_normal_moves(rifleBlcp, UpLeft);
+    }
+
     // Sittuyin promotions
-    if (pos.sittuyin_promotion() && (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS))
+    if (pos.sittuyin_promotion() && GeneratesCaptures)
     {
         // Pawns need to be in promotion zone if there is more than one pawn
         Bitboard promotionPawns = pos.count<PAWN>(Us) > 1 ? pawns & promotionZone : pawns;
@@ -643,7 +631,9 @@ namespace {
                 PieceType pt = pop_msb(ps);
                 if (!pos.promotion_allowed(Us, pt))
                     continue;
-                Bitboard b = ((pos.attacks_from(Us, pt, from) & ~(pos.pieces() | pos.dead_squares())) | from) & target;
+                Bitboard b = (pos.attacks_from(Us, pt, from) & ~(pos.pieces() | pos.dead_squares())) & target;
+                if (Type == EVASIONS ? bool(target & from) : true)
+                    b |= from;
                 while (b)
                 {
                     Square to = pop_lsb(b);
@@ -655,19 +645,10 @@ namespace {
     }
 
     // Standard and en passant captures
-    if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+    if (GeneratesCaptures)
     {
-        while (brc)
-        {
-            Square to = pop_lsb(brc);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - UpRight, to);
-        }
-
-        while (blc)
-        {
-            Square to = pop_lsb(blc);
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, to - UpLeft, to);
-        }
+        emit_normal_moves(brc, UpRight);
+        emit_normal_moves(blc, UpLeft);
 
         for (Bitboard epSquares = pos.ep_squares() & ~(pos.pieces() | pos.dead_squares()); epSquares; )
         {
@@ -692,36 +673,46 @@ namespace {
 
 
   template<Color Us, GenType Type>
-  ExtMove* generate_moves(const Position& pos, ExtMove* moveList, PieceType Pt, Bitboard target, Bitboard captureTarget, Bitboard fromMask = AllSquares) {
+  ExtMove* generate_moves(const Position& pos, ExtMove* moveList, PieceGenSpec spec) {
+    [[maybe_unused]] constexpr bool GeneratesCaptures = Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS;
+    [[maybe_unused]] constexpr bool GeneratesQuiets = Type != CAPTURES;
+    [[maybe_unused]] constexpr bool QuietChecks = Type == QUIET_CHECKS;
 
-    assert(Pt != KING && Pt != PAWN);
+    const PieceType Pt = spec.pt;
+    Bitboard target = spec.target;
+    Bitboard captureTarget = spec.captureTarget;
+    Bitboard fromMask = spec.fromMask;
+
+    assert(Pt != KING);
 
     constexpr Direction Up = pawn_push(Us);
-    Bitboard bb = pos.pieces(Us, Pt) & fromMask;
-    Bitboard frozen = pos.freeze_squares();
+    Bitboard bb = pos.pieces(Us, Pt) & fromMask & ~pos.freeze_squares();
+    Bitboard selfCaptureTargets = pos.pieces(Us);
+    Square royalSq = pos.royal_square(Us);
+    if (royalSq != SQ_NONE)
+        selfCaptureTargets &= ~square_bb(royalSq);
 
     while (bb)
     {
         Square from = pop_lsb(bb);
 
-        if (frozen & from)
-            continue;
-
         Bitboard attacks = pos.attacks_from(Us, Pt, from);
         Bitboard quiets = pos.moves_from(Us, Pt, from);
         Bitboard captureSquares;
         Bitboard localCaptureTarget = captureTarget;
-        if (pos.self_capture(Pt))
-            localCaptureTarget |= pos.pieces(Us) & ~pos.pieces(Us, KING) & (Type == EVASIONS ? target : AllSquares);
+        if (pos.self_capture(Pt) && GeneratesCaptures)
+            localCaptureTarget |= selfCaptureTargets & (Type == EVASIONS ? target : AllSquares);
         if (pos.anti_royal_self_capture_only() && (pos.anti_royal_types() & piece_set(Pt)))
-            captureSquares = attacks & pos.pieces(Us) & ~pos.pieces(Us, KING);
+            captureSquares = attacks & selfCaptureTargets;
         else
         {
             Bitboard capturable = (pos.pieces() & ~pos.pieces(Us)) | pos.dead_squares();
-            if (pos.self_capture(Pt))
-                capturable |= pos.pieces(Us) & ~pos.pieces(Us, KING);
+            if (pos.self_capture(Pt) && GeneratesCaptures)
+                capturable |= selfCaptureTargets;
             captureSquares = (attacks & capturable) & localCaptureTarget;
         }
+        if (Type == QUIETS || Type == QUIET_CHECKS)
+            captureSquares = 0;
         Bitboard quietSquares   = (quiets & ~pos.pieces()) & target;
         Bitboard b = captureSquares | quietSquares;
         Bitboard epSquares = (pos.en_passant_types(Us) & piece_set(Pt)) ? (attacks & pos.ep_squares() & ~pos.pieces()) : Bitboard(0);
@@ -731,21 +722,52 @@ namespace {
         Bitboard promotion_zone = pos.promotion_zone(Us, Pt);
         Bitboard mandatoryPromotionZone = pos.mandatory_promotion_zone(Us, Pt);
         PieceType promPt = pos.is_promoted(from) ? NO_PIECE_TYPE : pos.promoted_piece_type(Pt);
-        Bitboard b2 = promPt && pos.promotion_allowed(Us, promPt) ? b1 : Bitboard(0);
+        Bitboard b2 = promPt ? b1 : Bitboard(0);
         Bitboard b3 = pos.piece_demotion() && pos.is_promoted(from) ? b1 : Bitboard(0);
         Bitboard pawnPromotions = (pos.promotion_pawn_types(Us) & piece_set(Pt))
-                                ? (b & (Type == EVASIONS ? target : (~pos.pieces(Us) | (pos.self_capture(Pt) ? (pos.pieces(Us) & ~pos.pieces(Us, KING)) : Bitboard(0)))) & promotion_zone)
+                                ? (b & (Type == EVASIONS ? target : (~pos.pieces(Us) | (pos.self_capture(Pt) ? selfCaptureTargets : Bitboard(0)))) & promotion_zone)
                                 : Bitboard(0);
         Bitboard jumpCaptures = 0;
-        PieceSet jumpTypes = pos.jump_capture_types();
-        if ((jumpTypes & ALL_PIECES) || (jumpTypes & piece_set(Pt)))
+        PieceType movePt = Pt;
+        const PieceInfo* pi = pieceMap.get(movePt);
+        if (pi->has_universal_hopper())
         {
+            // Universal hopper jump captures land on empty squares; captured hurdle
+            // square is resolved by jump_capture_square().
             Bitboard candidates = (attacks | quiets) & ~pos.pieces();
+            candidates |= pos.universal_hopper_potential_bb(movePt, from) & pos.board_bb() & ~pos.pieces();
+
             while (candidates)
             {
                 Square to = pop_lsb(candidates);
-                if (pos.jump_capture_square(from, to) != SQ_NONE)
-                    jumpCaptures |= to;
+                Square hurdle = pos.jump_capture_square(from, to);
+                if (hurdle != SQ_NONE)
+                {
+                    bool ok = true;
+                    if constexpr (Type == EVASIONS)
+                    {
+                        Bitboard checkers = pos.evasion_checkers();
+                        if (checkers & hurdle)
+                        {
+                            Bitboard remaining = checkers & ~square_bb(hurdle);
+                            while (remaining)
+                            {
+                                Square checksq = pop_lsb(remaining);
+                                if (!(pos.checker_evasion_targets(Us, royalSq, checksq) & to))
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            ok = (target & to);
+                        }
+                    }
+                    if (ok)
+                        jumpCaptures |= to;
+                }
             }
         }
         Bitboard pushMoves = 0;
@@ -756,14 +778,15 @@ namespace {
             {
                 Square to = pop_lsb(candidates);
                 Move pm = make<NORMAL>(from, to);
-                if (!pos.push_move(pm))
+                PushInfo pushInfo;
+                if (!pos.analyze_push(pm, pushInfo))
                     continue;
-                if (pos.push_captures(pm))
+                if (pushInfo.captures)
                 {
-                    if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+                    if (GeneratesCaptures)
                         pushMoves |= to;
                 }
-                else if (Type != CAPTURES)
+                else if (GeneratesQuiets && (!QuietChecks || pos.gives_check(pm)))
                     pushMoves |= to;
             }
         }
@@ -844,8 +867,7 @@ namespace {
         // Jump captures are emitted explicitly below in capture-generating modes.
         // Exclude them from regular NORMAL generation to avoid duplicates.
         b1 &= ~jumpCaptures;
-        if (!pos.stepwise_pushing())
-            b1 &= ~pushMoves;
+        b1 &= ~pushMoves;
 
         while (b1)
             moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, from, pop_lsb(b1));
@@ -860,8 +882,6 @@ namespace {
             moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, from, pop_lsb(pawnLikeTripleSteps));
 
         // Shogi-style piece promotions
-        if (promPt && !pos.promotion_allowed(Us, promPt))
-            b2 = 0;
         while (b2)
             moveList = make_move_and_gating<PIECE_PROMOTION>(pos, moveList, Us, from, pop_lsb(b2));
 
@@ -870,23 +890,18 @@ namespace {
             moveList = make_move_and_gating<PIECE_DEMOTION>(pos, moveList, Us, from, pop_lsb(b3));
 
         // Pawn-style promotions
-        if ((Type == CAPTURES || Type == QUIETS || Type == EVASIONS || Type == NON_EVASIONS) && pawnPromotions)
-            for (Bitboard promotions = pawnPromotions; promotions; )
-            {
-                Square to = pop_lsb(promotions);
-                for (PieceSet ps = pos.promotion_piece_types(Us, to); ps;)
+        if constexpr (CanEmitPromotions<Type>)
+        {
+            if (pawnPromotions)
+                for (Bitboard promotions = pawnPromotions; promotions; )
                 {
-                    PieceType ptP = pop_msb(ps);
-                    if (pos.prison_pawn_promotion() && pos.count_in_prison(~Us, ptP) == 0) {
-                        continue;
-                    }
-                    if (pos.promotion_allowed(Us, ptP, to))
-                        moveList = make_move_and_gating<PROMOTION>(pos, moveList, pos.side_to_move(), from, to, ptP);
+                    Square to = pop_lsb(promotions);
+                    moveList = emit_promotion_variants<Type>(pos, moveList, Us, from, to);
                 }
-            }
+        }
 
         // En passant captures
-        if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+        if (GeneratesCaptures)
         {
             while (jumpCaptures)
                 moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, from, pop_lsb(jumpCaptures));
@@ -905,7 +920,8 @@ namespace {
     static_assert(Type != LEGAL, "Unsupported type in generate_all()");
 
     constexpr bool Checks = Type == QUIET_CHECKS; // Reduce template instantiations
-    const Square ksq = pos.count<KING>(Us) ? pos.square<KING>(Us) : SQ_NONE;
+    const PieceType royalPt = pos.royal_piece_type(Us);
+    const Square royalSq = pos.royal_square(Us);
     const Bitboard checkers = pos.evasion_checkers();
     Bitboard target;
     Bitboard captureTarget = Bitboard(0);
@@ -939,7 +955,7 @@ namespace {
             {
                 // Opponent must pass while the other side completes a forced jump chain.
                 Bitboard usPieces = pos.pieces(Us);
-                if (pos.pass(Us))
+                if (Type != QUIET_CHECKS && pos.pass(Us))
                 {
                     Square passSq = usPieces ? lsb(usPieces) : lsb(pos.board_bb());
                     *moveList++ = make<SPECIAL>(passSq, passSq);
@@ -949,78 +965,101 @@ namespace {
         }
     }
 
+    const PieceInfo* pawnInfo = pieceMap.get(PAWN);
+    const bool pawnHasCustomNonStepMovement = pawnInfo->has_nonstandard_pawn_movement();
+    const bool useFastStandardPawnGenerator =
+           !pawnHasCustomNonStepMovement
+        && !pawnInfo->has_explicit_initial_moves()
+        && pawnInfo->steps[0][MODALITY_QUIET].size() == 1
+        && pawnInfo->steps[0][MODALITY_QUIET].count(NORTH)
+        && pawnInfo->steps[0][MODALITY_CAPTURE].size() == 2
+        && pawnInfo->steps[0][MODALITY_CAPTURE].count(NORTH_EAST)
+        && pawnInfo->steps[0][MODALITY_CAPTURE].count(NORTH_WEST)
+        && pawnInfo->slider[0][MODALITY_QUIET].empty()
+        && pawnInfo->slider[0][MODALITY_CAPTURE].empty()
+        && pawnInfo->tupleSteps[0][MODALITY_QUIET].empty()
+        && pawnInfo->tupleSteps[0][MODALITY_CAPTURE].empty()
+        && pawnInfo->tupleSlider[0][MODALITY_QUIET].empty()
+        && pawnInfo->tupleSlider[0][MODALITY_CAPTURE].empty();
+
     // Skip generating non-king moves when in double check
     if (Type != EVASIONS || !more_than_one(checkers & ~pos.non_sliding_riders()))
     {
         if (restrictToForcedJumper)
         {
             target = Bitboard(0);
-            captureTarget = Bitboard(0);
+            captureTarget = pos.pieces(~Us) | pos.dead_squares();
         }
         else
         {
-            target = Type == EVASIONS     ?  between_bb(ksq, lsb(checkers))
+            target = Type == EVASIONS     ?  between_bb(royalSq, lsb(checkers))
                    : Type == NON_EVASIONS ? ~pos.pieces( Us)
                    : Type == CAPTURES     ? (pos.pieces(~Us) | pos.dead_squares())
                                           : ~pos.pieces(   ); // QUIETS || QUIET_CHECKS
 
             if (Type == EVASIONS)
             {
-                auto checker_targets = [&](Square checksq) {
-                    PieceType checkerPt = type_of(pos.piece_on(checksq));
-                    Bitboard checkerMask = square_bb(checksq);
-                    Bitboard t = (AttackRiderTypes[checkerPt] & RIDER_ROSE)
-                               ? rose_between_intersection_bb(ksq, checksq, pos.pieces())
-                               : between_bb(ksq, checksq, checkerPt);
-
-                    bool blockableNightrider = AttackRiderTypes[checkerPt] & RIDER_NIGHTRIDER;
-                    if ((checkerMask & pos.non_sliding_riders()) && !blockableNightrider)
-                        t = ~pos.pieces(Us);
-                    if (LeaperAttacks[~Us][checkerPt][checksq] & ksq)
-                        t = checkerMask;
-                    return t;
-                };
-
                 const bool multipleCheckers = more_than_one(checkers);
                 if (multipleCheckers)
                 {
                     target = AllSquares;
                     Bitboard remaining = checkers;
                     while (remaining)
-                        target &= checker_targets(pop_lsb(remaining));
+                        target &= pos.checker_evasion_targets(Us, royalSq, pop_lsb(remaining));
                 }
                 else
-                    target = checker_targets(lsb(checkers));
+                    target = pos.checker_evasion_targets(Us, royalSq, lsb(checkers));
+
+                if (pos.blast_on_move() || pos.blast_on_self_destruct())
+                    target = AllSquares;
             }
 
             // Remove inaccessible squares (outside board + wall squares)
             target &= pos.board_bb();
 
-            captureTarget = target;
+            if (Type == EVASIONS && (pos.blast_on_capture() || pos.blast_on_self_destruct()))
+                captureTarget = pos.board_bb() & ~pos.pieces(Us);
+            else
+                captureTarget = target;
         }
 
-        if (restrictToForcedJumper)
-        {
-            if (forcedJumpPt == PAWN)
-                moveList = generate_pawn_moves<Us, Type>(pos, moveList, target, forcedFromMask);
-            else if (forcedJumpPt != KING)
-                moveList = generate_moves<Us, Type>(pos, moveList, forcedJumpPt, target, captureTarget, forcedFromMask);
-        }
-        else
-        {
-            moveList = generate_pawn_moves<Us, Type>(pos, moveList, target, forcedFromMask);
-            for (PieceSet ps = pos.piece_types() & ~(piece_set(PAWN) | KING); ps;)
-                moveList = generate_moves<Us, Type>(pos, moveList, pop_lsb(ps), target, captureTarget, forcedFromMask);
-        }
+            if (restrictToForcedJumper)
+            {
+                if (forcedJumpPt == PAWN && forcedJumpPt != royalPt)
+                    moveList = useFastStandardPawnGenerator
+                             ? generate_pawn_moves<Us, Type>(pos, moveList, PawnGenSpec{target, forcedFromMask})
+                             : generate_moves<Us, Type>(pos, moveList, PieceGenSpec{PAWN, target, captureTarget, forcedFromMask});
+                else if (forcedJumpPt != royalPt)
+                    moveList = generate_moves<Us, Type>(pos, moveList, PieceGenSpec{forcedJumpPt, target, captureTarget, forcedFromMask});
+            }
+            else
+            {
+                if (royalPt != PAWN)
+                    moveList = useFastStandardPawnGenerator
+                             ? generate_pawn_moves<Us, Type>(pos, moveList, PawnGenSpec{target, forcedFromMask})
+                             : generate_moves<Us, Type>(pos, moveList, PieceGenSpec{PAWN, target, captureTarget, forcedFromMask});
+
+                PieceSet nonRoyalTypes = pos.piece_types() & ~piece_set(PAWN);
+                if (royalPt != NO_PIECE_TYPE)
+                    nonRoyalTypes = nonRoyalTypes & ~piece_set(royalPt);
+                for (PieceSet ps = nonRoyalTypes; ps;)
+                    moveList = generate_moves<Us, Type>(pos, moveList, PieceGenSpec{pop_lsb(ps), target, captureTarget, forcedFromMask});
+            }
+        const bool canGenerateDrops = !restrictToForcedJumper
+                                   && pos.piece_drops()
+                                   && (pos.can_drop(Us, ALL_PIECES) || pos.two_boards());
+        const bool generateQuietDrops = canGenerateDrops && Type != CAPTURES;
+
         // generate drops
-        if (!restrictToForcedJumper && pos.piece_drops() && Type != CAPTURES && (pos.can_drop(Us, ALL_PIECES) || pos.two_boards()))
-            for (PieceSet ps = pos.piece_types(); ps;)
-                moveList = generate_drops<Us, Type>(pos, moveList, pop_lsb(ps), target);
-        if (!restrictToForcedJumper && pos.piece_drops() && (pos.can_drop(Us, ALL_PIECES) || pos.two_boards()))
+        if (canGenerateDrops)
+        {
+            if (generateQuietDrops)
+                for (PieceSet ps = pos.piece_types(); ps;)
+                    moveList = generate_drops<Us, Type>(pos, moveList, pop_lsb(ps), target);
             for (PieceSet ps = pos.piece_types(); ps;)
                 moveList = generate_capture_drops<Us, Type>(pos, moveList, pop_lsb(ps), captureTarget);
-        if (!restrictToForcedJumper && pos.piece_drops() && (pos.can_drop(Us, ALL_PIECES) || pos.two_boards()))
             moveList = generate_edge_insertions<Us, Type>(pos, moveList);
+        }
         // generate exchange
         if (!restrictToForcedJumper && pos.capture_type() == PRISON && Type != CAPTURES && pos.has_exchange())
             for (PieceSet ps = pos.piece_types(); ps;)
@@ -1037,7 +1076,7 @@ namespace {
             }
 
         // Special moves
-        if constexpr (Type != CAPTURES)
+        if constexpr (Type != CAPTURES && Type != QUIET_CHECKS)
         if (!restrictToForcedJumper && pos.cambodian_moves() && pos.gates(Us))
         {
             if constexpr (Type != EVASIONS)
@@ -1126,7 +1165,12 @@ namespace {
                         if (Type == QUIET_CHECKS)
                             b &= target;
                         while (b)
-                            *moveList++ = make_pull(from, pop_lsb(b), pullFrom);
+                        {
+                            Move m = make_pull(from, pop_lsb(b), pullFrom);
+                            if (Type == QUIET_CHECKS && !pos.gives_check(m))
+                                continue;
+                            *moveList++ = m;
+                        }
                     }
                 }
             }
@@ -1146,13 +1190,18 @@ namespace {
                     if (Type == QUIET_CHECKS)
                         b &= target;
                     while (b)
-                        *moveList++ = make<SWAP>(from, pop_lsb(b));
+                    {
+                        Move m = make<SWAP>(from, pop_lsb(b));
+                        if (Type == QUIET_CHECKS && !pos.gives_check(m))
+                            continue;
+                        *moveList++ = m;
+                    }
                 }
             }
         }
 
         // Workaround for passing: Execute a non-move with any piece
-        if (!restrictToForcedJumper && pos.pass(Us) && !pos.count<KING>(Us))
+        if (!restrictToForcedJumper && Type != QUIET_CHECKS && pos.pass(Us) && !pos.count<KING>(Us))
         {
             Bitboard usPieces = pos.pieces(Us);
             Square passSq = usPieces ? lsb(usPieces) : lsb(pos.board_bb());
@@ -1166,13 +1215,14 @@ namespace {
             {
                 Square sq = pop_lsb(b);
                 Piece mover = pos.piece_on(sq);
-                if (mover != NO_PIECE && (pos.self_destruct_types() & piece_set(type_of(mover))))
+                assert(mover != NO_PIECE);
+                if (pos.self_destruct_types() & piece_set(type_of(mover)))
                     *moveList++ = make<SPECIAL>(sq, sq, type_of(mover));
             }
         }
 
         //if "wall or move", generate walling action with null move
-        if (!restrictToForcedJumper && pos.wall_or_move())
+        if (!restrictToForcedJumper && pos.walling(Us) && pos.wall_or_move())
         {
             Bitboard usPieces = pos.pieces(Us);
             Bitboard wallAnchors = pos.wall_squares();
@@ -1184,53 +1234,191 @@ namespace {
 
     }
 
-    // King moves
-    if (pos.count<KING>(Us) && (!restrictToForcedJumper || (forcedFromMask & ksq))
-        && (!Checks || pos.topology_wraps() || pos.blockers_for_king(~Us) & ksq))
+    // Royal moves must not be restricted to checker capture/interposition targets.
+    if (royalPt != NO_PIECE_TYPE && royalSq != SQ_NONE
+        && (!restrictToForcedJumper || (forcedFromMask & royalSq))
+        && (!Checks || pos.topology_wraps() || pos.blockers_for_king(~Us) & royalSq))
     {
         Bitboard b = 0;
         if (restrictToForcedJumper)
         {
-            Bitboard candidates = (pos.attacks_from(Us, KING, ksq) | pos.moves_from(Us, KING, ksq)) & ~pos.pieces();
+            Bitboard candidates = (pos.attacks_from(Us, royalPt, royalSq)
+                                 | pos.moves_from(Us, royalPt, royalSq)) & ~pos.pieces();
             while (candidates)
             {
                 Square to = pop_lsb(candidates);
-                if (pos.jump_capture_square(ksq, to) != SQ_NONE)
+                if (pos.jump_capture_square(royalSq, to) != SQ_NONE)
                     b |= to;
             }
         }
         else
         {
-            Bitboard kingAttacks = pos.attacks_from(Us, KING, ksq) & pos.pieces();
-            Bitboard kingMoves   = pos.moves_from(Us, KING, ksq) & ~pos.pieces();
+            Bitboard kingAttacks = pos.attacks_from(Us, royalPt, royalSq) & pos.pieces();
+            Bitboard kingMoves   = pos.moves_from(Us, royalPt, royalSq) & ~pos.pieces();
             Bitboard kingCaptureMask = Type == EVASIONS ? ~pos.pieces(Us) : captureTarget;
-            if (Type == EVASIONS && pos.self_capture(KING))
-                kingCaptureMask |= pos.pieces(Us) & ~pos.pieces(Us, KING);
+            if (Type != QUIETS && Type != QUIET_CHECKS && pos.self_capture(royalPt))
+                kingCaptureMask |= pos.pieces(Us) & ~square_bb(royalSq);
             Bitboard kingQuietMask = Type == EVASIONS ? ~pos.pieces(Us) : target;
             b = (kingAttacks & kingCaptureMask) | (kingMoves & kingQuietMask);
         }
         while (b)
-            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, ksq, pop_lsb(b));
+            moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, royalSq, pop_lsb(b));
 
-        // Passing move by king
+        // Passing move by royal piece
         if (!restrictToForcedJumper && pos.pass(Us))
-            *moveList++ = make<SPECIAL>(ksq != SQ_NONE ? ksq : lsb(pos.board_bb()),
-                                        ksq != SQ_NONE ? ksq : lsb(pos.board_bb()));
+            *moveList++ = make<SPECIAL>(royalSq, royalSq);
 
-        if (!restrictToForcedJumper && (Type == QUIETS || Type == NON_EVASIONS) && pos.can_castle(Us == WHITE ? WHITE_CASTLING : BLACK_CASTLING))
+        if (royalPt == KING && !restrictToForcedJumper
+            && (Type == QUIETS || Type == NON_EVASIONS)
+            && pos.can_castle(Us == WHITE ? WHITE_CASTLING : BLACK_CASTLING))
             for (CastlingRights cr : { Us & KING_SIDE, Us & QUEEN_SIDE } )
                 if (!pos.castling_impeded(cr) && pos.can_castle(cr))
-                    moveList = make_move_and_gating<CASTLING>(pos, moveList, Us,ksq, pos.castling_rook_square(cr));
+                    moveList = make_move_and_gating<CASTLING>(pos, moveList, Us, royalSq, pos.castling_rook_square(cr));
     }
 
     return moveList;
   }
 
+  inline bool is_potion_eligible_base(Move base, MoveType& mt, Square& from, Square& to) {
+      if (is_gating(base))
+          return false;
+      mt = type_of(base);
+      // PIECE_PROMOTION is Shogi-style piece promotion and is rejected here because
+      // potion gating is a Spell Chess mechanic, which only uses standard chess PROMOTION.
+      if (mt != NORMAL && mt != CASTLING && mt != PROMOTION)
+          return false;
+      if (mt == PROMOTION)
+      {
+          PieceType prom_pt = promotion_type(base);
+          if (prom_pt != KNIGHT && prom_pt != BISHOP && prom_pt != ROOK && prom_pt != QUEEN)
+              return false;
+      }
+      from = from_sq(base);
+      to = to_sq(base);
+      return true;
+  }
+
+  template<GenType Type>
+  inline bool potion_move_matches(const Position& pos, Move base, Move m) {
+      if (!pos.legal(m))
+          return false;
+
+      if constexpr (Type == EVASIONS)
+      {
+          Color us = pos.side_to_move();
+          Bitboard occupied = pos.pieces();
+          Square from = from_sq(base);
+          Square to = to_sq(base);
+          if (type_of(base) == CASTLING)
+          {
+              Square kto, rto;
+              pos.castling_destinations(us, from, to, kto, rto);
+              occupied = (occupied ^ square_bb(from) ^ square_bb(to)) | square_bb(kto) | square_bb(rto);
+          }
+          else if (from != to)
+              occupied ^= square_bb(from) ^ square_bb(to);
+
+          if (pos.capture(m))
+              occupied ^= square_bb(pos.capture_square(m));
+
+          if (pos.gating_move_blocks_occupancy(m) && gating_square(m) != SQ_NONE)
+              occupied |= square_bb(gating_square(m));
+
+          Position::SimulatedMoveGuard guard(pos, m);
+          if (pos.attackers_to(pos.royal_square(us), occupied, ~us))
+              return false;
+          return true;
+      }
+
+      const bool baseCaptures = pos.capture(base);
+
+      if constexpr (Type == CAPTURES)
+      {
+          if (baseCaptures)
+              return true;
+          return is_promotion_move(base) && promotion_type(base) == QUEEN;
+      }
+      else if constexpr (Type == QUIETS)
+      {
+          return !baseCaptures ? !is_promotion_move(base) || promotion_type(base) != QUEEN
+                               : is_promotion_move(base) && promotion_type(base) != QUEEN;
+      }
+      else if constexpr (Type == QUIET_CHECKS)
+      {
+          return !baseCaptures && type_of(base) != CASTLING && !is_promotion_move(base) && pos.gives_check(m);
+      }
+      else
+      {
+          return true;
+      }
+  }
+
+  enum class AppendStatus { Appended, Skipped, Full };
+
+  struct PotionBaseInfo {
+      MoveType mt = NORMAL;
+      Square from = SQ_NONE;
+      Square to = SQ_NONE;
+      Piece mover = NO_PIECE;
+      PieceType moverType = NO_PIECE_TYPE;
+      bool isInitial = false;
+      MoveModality modality = MODALITY_QUIET;
+  };
+
+  inline bool prepare_potion_base(const Position& pos, Move base, PotionBaseInfo& info) {
+      if (!is_potion_eligible_base(base, info.mt, info.from, info.to))
+          return false;
+
+      info.mover = pos.piece_on(info.from);
+      if (info.mover == NO_PIECE)
+          return false;
+
+      info.moverType = type_of(info.mover);
+      info.isInitial = pos.not_moved_pieces(pos.side_to_move()) & info.from;
+      info.modality = pos.capture(base) ? MODALITY_CAPTURE : MODALITY_QUIET;
+      return true;
+  }
+
+  template<GenType Type>
+  inline AppendStatus try_append_potion_gating_move(const Position& pos, ExtMove*& cur, ExtMove* maxEnd,
+                                                    Square from, Square to, MoveType mt, Move base,
+                                                    Variant::PotionType potion, PieceType potionPiece, Square gate, int value) {
+      if (cur >= maxEnd)
+          return AppendStatus::Full;
+
+      // is_potion_eligible_base() restricts mt to the cases below.
+      assert(mt == NORMAL || mt == CASTLING || mt == PROMOTION);
+      Move gatingMove = MOVE_NONE;
+      switch (mt)
+      {
+          case NORMAL:
+              gatingMove = make_gating<NORMAL>(from, to, potionPiece, gate);
+              break;
+          case CASTLING:
+              gatingMove = make_gating<CASTLING>(from, to, potionPiece, gate);
+              break;
+          case PROMOTION:
+              gatingMove = make_promotion_potion(from, to, promotion_type(base), potion, gate);
+              break;
+          default:
+              break;
+      }
+      assert(gatingMove != MOVE_NONE);
+
+      if (!potion_move_matches<Type>(pos, base, gatingMove))
+          return AppendStatus::Skipped;
+
+      cur->move = gatingMove;
+      cur->value = value;
+      ++cur;
+      return AppendStatus::Appended;
+  }
+
   template<Color Us, GenType Type>
-  ExtMove* generate_potion_moves(const Position& pos, ExtMove* listBegin, ExtMove* baseEnd) {
+  ExtMove* generate_potion_moves(const Position& pos, MoveBuffer buffer) {
     const Variant* var = pos.variant();
-    ExtMove* cur = baseEnd;
-    ExtMove* maxEnd = listBegin + MOVEGEN_OVERFLOW_CAPACITY;
+    ExtMove* cur = buffer.end;
+    ExtMove* maxEnd = buffer.begin + MOVEGEN_OVERFLOW_CAPACITY;
 
     for (int pt = 0; pt < Variant::POTION_TYPE_NB; ++pt)
     {
@@ -1242,13 +1430,13 @@ namespace {
             continue;
 
         Bitboard candidates = pos.board_bb();
-        if (!var->potionDropOnOccupied)
+        if (potion == Variant::POTION_JUMP)
+            candidates &= pos.pieces();
+        else if (!var->potionDropOnOccupied)
             candidates &= ~pos.pieces();
 
         if (potion == Variant::POTION_FREEZE)
             candidates &= useful_freeze_gates(pos, Us);
-        else if (potion == Variant::POTION_JUMP)
-            candidates &= pos.pieces();
 
         if (potion == Variant::POTION_FREEZE)
         {
@@ -1258,25 +1446,22 @@ namespace {
                     return maxEnd;
 
                 Square gate = pop_lsb(candidates);
-                for (ExtMove* it = listBegin; it != baseEnd; ++it)
+                for (ExtMove* it = buffer.begin; it != buffer.end; ++it)
                 {
-                    if (cur >= maxEnd)
-                        return maxEnd;
-
-                    Move base = it->move;
-                    MoveType mt = type_of(base);
-                    if (is_gating(base) || (mt != NORMAL && mt != CASTLING))
+                    PotionBaseInfo baseInfo;
+                    if (!prepare_potion_base(pos, it->move, baseInfo))
                         continue;
-                    Square from = from_sq(base);
-                    Square to = to_sq(base);
 
-                    Move gatingMove = mt == NORMAL
-                                      ? make_gating<NORMAL>(from, to, potionPiece, gate)
-                                      : make_gating<CASTLING>(from, to, potionPiece, gate);
+                    if (gate == baseInfo.to)
+                        continue;
+                    if (pos.freeze_squares() & baseInfo.from)
+                        continue;
+                    if ((between_bb(baseInfo.from, baseInfo.to, baseInfo.moverType, baseInfo.modality, baseInfo.isInitial) & ~square_bb(baseInfo.to)) & gate)
+                        continue;
 
-                    cur->move = gatingMove;
-                    cur->value = it->value;
-                    ++cur;
+                    if (try_append_potion_gating_move<Type>(pos, cur, maxEnd, baseInfo.from, baseInfo.to, baseInfo.mt, it->move, potion, potionPiece, gate, it->value)
+                        == AppendStatus::Full)
+                        return maxEnd;
                 }
             }
             continue;
@@ -1290,7 +1475,7 @@ namespace {
             ScopedSpellContext guard(Bitboard(0), candidates);
 
 #ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
-            std::unique_ptr<ExtMove[]> jumpMoves(new ExtMove[MOVEGEN_OVERFLOW_CAPACITY]);
+            auto jumpMoves = std::make_unique<ExtMove[]>(MOVEGEN_OVERFLOW_CAPACITY);
             ExtMove* jumpEnd = generate_all_impl<Us, NON_EVASIONS>(pos, jumpMoves.get());
             assert(jumpEnd - jumpMoves.get() <= MOVEGEN_OVERFLOW_CAPACITY);
 
@@ -1306,57 +1491,46 @@ namespace {
                 if (cur >= maxEnd)
                     return maxEnd;
 
-                Move base = it->move;
-                if (is_gating(base))
+                PotionBaseInfo baseInfo;
+                if (!prepare_potion_base(pos, it->move, baseInfo))
                     continue;
 
-                MoveType mt = type_of(base);
-                if (mt != NORMAL && mt != CASTLING)
-                    continue;
-
-                Square from = from_sq(base);
-                Square to = to_sq(base);
-
-                Piece mover = pos.piece_on(from);
-                if (mover == NO_PIECE)
-                    continue;
-
-                PieceType moverType = type_of(mover);
                 // Pure leapers cannot have an intermediate path square.
-                if (mt == NORMAL
-                    && AttackRiderTypes[moverType] == NO_RIDER
-                    && moverType != PAWN
-                    && moverType != SHOGI_PAWN
-                    && moverType != SOLDIER)
+                const bool initial = baseInfo.isInitial && pieceMap.get(baseInfo.moverType)->has_explicit_initial_moves();
+                const bool isRider = baseInfo.modality == MODALITY_CAPTURE
+                    ? AttackRiderTypes[baseInfo.moverType] != NO_RIDER
+                    : MoveRiderTypes[initial][baseInfo.moverType] != NO_RIDER;
+
+                if ((baseInfo.mt == NORMAL || baseInfo.mt == PROMOTION)
+                    && !isRider
+                    && baseInfo.moverType != PAWN
+                    && baseInfo.moverType != SHOGI_PAWN
+                    && baseInfo.moverType != SOLDIER)
                     continue;
 
-                if (distance(from, to) <= 1)
+                if (distance(baseInfo.from, baseInfo.to) <= 1)
                     continue;
 
-                Bitboard path = between_bb(from, to, moverType);
-                Bitboard intersection = path & candidates & ~square_bb(to);
+                Bitboard path = between_bb(baseInfo.from, baseInfo.to, baseInfo.moverType, baseInfo.modality, baseInfo.isInitial);
+                Bitboard intersection = path & candidates & ~square_bb(baseInfo.to);
                 if (popcount(intersection) != 1)
                     continue;
 
                 Square gate = lsb(intersection);
-                if (to == gate)
+
+                bool moveOk = false;
+                {
+                    ScopedSpellContext revalGuard(Bitboard(0), square_bb(gate));
+                    Bitboard okSquares = baseInfo.isInitial ? (pos.moves_from<true>(Us, baseInfo.moverType, baseInfo.from) | pos.attacks_from<true>(Us, baseInfo.moverType, baseInfo.from))
+                                                            : (pos.moves_from<false>(Us, baseInfo.moverType, baseInfo.from) | pos.attacks_from<false>(Us, baseInfo.moverType, baseInfo.from));
+                    moveOk = bool(okSquares & baseInfo.to);
+                }
+                if (!moveOk)
                     continue;
 
-                Move gatingMove = mt == NORMAL
-                                  ? make_gating<NORMAL>(from, to, potionPiece, gate)
-                                  : make_gating<CASTLING>(from, to, potionPiece, gate);
-
-                // Filter by original Type and legality
-                bool isCapture = pos.capture_or_promotion(gatingMove);
-                if (   (Type == CAPTURES && !isCapture)
-                    || (Type == QUIETS && isCapture)
-                    || (Type == QUIET_CHECKS && (isCapture || !pos.gives_check(gatingMove)))
-                    || !pos.legal(gatingMove))
-                    continue;
-
-                cur->move = gatingMove;
-                cur->value = it->value;
-                ++cur;
+                if (try_append_potion_gating_move<Type>(pos, cur, maxEnd, baseInfo.from, baseInfo.to, baseInfo.mt, it->move, potion, potionPiece, gate, it->value)
+                    == AppendStatus::Full)
+                    return maxEnd;
             }
         }
     }
@@ -1366,14 +1540,10 @@ namespace {
 
   template<Color Us, GenType Type>
   ExtMove* generate_all(const Position& pos, ExtMove* moveList) {
-
     ExtMove* baseEnd = generate_all_impl<Us, Type>(pos, moveList);
     if (!pos.potions_enabled())
         return baseEnd;
-    if (!pos.can_cast_potion(Us, Variant::POTION_FREEZE)
-        && !pos.can_cast_potion(Us, Variant::POTION_JUMP))
-        return baseEnd;
-    return generate_potion_moves<Us, Type>(pos, moveList, baseEnd);
+    return generate_potion_moves<Us, Type>(pos, MoveBuffer{moveList, baseEnd});
   }
 
 } // namespace
@@ -1393,7 +1563,6 @@ ExtMove* generate(const Position& pos, ExtMove* moveList) {
   static_assert(Type != LEGAL, "Unsupported type in generate()");
   assert((Type == EVASIONS) == (bool)pos.evasion_checkers()
          || (pos.topology_wraps() && Type == NON_EVASIONS && pos.evasion_checkers()));
-
   Color us = pos.side_to_move();
 
   return us == WHITE ? generate_all<WHITE, Type>(pos, moveList)
@@ -1415,17 +1584,13 @@ template<GenType Type>
 ExtMove* append_potions(const Position& pos, ExtMove* listBegin, ExtMove* baseEnd) {
 
   static_assert(Type != LEGAL, "Unsupported type in append_potions()");
-  assert((Type == EVASIONS) == (bool)pos.evasion_checkers()
-         || (pos.topology_wraps() && Type == NON_EVASIONS && pos.evasion_checkers()));
   if (!pos.potions_enabled())
       return baseEnd;
+  assert((Type == EVASIONS) == (bool)pos.evasion_checkers()
+         || (pos.topology_wraps() && Type == NON_EVASIONS && pos.evasion_checkers()));
   Color us = pos.side_to_move();
-  if (!pos.can_cast_potion(us, Variant::POTION_FREEZE)
-      && !pos.can_cast_potion(us, Variant::POTION_JUMP))
-      return baseEnd;
-
-  return us == WHITE ? generate_potion_moves<WHITE, Type>(pos, listBegin, baseEnd)
-                     : generate_potion_moves<BLACK, Type>(pos, listBegin, baseEnd);
+  return us == WHITE ? generate_potion_moves<WHITE, Type>(pos, MoveBuffer{listBegin, baseEnd})
+                     : generate_potion_moves<BLACK, Type>(pos, MoveBuffer{listBegin, baseEnd});
 }
 
 // Explicit template instantiations

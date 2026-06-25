@@ -21,6 +21,7 @@
 
 #include <bitset>
 #include <array>
+#include <memory>
 #include <set>
 #include <map>
 #include <vector>
@@ -86,6 +87,8 @@ struct ColorSetting {
     global = value;
     byColor[WHITE] = value;
     byColor[BLACK] = value;
+    byColorSet[WHITE] = false;
+    byColorSet[BLACK] = false;
   }
 
   void set_color(Color c, const T& value) {
@@ -153,6 +156,7 @@ struct Variant {
   bool blastPromotion = false;
   bool blastDiagonals = true;
   bool blastCenter = true;
+  bool blastOnCaptureMoverCenter = false;
   PieceSet blastPassiveTypes = NO_PIECE_SET;
   PieceSet blastImmuneTypes = NO_PIECE_SET;
   PieceSet mutuallyImmuneTypes = NO_PIECE_SET;
@@ -270,7 +274,6 @@ struct Variant {
   bool seirawanGating = false;
   bool commitGates = false;
   PieceSet cloneMoveTypes = NO_PIECE_SET;
-  PieceSet jumpCaptureTypes = NO_PIECE_SET;
   bool forcedJumpContinuation = false;
   bool forcedJumpSameDirection = false;
   bool cambodianMoves = false;
@@ -311,7 +314,7 @@ struct Variant {
   int nFoldRuleImmediate = 0;
   ColorSetting<Value> nFoldValue = ColorSetting<Value>(VALUE_DRAW);
 
-  std::shared_ptr<const MagicGeometry> magicGeometry;
+
 
   bool nFoldValueAbsolute = false;
   bool perpetualCheckIllegal = false;
@@ -384,6 +387,7 @@ struct Variant {
   Value pointsGoalValue = VALUE_MATE;
   Value pointsGoalSimulValueByMostPoints = VALUE_MATE;
   Value pointsGoalSimulValueByMover = VALUE_NONE;
+  Value connectGoalSimulValueByMover = VALUE_NONE;
   int pointsGoal = 0;
 
   // Derived properties
@@ -407,6 +411,7 @@ struct Variant {
   bool shogiStylePromotions = false;
   std::vector<Direction> connectDirections;
   std::vector<std::vector<Square>> connectLines;
+  std::vector<Bitboard> connectLineMasks;
   PieceSet connectPieceTypesTrimmed = ~NO_PIECE_SET;
   std::vector<PieceType> connectPieceGoalTypes[COLOR_NB];
   std::bitset<START_MULTIMOVES> multimovePass; // irregular pattern of multimove passes at game start
@@ -577,19 +582,23 @@ struct Variant {
 
   Variant* conclude();
 
+  mutable std::shared_ptr<const MagicGeometry> magicGeometry = nullptr;
 };
 
 class VariantMap : public std::map<std::string, const Variant*> {
 public:
+  ~VariantMap() { clear_all(); }
   void init();
   template <bool DoCheck> void parse(std::string path);
   template <bool DoCheck> void parse_istream(std::istream& file);
+  void set_verbose_load_warnings(bool verbose);
   void clear_all();
   std::vector<std::string> get_keys();
   const Variant* get(const std::string& name) const;
   bool has(const std::string& name) const;
 
 private:
+  bool verboseLoadWarnings = false;
   void add(std::string s, Variant* v);
 };
 
