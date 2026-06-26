@@ -18,6 +18,9 @@
 
 #include <iostream>
 #include <string>
+#include <cstdlib>
+#include <charconv>
+#include <limits>
 
 #include "evaluate.h"
 #include "misc.h"
@@ -38,11 +41,113 @@ namespace {
     return limits;
   }();
 
+  bool parse_non_negative_int64(const std::string& text, TimePoint& out) {
+    if (text.empty()) {
+        out = 0;
+        return true;
+    }
+
+    long long parsed = 0;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc() || ptr != end || parsed < 0 || parsed > std::numeric_limits<TimePoint>::max())
+        return false;
+
+    out = TimePoint(parsed);
+    return true;
+  }
+
+  bool parse_scaled_time_token(const std::string& text, TimePoint scale, TimePoint& out) {
+    TimePoint parsed = 0;
+    if (!parse_non_negative_int64(text, parsed))
+        return false;
+    if (parsed > std::numeric_limits<TimePoint>::max() / scale)
+        return false;
+    out = parsed * scale;
+    return true;
+  }
+
+  bool parse_level_base_time(const std::string& token, TimePoint& out) {
+    const std::size_t colon = token.find(':');
+    if (colon == std::string::npos)
+        return parse_scaled_time_token(token, 60 * 1000, out);
+
+    TimePoint minutes = 0;
+    TimePoint seconds = 0;
+    if (!parse_non_negative_int64(token.substr(0, colon), minutes))
+        return false;
+    if (!parse_non_negative_int64(token.substr(colon + 1), seconds))
+        return false;
+
+    const TimePoint maxTime = std::numeric_limits<TimePoint>::max();
+    if (minutes > maxTime / (60 * 1000))
+        return false;
+
+    TimePoint parsed = minutes * 60 * 1000;
+    if (seconds > (maxTime - parsed) / 1000)
+        return false;
+
+    out = parsed + seconds * 1000;
+    return true;
+  }
+
 } // namespace
 
 namespace XBoard {
 
   StateMachine* stateMachine = nullptr;
+
+  StateMachine::~StateMachine() {
+    join_ponder_worker();
+  }
+
+  void StateMachine::launch_ponder_worker() {
+
+    join_ponder_worker();
+
+    if (shuttingDown.load())
+        return;
+
+    // A late cancellation is harmless because ponder() rechecks atomically
+    // before starting the ponder search.
+    if (ponderMove.load() == MOVE_NONE)
+        return;
+
+    std::lock_guard<std::mutex> lk(ponderMutex);
+    if (ponderMove.load() == MOVE_NONE)
+        return;
+
+    ponderWorker.reset(new NativeThread(&StateMachine::ponder, this));
+  }
+
+  void StateMachine::join_ponder_worker() {
+
+    std::unique_ptr<NativeThread> worker;
+
+    {
+        std::lock_guard<std::mutex> lk(ponderMutex);
+        if (!ponderWorker)
+            return;
+        worker = std::move(ponderWorker);
+    }
+
+    worker->join();
+  }
+
+  void StateMachine::cancel_ponder_worker() {
+    ponderMove.store(MOVE_NONE);
+    join_ponder_worker();
+  }
+
+  void StateMachine::shutdown_ponder_worker() {
+    shuttingDown.store(true);
+    ponderMove.store(MOVE_NONE);
+    Threads.abort = true;
+    Threads.stop = true;
+    Threads.main()->wait_for_search_finished();
+    join_ponder_worker();
+  }
 
   // go() starts the search for game play, analysis, or perft.
 
@@ -57,10 +162,21 @@ namespace XBoard {
 
   void StateMachine::ponder() {
 
-    sync_cout << "Hint: " << UCI::move(pos, ponderMove) << sync_endl;
-    ponderHighlight = highlight(UCI::square(pos, from_sq(ponderMove)));
-    do_move(ponderMove);
-    ponderMove = MOVE_NONE;
+    if (shuttingDown.load())
+        return;
+
+    Move pm = ponderMove.exchange(MOVE_NONE);
+    if (pm == MOVE_NONE)
+        return;
+
+    sync_cout << "Hint: " << UCI::move(pos, pm) << sync_endl;
+    {
+        std::lock_guard<std::mutex> lk(ponderMutex);
+        ponderHighlight = highlight(UCI::square(pos, from_sq(pm)));
+    }
+    do_move(pm);
+    if (shuttingDown.load())
+        return;
     go(limits, true);
   }
 
@@ -87,11 +203,11 @@ namespace XBoard {
   void StateMachine::setboard(std::string fen) {
 
     if (fen.empty())
-        fen = variants.find(Options["UCI_Variant"])->second->startFen;
+        fen = variants.get(Options["UCI_Variant"])->startFen;
 
     states = StateListPtr(new std::deque<StateInfo>(1)); // Drop old and create a new one
     moveList.clear();
-    pos.set(variants.find(Options["UCI_Variant"])->second, fen, Options["UCI_Chess960"], &states->back(), Threads.main());
+    pos.set(variants.get(Options["UCI_Variant"]), fen, Options["UCI_Chess960"], &states->back(), Threads.main());
   }
 
   // do_move() is called when engine needs to apply a move when using XBoard protocol.
@@ -130,7 +246,7 @@ namespace XBoard {
         Square from = from_sq(m), to = to_sq(m);
         if (is_ok(from) && UCI::square(pos, from) == square && !is_pass(m))
         {
-            if (type_of(m) == PROMOTION)
+            if (is_promotion_move(m))
                 promotions |= to;
             else if (pos.capture(m))
                 captures |= to;
@@ -146,6 +262,9 @@ namespace XBoard {
     // Generate color FEN
     int emptyCnt;
     std::ostringstream ss;
+    if (pos.variant()->commitGates) {
+        ss << pos.max_file() + 1 << "/";
+    }
     for (Rank r = pos.max_rank(); r >= RANK_1; --r)
     {
         for (File f = FILE_A; f <= pos.max_file(); ++f)
@@ -162,6 +281,9 @@ namespace XBoard {
 
         if (r > RANK_1)
             ss << '/';
+    }
+    if (pos.variant()->commitGates) {
+        ss << "/" << pos.max_file() + 1;
     }
     return ss.str();
   }
@@ -190,7 +312,12 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
           if (Threads.main()->ponder)
           {
               if (token == UCI::square(pos, from_sq(moveList.back())))
-                  sync_cout << "highlight " << ponderHighlight << sync_endl;
+              {
+                  std::string highlightText;
+                  std::lock_guard<std::mutex> lk(ponderMutex);
+                  highlightText = ponderHighlight;
+                  sync_cout << "highlight " << highlightText << sync_endl;
+              }
               else
               {
                   Move currentPonderMove = moveList.back();
@@ -205,10 +332,10 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
                   if (filteredMoves.size())
                   {
                       static PRNG rng(now());
-                      ponderMove = filteredMoves.at(rng.rand<unsigned>() % filteredMoves.size());
+                      ponderMove.store(filteredMoves.at(rng.rand<unsigned>() % filteredMoves.size()));
                   }
                   else
-                      ponderMove = currentPonderMove;
+                      ponderMove.store(currentPonderMove);
                   ponder();
               }
           }
@@ -258,47 +385,64 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   }
   else if (token == "level" || token == "st" || token == "sd" || token == "time" || token == "otim")
   {
-      int num;
       if (token == "level")
       {
-          // moves to go
-          is >> limits.movestogo;
-          // base time
-          is >> token;
-          size_t idx = token.find(":");
-          if (idx != std::string::npos)
-              num = std::stoi(token.substr(0, idx)) * 60 + std::stoi(token.substr(idx + 1));
+          int movestogo = 0;
+          std::string baseToken, incToken;
+          TimePoint baseTime = 0, increment = 0;
+
+          if (   (is >> movestogo)
+              && (is >> baseToken) && parse_level_base_time(baseToken, baseTime)
+              && (is >> incToken) && parse_scaled_time_token(incToken, 1000, increment))
+          {
+              limits.movestogo = movestogo;
+              limits.time[WHITE] = limits.time[BLACK] = baseTime;
+              limits.inc[WHITE] = limits.inc[BLACK] = increment;
+              limits.movetime = 0;
+          }
           else
-              num = std::stoi(token) * 60;
-          limits.time[WHITE] = num * 1000;
-          limits.time[BLACK] = num * 1000;
-          // increment
-          is >> num;
-          limits.inc[WHITE] = num * 1000;
-          limits.inc[BLACK] = num * 1000;
+              sync_cout << "Error (bad level): level" << sync_endl;
       }
       else if (token == "sd")
-          is >> limits.depth;
+      {
+          int depth = 0;
+          if (is >> depth && depth >= 1)
+              limits.depth = depth;
+          else
+              sync_cout << "Error (bad sd): sd" << sync_endl;
+      }
       else if (token == "st")
       {
-          is >> num;
-          limits.movetime = num * 1000;
-          limits.time[WHITE] = limits.time[BLACK] = 0;
+          TimePoint movetime = 0;
+          if (is >> token && parse_scaled_time_token(token, 1000, movetime))
+          {
+              limits.movetime = movetime;
+              limits.movestogo = 0;
+              limits.time[WHITE] = limits.time[BLACK] = 0;
+          }
+          else
+              sync_cout << "Error (bad st): st" << sync_endl;
       }
       // Note: time/otim are in centi-, not milliseconds
       else if (token == "time")
       {
-          is >> num;
-          Color us = playColor != COLOR_NB ? playColor : pos.side_to_move();
-          if (limits.time[us])
-              limits.time[us] = num * 10;
+          if (is >> token)
+          {
+              Color us = playColor != COLOR_NB ? playColor : pos.side_to_move();
+              TimePoint time = 0;
+              if (parse_scaled_time_token(token, 10, time))
+                  limits.time[us] = time;
+          }
       }
       else if (token == "otim")
       {
-          is >> num;
-          Color them = playColor != COLOR_NB ? ~playColor : ~pos.side_to_move();
-          if (limits.time[them])
-              limits.time[them] = num * 10;
+          if (is >> token)
+          {
+              Color them = playColor != COLOR_NB ? ~playColor : ~pos.side_to_move();
+              TimePoint time = 0;
+              if (parse_scaled_time_token(token, 10, time))
+                  limits.time[them] = time;
+          }
       }
   }
   else if (token == "setboard")
@@ -349,7 +493,7 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   else if (token == "option")
   {
       std::string name, value;
-      is.get();
+      is >> std::ws;
       std::getline(is, name, '=');
       std::getline(is, value);
       if (Options.count(name))
@@ -383,7 +527,7 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   else if (token == "remove")
   {
       stop();
-      if (moveList.size())
+      if (moveList.size() >= 2)
       {
           undo_move();
           undo_move();
@@ -423,11 +567,17 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
           if (is >> color && is >> pieceType)
           {
               fen = pos.fen();
-              fen.insert(fen.find(']'), 1, toupper(color) == 'B' ? tolower(pieceType) : toupper(pieceType));
+              const std::size_t bracket = fen.find(']');
+              if (bracket != std::string::npos)
+                  fen.insert(bracket, 1,
+                             std::toupper(static_cast<unsigned char>(color)) == 'B'
+                                 ? char(std::tolower(static_cast<unsigned char>(pieceType)))
+                                 : char(std::toupper(static_cast<unsigned char>(pieceType))));
           }
           else
           {
-              std::transform(black_holdings.begin(), black_holdings.end(), black_holdings.begin(), ::tolower);
+              std::transform(black_holdings.begin(), black_holdings.end(), black_holdings.begin(),
+                             [](unsigned char c) { return char(std::tolower(c)); });
               fen = pos.fen(false, false, 0, white_holdings + black_holdings);
           }
           setboard(fen);
@@ -441,7 +591,14 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
   {
       stop();
       Search::LimitsType perft_limits;
-      is >> perft_limits.perft;
+      int perftDepth = 0;
+      if (is >> perftDepth && perftDepth >= 1)
+          perft_limits.perft = perftDepth;
+      else
+      {
+          sync_cout << "Error (bad perft): perft" << sync_endl;
+          return;
+      }
       go(perft_limits);
   }
   else if (token == "d")
@@ -455,7 +612,11 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
 
       if (token == "usermove")
       {
-          is >> token;
+          if (!(is >> token))
+          {
+              sync_cout << "Error (bad usermove): usermove" << sync_endl;
+              return;
+          }
           isMove = true;
       }
 

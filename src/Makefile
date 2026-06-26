@@ -94,10 +94,12 @@ endif
 
 
 ### 2.1. General and architecture defaults
-largeboards = yes
-all = yes
+largeboards = no
+verylargeboards = no
+all = no
+extra_large_movelists = no
 precomputedmagics = yes
-nnue = yes
+nnue = no
 load_net = $(if $(filter $(nnue),yes),net)
 
 ifeq ($(ARCH),)
@@ -340,6 +342,11 @@ CXXFLAGS += -Wno-profile-instr-out-of-date
 
 # Compile version with support for large board variants
 # Use precomputed magics by default if pext is not available
+ifneq ($(verylargeboards),no)
+	largeboards = yes
+	precomputedmagics = no
+	CXXFLAGS += -DVERY_LARGE_BOARDS
+endif
 ifneq ($(largeboards),no)
 	CXXFLAGS += -DLARGEBOARDS
 	ifeq ($(precomputedmagics),yes)
@@ -357,6 +364,12 @@ ifneq ($(all),no)
 	CXXFLAGS += -DALLVARS
 endif
 
+# Increase move list capacity for very high-branching variants.
+ifneq ($(extra_large_movelists),no)
+	CXXFLAGS += -DEXTRA_LARGE_MOVELISTS
+endif
+
+
 ifeq ($(COMP),)
 	COMP=gcc
 endif
@@ -364,7 +377,7 @@ endif
 ifeq ($(COMP),gcc)
 	comp=gcc
 	CXX=g++
-	CXXFLAGS += -Wextra -Wshadow
+	CXXFLAGS += -Wextra -Wshadow -fno-ipa-cp-clone
 	ifeq ($(largeboards),no)
 		CXXFLAGS += -pedantic
 	endif
@@ -544,8 +557,10 @@ ifeq ($(optimize),yes)
 
 	ifeq ($(comp),clang)
 		clangmajorversion = $(shell $(CXX) -dumpversion 2>/dev/null | cut -f1 -d.)
+		ifneq ($(ARCH),wasm)
 		ifeq ($(shell expr $(clangmajorversion) \< 16),1)
 			CXXFLAGS += -fexperimental-new-pass-manager
+		endif
 		endif
 	endif
 endif
@@ -783,9 +798,19 @@ else
 	@echo ""
 	@echo "make build ARCH=x86-64 COMP=gcc largeboards=yes"
 	@echo ""
+	@echo "Version for very large boards (up to 16x16): "
+	@echo ""
+	@echo "make build ARCH=x86-64 COMP=gcc verylargeboards=yes"
+	@echo ""
 	@echo "Include all variants (adds Game of the Amazons): "
 	@echo ""
 	@echo "make build ARCH=x86-64 largeboards=yes all=yes"
+	@echo "make build ARCH=x86-64 verylargeboards=yes all=yes"
+	@echo ""
+	@echo "Enable extra-large move lists for high branching variants:"
+	@echo ""
+	@echo "make build ARCH=x86-64 all=yes extra_large_movelists=yes"
+	@echo ""
 	@echo ""
 endif
 
@@ -906,7 +931,9 @@ config-sanity: $(load_net)
 	@echo ""
 	@echo "Fairy-Stockfish specific:"
 	@echo "largeboards: '$(largeboards)'"
+	@echo "verylargeboards: '$(verylargeboards)'"
 	@echo "all: '$(all)'"
+	@echo "extra_large_movelists: '$(extra_large_movelists)'"
 	@echo "precomputedmagics: '$(precomputedmagics)'"
 	@echo "nnue: '$(nnue)'"
 	@echo ""

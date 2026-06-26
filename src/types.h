@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
+#include <utility>
 
 #if defined(_MSC_VER)
 // Disable some silly and noisy warning from MSVC compiler
@@ -78,10 +79,15 @@
 #  include <xmmintrin.h> // Intel and Microsoft header for _mm_prefetch()
 #endif
 
-#if defined(USE_PEXT)
+#if defined(USE_PEXT) && !defined(VERY_LARGE_BOARDS)
 #  include <immintrin.h> // Header for _pext_u64() intrinsic
 #  ifdef LARGEBOARDS
-#    define pext(b, m) (_pext_u64(b, m) ^ (_pext_u64(b >> 64, m >> 64) << popcount((m << 64) >> 64)))
+#    if defined(_MSC_VER)
+#      define pext_popcount64(m) int(__popcnt64(uint64_t(m)))
+#    else
+#      define pext_popcount64(m) __builtin_popcountll(uint64_t(m))
+#    endif
+#    define pext(b, m) (_pext_u64(b, m) ^ (_pext_u64(b >> 64, m >> 64) << pext_popcount64((m << 64) >> 64)))
 #  else
 #    define pext(b, m) _pext_u64(b, m)
 #  endif
@@ -97,7 +103,7 @@ constexpr bool HasPopCnt = true;
 constexpr bool HasPopCnt = false;
 #endif
 
-#ifdef USE_PEXT
+#if defined(USE_PEXT) && !defined(VERY_LARGE_BOARDS)
 constexpr bool HasPext = true;
 #else
 constexpr bool HasPext = false;
@@ -109,9 +115,191 @@ constexpr bool Is64Bit = true;
 constexpr bool Is64Bit = false;
 #endif
 
+#if defined(VERY_LARGE_BOARDS)
+constexpr int MaxBoardFiles = 16;
+constexpr int MaxBoardRanks = 16;
+constexpr int SquareBitMaskValue = 255;
+#elif defined(LARGEBOARDS)
+constexpr int MaxBoardFiles = 12;
+constexpr int MaxBoardRanks = 10;
+constexpr int SquareBitMaskValue = 127;
+#else
+constexpr int MaxBoardFiles = 8;
+constexpr int MaxBoardRanks = 8;
+constexpr int SquareBitMaskValue = 63;
+#endif
+
 typedef uint64_t Key;
-#ifdef LARGEBOARDS
-#if defined(__GNUC__) && defined(IS_64BIT)
+#if defined(VERY_LARGE_BOARDS) && !defined(LARGEBOARDS)
+#  define LARGEBOARDS
+#endif
+
+#ifdef VERY_LARGE_BOARDS
+struct Bitboard {
+    uint64_t b64[4];
+
+    constexpr Bitboard() : b64 {0, 0, 0, 0} {}
+    constexpr Bitboard(uint64_t i) : b64 {0, 0, 0, i} {}
+    constexpr Bitboard(uint64_t b3, uint64_t b2, uint64_t b1, uint64_t b0) : b64 {b3, b2, b1, b0} {}
+
+    constexpr operator bool() const {
+        return b64[0] || b64[1] || b64[2] || b64[3];
+    }
+
+    constexpr operator long long unsigned () const {
+        return b64[3];
+    }
+
+    constexpr operator unsigned() const {
+        return b64[3];
+    }
+
+    constexpr Bitboard operator << (const unsigned int bits) const {
+        if (bits == 0)
+            return *this;
+        if (bits >= 256)
+            return Bitboard();
+        if (bits >= 192)
+            return Bitboard(b64[3] << (bits - 192), 0, 0, 0);
+        if (bits >= 128)
+        {
+            const unsigned shift = bits - 128;
+            return Bitboard((b64[2] << shift) | (shift ? (b64[3] >> (64 - shift)) : 0),
+                            b64[3] << shift, 0, 0);
+        }
+        if (bits >= 64)
+        {
+            const unsigned shift = bits - 64;
+            return Bitboard((b64[1] << shift) | (shift ? (b64[2] >> (64 - shift)) : 0),
+                            (b64[2] << shift) | (shift ? (b64[3] >> (64 - shift)) : 0),
+                            b64[3] << shift, 0);
+        }
+        return Bitboard((b64[0] << bits) | (b64[1] >> (64 - bits)),
+                        (b64[1] << bits) | (b64[2] >> (64 - bits)),
+                        (b64[2] << bits) | (b64[3] >> (64 - bits)),
+                        b64[3] << bits);
+    }
+
+    constexpr Bitboard operator >> (const unsigned int bits) const {
+        if (bits == 0)
+            return *this;
+        if (bits >= 256)
+            return Bitboard();
+        if (bits >= 192)
+            return Bitboard(0, 0, 0, b64[0] >> (bits - 192));
+        if (bits >= 128)
+        {
+            const unsigned shift = bits - 128;
+            if (shift == 0)
+                return Bitboard(0, 0, b64[0], b64[1]);
+            return Bitboard(0, 0,
+                            b64[0] >> shift,
+                            (b64[0] << (64 - shift)) | (b64[1] >> shift));
+        }
+        if (bits >= 64)
+        {
+            const unsigned shift = bits - 64;
+            if (shift == 0)
+                return Bitboard(0, b64[0], b64[1], b64[2]);
+            return Bitboard(0,
+                            b64[0] >> shift,
+                            (b64[0] << (64 - shift)) | (b64[1] >> shift),
+                            (b64[1] << (64 - shift)) | (b64[2] >> shift));
+        }
+        return Bitboard(b64[0] >> bits,
+                        (b64[0] << (64 - bits)) | (b64[1] >> bits),
+                        (b64[1] << (64 - bits)) | (b64[2] >> bits),
+                        (b64[2] << (64 - bits)) | (b64[3] >> bits));
+    }
+
+    constexpr Bitboard operator << (const int bits) const { return *this << unsigned(bits); }
+    constexpr Bitboard operator >> (const int bits) const { return *this >> unsigned(bits); }
+
+    constexpr bool operator == (const Bitboard y) const {
+        return b64[0] == y.b64[0] && b64[1] == y.b64[1] && b64[2] == y.b64[2] && b64[3] == y.b64[3];
+    }
+
+    constexpr bool operator != (const Bitboard y) const { return !(*this == y); }
+
+    inline Bitboard& operator |=(const Bitboard x) {
+        b64[0] |= x.b64[0]; b64[1] |= x.b64[1]; b64[2] |= x.b64[2]; b64[3] |= x.b64[3];
+        return *this;
+    }
+    inline Bitboard& operator &=(const Bitboard x) {
+        b64[0] &= x.b64[0]; b64[1] &= x.b64[1]; b64[2] &= x.b64[2]; b64[3] &= x.b64[3];
+        return *this;
+    }
+    inline Bitboard& operator ^=(const Bitboard x) {
+        b64[0] ^= x.b64[0]; b64[1] ^= x.b64[1]; b64[2] ^= x.b64[2]; b64[3] ^= x.b64[3];
+        return *this;
+    }
+
+    constexpr Bitboard operator ~ () const { return Bitboard(~b64[0], ~b64[1], ~b64[2], ~b64[3]); }
+
+    constexpr Bitboard operator - () const {
+        uint64_t n3 = 0ULL - b64[3];
+        uint64_t borrow = b64[3] != 0;
+        uint64_t n2 = 0ULL - b64[2] - borrow;
+        borrow = (b64[2] != 0) || borrow;
+        uint64_t n1 = 0ULL - b64[1] - borrow;
+        borrow = (b64[1] != 0) || borrow;
+        uint64_t n0 = 0ULL - b64[0] - borrow;
+        return Bitboard(n0, n1, n2, n3);
+    }
+
+    constexpr Bitboard operator | (const Bitboard x) const {
+        return Bitboard(b64[0] | x.b64[0], b64[1] | x.b64[1], b64[2] | x.b64[2], b64[3] | x.b64[3]);
+    }
+
+    constexpr Bitboard operator & (const Bitboard x) const {
+        return Bitboard(b64[0] & x.b64[0], b64[1] & x.b64[1], b64[2] & x.b64[2], b64[3] & x.b64[3]);
+    }
+
+    constexpr Bitboard operator ^ (const Bitboard x) const {
+        return Bitboard(b64[0] ^ x.b64[0], b64[1] ^ x.b64[1], b64[2] ^ x.b64[2], b64[3] ^ x.b64[3]);
+    }
+
+    constexpr Bitboard operator - (const Bitboard x) const {
+        uint64_t r3 = b64[3] - x.b64[3];
+        uint64_t borrow = b64[3] < x.b64[3];
+        uint64_t r2 = b64[2] - x.b64[2] - borrow;
+        borrow = (b64[2] < x.b64[2]) || (borrow && b64[2] == x.b64[2]);
+        uint64_t r1 = b64[1] - x.b64[1] - borrow;
+        borrow = (b64[1] < x.b64[1]) || (borrow && b64[1] == x.b64[1]);
+        uint64_t r0 = b64[0] - x.b64[0] - borrow;
+        return Bitboard(r0, r1, r2, r3);
+    }
+
+    constexpr Bitboard operator - (const int x) const { return *this - Bitboard(x); }
+
+    inline Bitboard operator * (const Bitboard x) const {
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__SIZEOF_INT128__)
+        uint64_t r[4] = {0, 0, 0, 0};
+        const uint64_t a[4] = { b64[3], b64[2], b64[1], b64[0] };
+        const uint64_t b[4] = { x.b64[3], x.b64[2], x.b64[1], x.b64[0] };
+        for (int i = 0; i < 4; ++i)
+        {
+            unsigned __int128 carry = 0;
+            for (int j = 0; j + i < 4; ++j)
+            {
+                unsigned __int128 t = (unsigned __int128)a[i] * b[j] + r[i + j] + carry;
+                r[i + j] = uint64_t(t);
+                carry = t >> 64;
+            }
+        }
+        return Bitboard(r[3], r[2], r[1], r[0]);
+#else
+        Bitboard result;
+        for (int i = 0; i < 256; ++i)
+            if (((*this >> i) & Bitboard(1)))
+                result |= x << i;
+        return result;
+#endif
+   }
+};
+constexpr int SQUARE_BITS = 8;
+#elif defined(LARGEBOARDS)
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__SIZEOF_INT128__) && defined(IS_64BIT)
 typedef unsigned __int128 Bitboard;
 #else
 struct Bitboard {
@@ -134,17 +322,23 @@ struct Bitboard {
     }
 
     constexpr Bitboard operator << (const unsigned int bits) const {
-        return Bitboard(  bits >= 64 ? b64[1] << (bits - 64)
-                        : bits == 0  ? b64[0]
-                        : ((b64[0] << bits) | (b64[1] >> (64 - bits))),
-                        bits >= 64 ? 0 : b64[1] << bits);
+        if (bits == 0)
+            return *this;
+        if (bits >= 128)
+            return Bitboard();
+        if (bits >= 64)
+            return Bitboard(b64[1] << (bits - 64), 0);
+        return Bitboard((b64[0] << bits) | (b64[1] >> (64 - bits)), b64[1] << bits);
     }
 
     constexpr Bitboard operator >> (const unsigned int bits) const {
-        return Bitboard(bits >= 64 ? 0 : b64[0] >> bits,
-                          bits >= 64 ? b64[0] >> (bits - 64)
-                        : bits == 0  ? b64[1]
-                        : ((b64[1] >> bits) | (b64[0] << (64 - bits))));
+        if (bits == 0)
+            return *this;
+        if (bits >= 128)
+            return Bitboard();
+        if (bits >= 64)
+            return Bitboard(0, b64[0] >> (bits - 64));
+        return Bitboard(b64[0] >> bits, (b64[0] << (64 - bits)) | (b64[1] >> bits));
     }
 
     constexpr Bitboard operator << (const int bits) const {
@@ -208,17 +402,23 @@ struct Bitboard {
     }
 
     inline Bitboard operator * (const Bitboard x) const {
-        uint64_t a_lo = (uint32_t)b64[1];
-        uint64_t a_hi = b64[1] >> 32;
-        uint64_t b_lo = (uint32_t)x.b64[1];
-        uint64_t b_hi = x.b64[1] >> 32;
-
-        uint64_t t1 = (a_hi * b_lo) + ((a_lo * b_lo) >> 32);
-        uint64_t t2 = (a_lo * b_hi) + (t1 & 0xFFFFFFFF);
-
-        return Bitboard(b64[0] * x.b64[1] + b64[1] * x.b64[0] + (a_hi * b_hi) + (t1 >> 32) + (t2 >> 32),
-                        (t2 << 32) + (a_lo * b_lo & 0xFFFFFFFF));
-   }
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__SIZEOF_INT128__)
+        unsigned __int128 lo = (unsigned __int128)b64[1] * x.b64[1];
+        unsigned __int128 cross1 = (unsigned __int128)b64[1] * x.b64[0];
+        unsigned __int128 cross2 = (unsigned __int128)b64[0] * x.b64[1];
+        uint64_t r1 = uint64_t(lo);
+        uint64_t r0 = uint64_t(lo >> 64);
+        r0 += uint64_t(cross1);
+        r0 += uint64_t(cross2);
+        return Bitboard(r0, r1);
+#else
+        Bitboard result;
+        for (int i = 0; i < 128; ++i)
+            if (((*this >> i) & Bitboard(1)))
+                result |= x << i;
+        return result;
+#endif
+    }
 };
 #endif
 constexpr int SQUARE_BITS = 7;
@@ -227,11 +427,87 @@ typedef uint64_t Bitboard;
 constexpr int SQUARE_BITS = 6;
 #endif
 
-//When defined, move list will be stored in heap. Delete this if you want to use stack to store move list. Using stack can cause overflow (Segmentation Fault) when the search is too deep.
-#define USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+//The piece type count. Currently we have A-Z as piece type so it's 26.
+constexpr size_t PIECE_TYPE_COUNT = 26;
 
-#ifdef ALLVARS
-constexpr int MAX_MOVES = 8192;
+//This is a bitboard group that matches to all 26 piece types.
+//Each bitboard is related to a piece type, so we have PIECE_TYPE_COUNT of bitboards.
+//For example, piece A is related to boardlist[0], piece B is related to boardlist[1], etc.
+struct PieceTypeBitboardGroup
+{
+    PieceTypeBitboardGroup() = default;
+    PieceTypeBitboardGroup(Bitboard b) : fallback(b) {}
+    PieceTypeBitboardGroup(const PieceTypeBitboardGroup& other) = default;
+    PieceTypeBitboardGroup& operator=(const PieceTypeBitboardGroup& other) = default;
+
+    // Returns the bitboard reference at the index of idx in boardlist.
+    // idx: The index
+    // <return value>: Bitboard reference at index <idx> in boardlist
+    Bitboard& at(const size_t idx)
+    {
+        assert(idx < PIECE_TYPE_COUNT);
+        return this->boardlist[idx];
+    }
+
+    // Returns the bitboard copy of a piece type.
+    // ptc: Only accepts A-Z
+    // <return value>: The copy of corresponding bitboard
+    Bitboard boardOfPiece(const char ptc) const
+    {
+        if (ptc == '*') return fallback;
+        if (ptc < 'A' || ptc > 'Z') return Bitboard(0);
+        return isSet[ptc - 'A'] ? boardlist[ptc - 'A'] : fallback;
+    }
+
+    Bitboard explicitBoardOfPiece(const char ptc) const
+    {
+        if (ptc < 'A' || ptc > 'Z') return Bitboard(0);
+        return isSet[ptc - 'A'] ? boardlist[ptc - 'A'] : Bitboard(0);
+    }
+
+    // Set the bitboard of a piece type.
+    // ptc: Only accepts A-Z or * for fallback
+    // board: The bitboard to set
+    void set(const char ptc, Bitboard board)
+    {
+        if (ptc == '*') { fallback = board; return; }
+        if (ptc < 'A' || ptc > 'Z') return;
+        boardlist[ptc - 'A'] = board;
+        isSet[ptc - 'A'] = true;
+    }
+
+    PieceTypeBitboardGroup& operator|=(Bitboard b) {
+        fallback |= b;
+        for (size_t i = 0; i < PIECE_TYPE_COUNT; ++i)
+            if (isSet[i]) boardlist[i] |= b;
+        return *this;
+    }
+
+    explicit operator bool() const { return fallback || anySet(); }
+    operator Bitboard() const { return fallback; }
+
+    bool anySet() const {
+        for (size_t i = 0; i < PIECE_TYPE_COUNT; ++i) if (isSet[i]) return true;
+        return false;
+    }
+
+    Bitboard fallback = 0;
+private:
+    Bitboard boardlist[PIECE_TYPE_COUNT] = {0};
+    bool isSet[PIECE_TYPE_COUNT] = {false};
+};
+
+//When defined, move list will be stored in heap. Delete this if you want to use stack to store move list. Using stack can cause overflow (Segmentation Fault) when the search is too deep.
+#if !defined(USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST) && !defined(NO_HEAP_MOVE_LIST)
+#define USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+#endif
+
+#if defined(ALLVARS)
+#if defined(VERY_LARGE_BOARDS)
+constexpr int MAX_MOVES = 65536;
+#else
+constexpr int MAX_MOVES = 16384;
+#endif
 #ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
 constexpr int MAX_PLY = 246;
 #else
@@ -239,7 +515,7 @@ constexpr int MAX_PLY = 60;
 #endif
 /// endif USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
 #else
-constexpr int MAX_MOVES = 1024;
+constexpr int MAX_MOVES = 4096;
 constexpr int MAX_PLY = 246;
 #endif
 /// endif ALLVARS
@@ -256,7 +532,13 @@ constexpr int MAX_PLY = 246;
 /// any normal move destination square is always different from origin square
 /// while MOVE_NONE and MOVE_NULL have the same origin and destination square.
 
-enum Move : int {
+enum Move :
+#if defined(VERY_LARGE_BOARDS)
+  uint64_t
+#else
+  int
+#endif
+{
   MOVE_NONE,
   MOVE_NULL = 1 + (1 << SQUARE_BITS)
 };
@@ -270,7 +552,14 @@ enum MoveType : int {
   PIECE_PROMOTION    = 5 << (2 * SQUARE_BITS),
   PIECE_DEMOTION     = 6 << (2 * SQUARE_BITS),
   SPECIAL            = 7 << (2 * SQUARE_BITS),
+  DROP2              = 8 << (2 * SQUARE_BITS),
+  INSERT             = 9 << (2 * SQUARE_BITS),
+  PULL               = 10 << (2 * SQUARE_BITS),
+  SWAP               = 11 << (2 * SQUARE_BITS),
+  PROMOTION_POTION   = 12 << (2 * SQUARE_BITS),
 };
+
+enum MoveModality {MODALITY_QUIET, MODALITY_CAPTURE, MOVE_MODALITY_NB};
 
 constexpr int MOVE_TYPE_BITS = 4;
 
@@ -298,8 +587,15 @@ enum CheckCount : int {
   CHECKS_0 = 0, CHECKS_NB = 11
 };
 
+constexpr int CHECKS_BITS = 4;
+constexpr int CHECKS_MAX = (1 << CHECKS_BITS) - 1;
+constexpr int POINTS_SCORE_BITS = 8;
+constexpr int POINTS_SCORE_MAX = (1 << POINTS_SCORE_BITS) - 1;
+
+constexpr int POTION_COOLDOWN_BITS = 16;
+
 enum MaterialCounting {
-  NO_MATERIAL_COUNTING, JANGGI_MATERIAL, UNWEIGHTED_MATERIAL, WHITE_DRAW_ODDS, BLACK_DRAW_ODDS
+  NO_MATERIAL_COUNTING, JANGGI_MATERIAL, UNWEIGHTED_MATERIAL, WHITE_DRAW_ODDS, BLACK_DRAW_ODDS, CONNECT_N_COUNT
 };
 
 enum CountingRule {
@@ -316,6 +612,26 @@ enum EnclosingRule {
 
 enum WallingRule {
   NO_WALLING, ARROW, DUCK, EDGE, PAST, STATIC
+};
+
+enum PointsRule {
+  POINTS_NONE, POINTS_US, POINTS_THEM, POINTS_OWNER, POINTS_NON_OWNER
+};
+
+enum CapturingRule {
+  MOVE_OUT, HAND, PRISON
+};
+
+enum TransferSide {
+  TRANSFER_US, TRANSFER_THEM, TRANSFER_OWNER, TRANSFER_NON_OWNER
+};
+
+enum PushFirstColor {
+  PUSH_US, PUSH_THEM, PUSH_EITHER
+};
+
+enum PushRemoval {
+  PUSH_REMOVE_NONE, PUSH_REMOVE_SHOVE
 };
 
 enum EndgameEval {
@@ -351,6 +667,7 @@ enum Value : int {
   VALUE_DRAW      = 0,
   VALUE_KNOWN_WIN = 10000,
   VALUE_MATE      = 32000,
+  VALUE_COUNT_WIN = 30000,
   XBOARD_VALUE_MATE = 200000,
   VALUE_VIRTUAL_MATE = 3000,
   VALUE_VIRTUAL_MATE_IN_MAX_PLY = VALUE_VIRTUAL_MATE - MAX_PLY,
@@ -375,7 +692,7 @@ enum Value : int {
   BersValueMg              = 1800,  BersValueEg              = 1900,
   ArchbishopValueMg        = 2200,  ArchbishopValueEg        = 2200,
   ChancellorValueMg        = 2300,  ChancellorValueEg        = 2600,
-  AmazonValueMg            = 2700,  AmazonValueEg            = 2850,
+  AmazonValueMg            = 2825,  AmazonValueEg            = 2975,
   KnibisValueMg            = 1100,  KnibisValueEg            = 1200,
   BiskniValueMg            = 750,   BiskniValueEg            = 700,
   KnirooValueMg            = 1050,  KnirooValueEg            = 1250,
@@ -432,7 +749,11 @@ static_assert(KING < PIECE_TYPE_NB, "KING exceeds PIECE_TYPE_NB.");
 static_assert(PIECE_TYPE_BITS <= 6, "PIECE_TYPE uses more than 6 bit");
 static_assert(!(PIECE_TYPE_NB & (PIECE_TYPE_NB - 1)), "PIECE_TYPE_NB is not a power of 2");
 
+#if defined(VERY_LARGE_BOARDS)
+static_assert(2 * SQUARE_BITS + MOVE_TYPE_BITS + 2 * PIECE_TYPE_BITS <= 64, "Move encoding uses more than 64 bits");
+#else
 static_assert(2 * SQUARE_BITS + MOVE_TYPE_BITS + 2 * PIECE_TYPE_BITS <= 32, "Move encoding uses more than 32 bits");
+#endif
 
 enum Piece {
   NO_PIECE,
@@ -466,12 +787,32 @@ enum RiderType : int {
   RIDER_GRASSHOPPER_H = 1 << 11,
   RIDER_GRASSHOPPER_V = 1 << 12,
   RIDER_GRASSHOPPER_D = 1 << 13,
+  // Bent-slider (Griffon-like) internal rider legs.
+  // One diagonal source step, then outward orthogonal slide from that source.
+  RIDER_GRIFFON_NH = 1 << 14,
+  RIDER_GRIFFON_SH = 1 << 15,
+  RIDER_GRIFFON_EV = 1 << 16,
+  RIDER_GRIFFON_WV = 1 << 17,
+  // Bent-slider (Manticore-like) internal rider legs.
+  // One orthogonal source step, then outward diagonal slide from that source.
+  RIDER_MANTICORE_NE = 1 << 18,
+  RIDER_MANTICORE_NW = 1 << 19,
+  RIDER_MANTICORE_SE = 1 << 20,
+  RIDER_MANTICORE_SW = 1 << 21,
+  // Ski/slip sliders (Betza jR/jB): first square is skipped, then slide.
+  RIDER_SKI_ROOK_H = 1 << 22,
+  RIDER_SKI_ROOK_V = 1 << 23,
+  RIDER_SKI_BISHOP = 1 << 24,
+  RIDER_ROSE = 1 << 25,
   HOPPING_RIDERS =  RIDER_CANNON_H | RIDER_CANNON_V | RIDER_CANNON_DIAG
                   | RIDER_GRASSHOPPER_H | RIDER_GRASSHOPPER_V | RIDER_GRASSHOPPER_D,
   LAME_LEAPERS = RIDER_LAME_DABBABA | RIDER_HORSE | RIDER_ELEPHANT | RIDER_JANGGI_ELEPHANT,
   ASYMMETRICAL_RIDERS =  RIDER_HORSE | RIDER_JANGGI_ELEPHANT
+                       | RIDER_GRIFFON_NH | RIDER_GRIFFON_SH | RIDER_GRIFFON_EV | RIDER_GRIFFON_WV
+                       | RIDER_MANTICORE_NE | RIDER_MANTICORE_NW | RIDER_MANTICORE_SE | RIDER_MANTICORE_SW
                        | RIDER_GRASSHOPPER_H | RIDER_GRASSHOPPER_V | RIDER_GRASSHOPPER_D,
-  NON_SLIDING_RIDERS = HOPPING_RIDERS | LAME_LEAPERS | RIDER_NIGHTRIDER,
+  NON_SLIDING_RIDERS = HOPPING_RIDERS | LAME_LEAPERS | RIDER_NIGHTRIDER
+                     | RIDER_SKI_ROOK_H | RIDER_SKI_ROOK_V | RIDER_SKI_BISHOP,
 };
 
 extern Value PieceValue[PHASE_NB][PIECE_NB];
@@ -492,7 +833,24 @@ enum : int {
 };
 
 enum Square : int {
-#ifdef LARGEBOARDS
+#if defined(VERY_LARGE_BOARDS)
+  SQ_A1, SQ_B1, SQ_C1, SQ_D1, SQ_E1, SQ_F1, SQ_G1, SQ_H1, SQ_I1, SQ_J1, SQ_K1, SQ_L1, SQ_M1, SQ_N1, SQ_O1, SQ_P1,
+  SQ_A2, SQ_B2, SQ_C2, SQ_D2, SQ_E2, SQ_F2, SQ_G2, SQ_H2, SQ_I2, SQ_J2, SQ_K2, SQ_L2, SQ_M2, SQ_N2, SQ_O2, SQ_P2,
+  SQ_A3, SQ_B3, SQ_C3, SQ_D3, SQ_E3, SQ_F3, SQ_G3, SQ_H3, SQ_I3, SQ_J3, SQ_K3, SQ_L3, SQ_M3, SQ_N3, SQ_O3, SQ_P3,
+  SQ_A4, SQ_B4, SQ_C4, SQ_D4, SQ_E4, SQ_F4, SQ_G4, SQ_H4, SQ_I4, SQ_J4, SQ_K4, SQ_L4, SQ_M4, SQ_N4, SQ_O4, SQ_P4,
+  SQ_A5, SQ_B5, SQ_C5, SQ_D5, SQ_E5, SQ_F5, SQ_G5, SQ_H5, SQ_I5, SQ_J5, SQ_K5, SQ_L5, SQ_M5, SQ_N5, SQ_O5, SQ_P5,
+  SQ_A6, SQ_B6, SQ_C6, SQ_D6, SQ_E6, SQ_F6, SQ_G6, SQ_H6, SQ_I6, SQ_J6, SQ_K6, SQ_L6, SQ_M6, SQ_N6, SQ_O6, SQ_P6,
+  SQ_A7, SQ_B7, SQ_C7, SQ_D7, SQ_E7, SQ_F7, SQ_G7, SQ_H7, SQ_I7, SQ_J7, SQ_K7, SQ_L7, SQ_M7, SQ_N7, SQ_O7, SQ_P7,
+  SQ_A8, SQ_B8, SQ_C8, SQ_D8, SQ_E8, SQ_F8, SQ_G8, SQ_H8, SQ_I8, SQ_J8, SQ_K8, SQ_L8, SQ_M8, SQ_N8, SQ_O8, SQ_P8,
+  SQ_A9, SQ_B9, SQ_C9, SQ_D9, SQ_E9, SQ_F9, SQ_G9, SQ_H9, SQ_I9, SQ_J9, SQ_K9, SQ_L9, SQ_M9, SQ_N9, SQ_O9, SQ_P9,
+  SQ_A10, SQ_B10, SQ_C10, SQ_D10, SQ_E10, SQ_F10, SQ_G10, SQ_H10, SQ_I10, SQ_J10, SQ_K10, SQ_L10, SQ_M10, SQ_N10, SQ_O10, SQ_P10,
+  SQ_A11, SQ_B11, SQ_C11, SQ_D11, SQ_E11, SQ_F11, SQ_G11, SQ_H11, SQ_I11, SQ_J11, SQ_K11, SQ_L11, SQ_M11, SQ_N11, SQ_O11, SQ_P11,
+  SQ_A12, SQ_B12, SQ_C12, SQ_D12, SQ_E12, SQ_F12, SQ_G12, SQ_H12, SQ_I12, SQ_J12, SQ_K12, SQ_L12, SQ_M12, SQ_N12, SQ_O12, SQ_P12,
+  SQ_A13, SQ_B13, SQ_C13, SQ_D13, SQ_E13, SQ_F13, SQ_G13, SQ_H13, SQ_I13, SQ_J13, SQ_K13, SQ_L13, SQ_M13, SQ_N13, SQ_O13, SQ_P13,
+  SQ_A14, SQ_B14, SQ_C14, SQ_D14, SQ_E14, SQ_F14, SQ_G14, SQ_H14, SQ_I14, SQ_J14, SQ_K14, SQ_L14, SQ_M14, SQ_N14, SQ_O14, SQ_P14,
+  SQ_A15, SQ_B15, SQ_C15, SQ_D15, SQ_E15, SQ_F15, SQ_G15, SQ_H15, SQ_I15, SQ_J15, SQ_K15, SQ_L15, SQ_M15, SQ_N15, SQ_O15, SQ_P15,
+  SQ_A16, SQ_B16, SQ_C16, SQ_D16, SQ_E16, SQ_F16, SQ_G16, SQ_H16, SQ_I16, SQ_J16, SQ_K16, SQ_L16, SQ_M16, SQ_N16, SQ_O16, SQ_P16,
+#elif defined(LARGEBOARDS)
   SQ_A1, SQ_B1, SQ_C1, SQ_D1, SQ_E1, SQ_F1, SQ_G1, SQ_H1, SQ_I1, SQ_J1, SQ_K1, SQ_L1,
   SQ_A2, SQ_B2, SQ_C2, SQ_D2, SQ_E2, SQ_F2, SQ_G2, SQ_H2, SQ_I2, SQ_J2, SQ_K2, SQ_L2,
   SQ_A3, SQ_B3, SQ_C3, SQ_D3, SQ_E3, SQ_F3, SQ_G3, SQ_H3, SQ_I3, SQ_J3, SQ_K3, SQ_L3,
@@ -516,20 +874,17 @@ enum Square : int {
   SQ_NONE,
 
   SQUARE_ZERO = 0,
-#ifdef LARGEBOARDS
-  SQUARE_NB = 120,
-  SQUARE_BIT_MASK = 127,
-#else
-  SQUARE_NB = 64,
-  SQUARE_BIT_MASK = 63,
-#endif
+  SQUARE_NB = MaxBoardFiles * MaxBoardRanks,
+  SQUARE_BIT_MASK = SquareBitMaskValue,
   SQ_MAX = SQUARE_NB - 1,
   SQUARE_NB_CHESS = 64,
   SQUARE_NB_SHOGI = 81,
 };
 
 enum Direction : int {
-#ifdef LARGEBOARDS
+#if defined(VERY_LARGE_BOARDS)
+  NORTH = 16,
+#elif defined(LARGEBOARDS)
   NORTH =  12,
 #else
   NORTH =  8,
@@ -545,7 +900,10 @@ enum Direction : int {
 };
 
 enum File : int {
-#ifdef LARGEBOARDS
+#if defined(VERY_LARGE_BOARDS)
+  FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H,
+  FILE_I, FILE_J, FILE_K, FILE_L, FILE_M, FILE_N, FILE_O, FILE_P,
+#elif defined(LARGEBOARDS)
   FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H, FILE_I, FILE_J, FILE_K, FILE_L,
 #else
   FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H,
@@ -555,7 +913,10 @@ enum File : int {
 };
 
 enum Rank : int {
-#ifdef LARGEBOARDS
+#if defined(VERY_LARGE_BOARDS)
+  RANK_1, RANK_2, RANK_3, RANK_4, RANK_5, RANK_6, RANK_7, RANK_8,
+  RANK_9, RANK_10, RANK_11, RANK_12, RANK_13, RANK_14, RANK_15, RANK_16,
+#elif defined(LARGEBOARDS)
   RANK_1, RANK_2, RANK_3, RANK_4, RANK_5, RANK_6, RANK_7, RANK_8, RANK_9, RANK_10,
 #else
   RANK_1, RANK_2, RANK_3, RANK_4, RANK_5, RANK_6, RANK_7, RANK_8,
@@ -564,22 +925,35 @@ enum Rank : int {
   RANK_MAX = RANK_NB - 1
 };
 
+inline constexpr std::pair<int, int> decode_direction(Direction d) {
+    const int raw = int(d);
+    int df = raw % int(FILE_NB);
+
+    if (df > int(FILE_NB) / 2)
+        df -= int(FILE_NB);
+    if (df < -int(FILE_NB) / 2)
+        df += int(FILE_NB);
+
+    const int dr = (raw - df) / int(FILE_NB);
+    return {dr, df};
+}
+
 // Keep track of what a move changes on the board (used by NNUE)
+constexpr int DIRTY_PIECE_MAX = 12;
 struct DirtyPiece {
 
   // Number of changed pieces
   int dirty_num;
 
-  // Max 3 pieces can change in one move. A promotion with capture moves
-  // both the pawn and the captured piece to SQ_NONE and the piece promoted
-  // to from SQ_NONE to the capture square.
-  Piece piece[12];
-  Piece handPiece[12];
-  int handCount[12];
+  // Up to 12 entries cover the high-dirty move families: blast moves, paired
+  // drops, pushes, pulls, morphs, color changes, and hand updates.
+  Piece piece[DIRTY_PIECE_MAX];
+  Piece handPiece[DIRTY_PIECE_MAX];
+  int handCount[DIRTY_PIECE_MAX];
 
   // From and to squares, which may be SQ_NONE
-  Square from[12];
-  Square to[12];
+  Square from[DIRTY_PIECE_MAX];
+  Square to[DIRTY_PIECE_MAX];
 };
 
 /// Score enum stores a middlegame and an endgame value in a single integer (enum).
@@ -610,9 +984,9 @@ constexpr T operator~ (T d) { return (T)~(int)d; }                        \
 constexpr T operator| (T d1, T d2) { return (T)((int)d1 | (int)d2); }     \
 constexpr T operator& (T d1, T d2) { return (T)((int)d1 & (int)d2); }     \
 constexpr T operator^ (T d1, T d2) { return (T)((int)d1 ^ (int)d2); }     \
-inline T& operator|= (T& d1, T d2) { return (T&)((int&)d1 |= (int)d2); }  \
-inline T& operator&= (T& d1, T d2) { return (T&)((int&)d1 &= (int)d2); }  \
-inline T& operator^= (T& d1, T d2) { return (T&)((int&)d1 ^= (int)d2); }
+inline T& operator|= (T& d1, T d2) { return d1 = d1 | d2; }               \
+inline T& operator&= (T& d1, T d2) { return d1 = d1 & d2; }               \
+inline T& operator^= (T& d1, T d2) { return d1 = d1 ^ d2; }
 
 #define ENABLE_BASE_OPERATORS_ON(T)                                \
 constexpr T operator+(T d1, int d2) { return T(int(d1) + d2); }    \
@@ -663,14 +1037,16 @@ constexpr PieceSet operator~ (PieceSet ps) { return (PieceSet)~(uint64_t)ps; }
 constexpr PieceSet operator| (PieceSet ps1, PieceSet ps2) { return (PieceSet)((uint64_t)ps1 | (uint64_t)ps2); }
 constexpr PieceSet operator| (PieceSet ps, PieceType pt) { return ps | piece_set(pt); }
 constexpr PieceSet operator& (PieceSet ps1, PieceSet ps2) { return (PieceSet)((uint64_t)ps1 & (uint64_t)ps2); }
-constexpr PieceSet operator& (PieceSet ps, PieceType pt) { return ps & piece_set(pt); }
+constexpr PieceSet operator& (PieceSet ps, PieceType pt) {
+  return (uint64_t(ps) & (1ULL << ALL_PIECES)) ? piece_set(pt) : PieceSet(uint64_t(ps) & (1ULL << pt));
+}
 constexpr PieceSet operator^ (PieceSet ps1, PieceSet ps2) { return (PieceSet)((uint64_t)ps1 ^ (uint64_t)ps2); }
 constexpr PieceSet operator^ (PieceSet ps, PieceType pt) { return ps ^ piece_set(pt); }
-inline PieceSet& operator|= (PieceSet& ps1, PieceSet ps2) { return (PieceSet&)((uint64_t&)ps1 |= (uint64_t)ps2); }
+inline PieceSet& operator|= (PieceSet& ps1, PieceSet ps2) { ps1 = PieceSet(uint64_t(ps1) | uint64_t(ps2)); return ps1; }
 inline PieceSet& operator|= (PieceSet& ps, PieceType pt) { return ps |= piece_set(pt); }
-inline PieceSet& operator&= (PieceSet& ps1, PieceSet ps2) { return (PieceSet&)((uint64_t&)ps1 &= (uint64_t)ps2); }
+inline PieceSet& operator&= (PieceSet& ps1, PieceSet ps2) { ps1 = PieceSet(uint64_t(ps1) & uint64_t(ps2)); return ps1; }
 //inline PieceSet& operator&= (PieceSet& ps, PieceType pt) does not make sense
-inline PieceSet& operator^= (PieceSet& ps1, PieceSet ps2) { return (PieceSet&)((uint64_t&)ps1 ^= (uint64_t)ps2); }
+inline PieceSet& operator^= (PieceSet& ps1, PieceSet ps2) { ps1 = PieceSet(uint64_t(ps1) ^ uint64_t(ps2)); return ps1; }
 inline PieceSet& operator^= (PieceSet& ps, PieceType pt) { return ps ^= piece_set(pt); }
 
 static_assert(piece_set(PAWN) & PAWN);
@@ -739,7 +1115,9 @@ constexpr Value mated_in(int ply) {
 constexpr Value convert_mate_value(Value v, int ply) {
   return  v ==  VALUE_MATE ? mate_in(ply)
         : v == -VALUE_MATE ? mated_in(ply)
-        : v;
+        : v ==  VALUE_COUNT_WIN ? mate_in(ply)
+        : v == -VALUE_COUNT_WIN ? mated_in(ply)
+                           : v;
 }
 
 constexpr Square make_square(File f, Rank r) {
@@ -804,7 +1182,26 @@ inline int from_to(Move m) {
 }
 
 inline PieceType promotion_type(Move m) {
-  return type_of(m) == PROMOTION ? PieceType((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & (PIECE_TYPE_NB - 1)) : NO_PIECE_TYPE;
+  if (type_of(m) == PROMOTION)
+    return PieceType((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & (PIECE_TYPE_NB - 1));
+  if (type_of(m) == PROMOTION_POTION) {
+    int choice = (m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS)) & 3;
+    return choice == 0 ? KNIGHT : (choice == 1 ? BISHOP : (choice == 2 ? ROOK : QUEEN));
+  }
+  return NO_PIECE_TYPE;
+}
+
+inline bool is_promotion_move(Move m) {
+  return type_of(m) == PROMOTION || type_of(m) == PROMOTION_POTION;
+}
+
+inline Square potion_target_square(Move m) {
+  return Square((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) & SQUARE_BIT_MASK);
+}
+
+inline int potion_type(Move m) {
+  assert(type_of(m) == PROMOTION_POTION);
+  return (m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS + 2)) & 1;
 }
 
 inline PieceType gating_type(Move m) {
@@ -812,28 +1209,117 @@ inline PieceType gating_type(Move m) {
 }
 
 inline Square gating_square(Move m) {
-  return Square((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SQUARE_BIT_MASK);
+  const uint64_t raw = static_cast<uint64_t>(m);
+  constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
+  const uint64_t gate = (raw >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask;
+  if (gate)
+      return Square(gate - 1);
+  if (type_of(m) == CASTLING && gating_type(m) != NO_PIECE_TYPE)
+      return to_sq(m);
+  if ((type_of(m) == NORMAL || type_of(m) == CASTLING) && gating_type(m) != NO_PIECE_TYPE)
+      return from_sq(m);
+  return SQ_NONE;
+}
+
+inline Square pull_square(Move m) {
+  if (type_of(m) != PULL)
+      return SQ_NONE;
+  const uint64_t raw = static_cast<uint64_t>(m);
+  constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
+  const uint64_t sq = (raw >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask;
+  return sq ? Square(sq - 1) : SQ_NONE;
+}
+
+inline Square swap_square(Move m) {
+  return type_of(m) == SWAP ? to_sq(m) : SQ_NONE;
 }
 
 inline bool is_gating(Move m) {
-  return gating_type(m) && (type_of(m) == NORMAL || type_of(m) == CASTLING);
+  const MoveType mt = type_of(m);
+  constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
+  if (mt == SPECIAL)
+      return ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask) != 0;
+  if (mt == NORMAL || mt == CASTLING)
+      return gating_type(m) != NO_PIECE_TYPE
+          || ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask);
+  return (mt == PROMOTION || mt == PIECE_PROMOTION || mt == PIECE_DEMOTION)
+      && ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask) != 0;
+}
+
+inline bool is_drop_move(Move m) {
+  return type_of(m) == DROP || type_of(m) == DROP2 || type_of(m) == INSERT;
+}
+
+inline bool is_insert_move(Move m) {
+  return type_of(m) == INSERT;
 }
 
 inline bool is_pass(Move m) {
-  return type_of(m) == SPECIAL && from_sq(m) == to_sq(m);
+  return type_of(m) == SPECIAL
+      && from_sq(m) == to_sq(m)
+      && !is_gating(m)
+      && gating_type(m) == NO_PIECE_TYPE;
+}
+
+inline bool is_self_destruct(Move m) {
+  return type_of(m) == SPECIAL
+      && from_sq(m) == to_sq(m)
+      && !is_gating(m)
+      && gating_type(m) != NO_PIECE_TYPE;
+}
+
+inline bool is_first_move_special(Move m) {
+  return type_of(m) == SPECIAL
+      && from_sq(m) != to_sq(m)
+      && !is_gating(m)
+      && gating_type(m) != NO_PIECE_TYPE;
 }
 
 constexpr Move make_move(Square from, Square to) {
-  return Move((from << SQUARE_BITS) + to);
+  return Move((static_cast<uint64_t>(from) << SQUARE_BITS) + static_cast<uint64_t>(to));
 }
 
 template<MoveType T>
 inline Move make(Square from, Square to, PieceType pt = NO_PIECE_TYPE) {
-  return Move((pt << (2 * SQUARE_BITS + MOVE_TYPE_BITS)) + T + (from << SQUARE_BITS) + to);
+  return Move((static_cast<uint64_t>(pt) << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+            + static_cast<uint64_t>(T)
+            + (static_cast<uint64_t>(from) << SQUARE_BITS)
+            + static_cast<uint64_t>(to));
 }
 
 constexpr Move make_drop(Square to, PieceType pt_in_hand, PieceType pt_dropped) {
-  return Move((pt_in_hand << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) + (pt_dropped << (2 * SQUARE_BITS + MOVE_TYPE_BITS)) + DROP + to);
+  return Move((static_cast<uint64_t>(pt_in_hand) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
+            + (static_cast<uint64_t>(pt_dropped) << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+            + static_cast<uint64_t>(DROP)
+            + static_cast<uint64_t>(to));
+}
+
+constexpr Move make_drop_pair(Square to1, Square to2, PieceType pt_in_hand, PieceType pt_dropped) {
+  return Move((static_cast<uint64_t>(pt_in_hand) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
+            + (static_cast<uint64_t>(pt_dropped) << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+            + static_cast<uint64_t>(DROP2)
+            + (static_cast<uint64_t>(to2) << SQUARE_BITS)
+            + static_cast<uint64_t>(to1));
+}
+
+constexpr Move make_insert(Square marker, Square to, PieceType pt_in_hand, PieceType pt_dropped) {
+  return Move((static_cast<uint64_t>(pt_in_hand) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
+            + (static_cast<uint64_t>(pt_dropped) << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+            + static_cast<uint64_t>(INSERT)
+            + (static_cast<uint64_t>(marker) << SQUARE_BITS)
+            + static_cast<uint64_t>(to));
+}
+
+constexpr PieceType exchange_piece(Move m) {
+  return type_of(m) != DROP ? NO_PIECE_TYPE : PieceType((m >> SQUARE_BITS) & SQUARE_BIT_MASK);
+}
+
+constexpr Move make_exchange(Square to, PieceType pt_exchange, PieceType pt_in_hand, PieceType pt_dropped) {
+  return Move((static_cast<uint64_t>(pt_in_hand) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
+            + (static_cast<uint64_t>(pt_dropped) << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+            + (static_cast<uint64_t>(pt_exchange) << SQUARE_BITS)
+            + static_cast<uint64_t>(DROP)
+            + static_cast<uint64_t>(to));
 }
 
 constexpr Move reverse_move(Move m) {
@@ -842,7 +1328,34 @@ constexpr Move reverse_move(Move m) {
 
 template<MoveType T>
 constexpr Move make_gating(Square from, Square to, PieceType pt, Square gate) {
-  return Move((gate << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) + (pt << (2 * SQUARE_BITS + MOVE_TYPE_BITS)) + T + (from << SQUARE_BITS) + to);
+  return Move((static_cast<uint64_t>(gate + 1) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
+            + (static_cast<uint64_t>(pt) << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+            + static_cast<uint64_t>(T)
+            + (static_cast<uint64_t>(from) << SQUARE_BITS)
+            + static_cast<uint64_t>(to));
+}
+
+constexpr Move make_pull(Square from, Square to, Square pullFrom) {
+  return Move((static_cast<uint64_t>(pullFrom + 1) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
+            + static_cast<uint64_t>(PULL)
+            + (static_cast<uint64_t>(from) << SQUARE_BITS)
+            + static_cast<uint64_t>(to));
+}
+
+constexpr Move make_promotion_potion(Square from, Square to, PieceType prom_pt, int potion, Square target) {
+  assert(prom_pt == KNIGHT || prom_pt == BISHOP || prom_pt == ROOK || prom_pt == QUEEN);
+  assert(potion == 0 || potion == 1);
+  uint64_t prom_val = (prom_pt == KNIGHT ? 0 : (prom_pt == BISHOP ? 1 : (prom_pt == ROOK ? 2 : 3)));
+  uint64_t potion_val = static_cast<uint64_t>(potion);
+  uint64_t target_val = static_cast<uint64_t>(target);
+  return Move(
+      (potion_val << (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS + 2))
+    + (prom_val << (2 * SQUARE_BITS + MOVE_TYPE_BITS + SQUARE_BITS))
+    + (target_val << (2 * SQUARE_BITS + MOVE_TYPE_BITS))
+    + static_cast<uint64_t>(PROMOTION_POTION)
+    + (static_cast<uint64_t>(from) << SQUARE_BITS)
+    + static_cast<uint64_t>(to)
+  );
 }
 
 constexpr PieceType dropped_piece_type(Move m) {
@@ -858,7 +1371,11 @@ inline bool is_custom(PieceType pt) {
 }
 
 inline bool is_ok(Move m) {
-  return from_sq(m) != to_sq(m) || type_of(m) == PROMOTION || type_of(m) == SPECIAL; // Catch MOVE_NULL and MOVE_NONE
+  return from_sq(m) != to_sq(m)
+      || type_of(m) == PROMOTION
+      || type_of(m) == SPECIAL
+      || type_of(m) == CASTLING
+      || type_of(m) == PROMOTION_POTION; // Catch MOVE_NULL and MOVE_NONE, allow stationary castling and promotion/potions
 }
 
 inline int dist(Direction d) {
@@ -870,6 +1387,68 @@ inline int dist(Direction d) {
 constexpr Key make_key(uint64_t seed) {
   return seed * 6364136223846793005ULL + 1442695040888963407ULL;
 }
+
+struct FilePieceSetMap
+{
+    FilePieceSetMap() = default;
+    FilePieceSetMap(PieceSet ps) : fallback(ps) {}
+    FilePieceSetMap(const FilePieceSetMap& other) = default;
+    FilePieceSetMap& operator=(const FilePieceSetMap& other) = default;
+
+    FilePieceSetMap& operator=(PieceSet ps) {
+        fallback = ps;
+        for (int f = FILE_A; f < FILE_NB; ++f) isSet[f] = false;
+        return *this;
+    }
+
+    FilePieceSetMap& operator&=(PieceSet ps) {
+        fallback &= ps;
+        for (int f = FILE_A; f < FILE_NB; ++f)
+            if (isSet[f]) filelist[f] &= ps;
+        return *this;
+    }
+
+    FilePieceSetMap& operator|=(PieceSet ps) {
+        fallback |= ps;
+        for (int f = FILE_A; f < FILE_NB; ++f)
+            if (isSet[f]) filelist[f] |= ps;
+        return *this;
+    }
+
+    FilePieceSetMap& operator|=(PieceType pt) {
+        return *this |= piece_set(pt);
+    }
+
+    PieceSet piecesOfFile(File f) const
+    {
+        if (f == FILE_NB) return fallback;
+        if (f < FILE_A || f > FILE_MAX) return NO_PIECE_SET;
+        return isSet[f] ? filelist[f] : fallback;
+    }
+
+    void set(File f, PieceSet ps)
+    {
+        if (f == FILE_NB) { fallback = ps; return; }
+        if (f < FILE_A || f > FILE_MAX) return;
+        filelist[f] = ps;
+        isSet[f] = true;
+    }
+
+    PieceSet unionSet() const
+    {
+        PieceSet ps = fallback;
+        for (int f = FILE_A; f < FILE_NB; ++f)
+            if (isSet[f]) ps |= filelist[f];
+        return ps;
+    }
+
+    operator PieceSet() const { return unionSet(); }
+
+    PieceSet fallback = NO_PIECE_SET;
+private:
+    PieceSet filelist[FILE_NB] = {NO_PIECE_SET};
+    bool isSet[FILE_NB] = {false};
+};
 
 } // namespace Stockfish
 

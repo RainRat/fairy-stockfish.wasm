@@ -34,11 +34,6 @@
 #include "xboard.h"
 #include "syzygy/tbprobe.h"
 
-#ifdef __EMSCRIPTEN__
-#include "emscripten/utils.h"
-#include "emscripten/misc/timeit.hpp"
-#endif
-
 using namespace std;
 
 namespace Stockfish {
@@ -63,7 +58,7 @@ namespace {
 
     if (token == "startpos")
     {
-        fen = variants.find(Options["UCI_Variant"])->second->startFen;
+        fen = variants.get(Options["UCI_Variant"])->startFen;
         is >> token; // Consume "moves" token if any
     }
     else if (token == "fen" || token == "sfen")
@@ -73,7 +68,7 @@ namespace {
         return;
 
     states = StateListPtr(new std::deque<StateInfo>(1)); // Drop old and create a new one
-    pos.set(variants.find(Options["UCI_Variant"])->second, fen, Options["UCI_Chess960"], &states->back(), Threads.main(), sfen);
+    pos.set(variants.get(Options["UCI_Variant"]), fen, Options["UCI_Chess960"], &states->back(), Threads.main(), sfen);
 
     // Parse move list (if any)
     while (is >> token && (m = UCI::to_move(pos, token)) != MOVE_NONE)
@@ -105,6 +100,10 @@ namespace {
 
     string token, name, value;
 
+    Threads.stop = true;
+    Threads.main()->wait_for_search_finished();
+    Threads.wait_for_search_finished();
+
     is >> token; // Consume "name" token
 
     if (CurrentProtocol == UCCI)
@@ -118,7 +117,10 @@ namespace {
     while (is >> token)
         value += (value.empty() ? "" : " ") + token;
 
-    if (Options.count(name))
+    if (name == "UCI_Variant" && !value.empty() && !variants.has(value))
+        sync_cout << "info string unknown variant '" << value
+                  << "'; keeping '" << std::string(Options["UCI_Variant"]) << "'" << sync_endl;
+    else if (Options.count(name))
         Options[name] = value;
     // Deal with option name aliases in UCI dialects
     else if (is_valid_option(Options, name))
@@ -235,8 +237,8 @@ namespace {
      // Coefficients of a 3rd order polynomial fit based on fishtest data
      // for two parameters needed to transform eval to the argument of a
      // logistic function.
-     double as[] = {-3.68389304,  30.07065921, -60.52878723, 149.53378557};
-     double bs[] = {-2.0181857,   15.85685038, -29.83452023,  47.59078827};
+     static constexpr double as[] = {-3.68389304,  30.07065921, -60.52878723, 149.53378557};
+     static constexpr double bs[] = {-2.0181857,   15.85685038, -29.83452023,  47.59078827};
      double a = (((as[0] * m + as[1]) * m + as[2]) * m) + as[3];
      double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
 
@@ -289,12 +291,50 @@ namespace {
     }
   }
 
-  #ifdef __EMSCRIPTEN__
-  void bench_eval(Position& pos) {
-    auto res = timeit::timeit([&]() { return Eval::evaluate(pos); });
-    std::cout << res << std::endl;
+  // print_variant_info() prints a summary of the current variant's configuration.
+
+  void print_variant_info(const Variant* v, const std::string& variantName) {
+
+    if (!v) return;
+
+    sync_cout << "\nVariant:  " << variantName
+              << "\nTemplate: " << v->variantTemplate
+              << "\nBoard:    " << v->maxFile + 1 << "x" << v->maxRank + 1
+              << (v->hexBoard ? " (hex)" : "")
+              << (v->cylindrical ? " (cylindrical)" : "")
+              << (v->toroidal ? " (toroidal)" : "")
+              << "\nPockets:  " << v->pocketSize
+              << "\nPieces:  ";
+
+    for (PieceSet ps = v->pieceTypes; ps; )
+    {
+        PieceType pt = pop_lsb(ps);
+        const PieceInfo* pi = pieceMap.get(pt);
+        sync_cout << " " << v->pieceToChar[make_piece(WHITE, pt)]
+                  << "(" << (pi ? pi->betza : "") << ")";
+    }
+
+    sync_cout << "\nRules:   ";
+    if (v->mustCapture[WHITE] || v->mustCapture[BLACK]) sync_cout << " mustCapture";
+    if (!v->checking)    sync_cout << " noChecking";
+    if (v->allowChecks)  sync_cout << " allowChecks";
+    if (v->castling)     sync_cout << " castling";
+    if (v->pieceDrops)   sync_cout << " pieceDrops";
+    if (v->gating)       sync_cout << " gating";
+    if (v->pass[WHITE] || v->pass[BLACK]) sync_cout << " pass";
+    if (v->checkCounting) sync_cout << " checkCounting";
+    if (v->pointsCounting) sync_cout << " pointsCounting";
+    if (v->potions)      sync_cout << " potions";
+
+    sync_cout << "\nEndgame: ";
+    if (v->nMoveRule > 0) sync_cout << " " << v->nMoveRule << "-move-rule";
+    if (v->nFoldRule > 0) sync_cout << " " << v->nFoldRule << "-fold-repetition";
+    if (v->stalemateValue.global != VALUE_DRAW) sync_cout << " stalemate=" << (v->stalemateValue.global == -VALUE_MATE ? "lose" : (v->stalemateValue.global == VALUE_MATE ? "win" : std::to_string(int(v->stalemateValue.global))));
+    if (v->extinctionValue.global != VALUE_NONE) sync_cout << " extinction";
+    if (v->connectN > 0) sync_cout << " connect" << v->connectN;
+
+    sync_cout << sync_endl;
   }
-  #endif
 
 } // namespace
 
@@ -311,8 +351,8 @@ void UCI::loop(int argc, char* argv[]) {
   string token, cmd;
   StateListPtr states(new std::deque<StateInfo>(1));
 
-  assert(variants.find(Options["UCI_Variant"])->second != nullptr);
-  pos.set(variants.find(Options["UCI_Variant"])->second, variants.find(Options["UCI_Variant"])->second->startFen, false, &states->back(), Threads.main());
+  assert(variants.get(Options["UCI_Variant"]) != nullptr);
+  pos.set(variants.get(Options["UCI_Variant"]), variants.get(Options["UCI_Variant"])->startFen, false, &states->back(), Threads.main());
 
   for (int i = 1; i < argc; ++i)
       cmd += std::string(argv[i]) + " ";
@@ -336,13 +376,8 @@ void UCI::loop(int argc, char* argv[]) {
   }
 
   do {
-      #ifdef __EMSCRIPTEN__
-      argc = 1;
-      emscripten_utils_getline(cmd);
-      #else
       if (argc == 1 && !getline(cin, cmd)) // Block here waiting for input or EOF
           cmd = "quit";
-      #endif
 
       istringstream is(cmd);
 
@@ -399,12 +434,38 @@ void UCI::loop(int argc, char* argv[]) {
       else if (token == "position")   position(pos, is, states), banmoves.clear();
       else if (token == "ucinewgame" || token == "usinewgame" || token == "uccinewgame") Search::clear();
       else if (token == "isready")    sync_cout << "readyok" << sync_endl;
+      else if (token == "help")
+          sync_cout << "\nStandard Protocol Commands:"
+                    << "\n  uci, usi, ucci, xboard      Select an engine protocol"
+                    << "\n  isready                     Check if the engine is ready"
+                    << "\n  setoption name N value V    Update an engine option"
+                    << "\n  ucinewgame                  Prepare for a new game"
+                    << "\n  position [startpos|fen]     Load a game position"
+                    << "\n  go                          Start searching for the best move"
+                    << "\n  stop                        Finish searching immediately"
+                    << "\n  ponderhit                   Continue as a normal search"
+                    << "\n  quit                        Exit the program"
+                    << "\n\nTools and Debugging:"
+                    << "\n  d                           Display the current board"
+                    << "\n  vinfo                       Show details about the active variant"
+                    << "\n  eval                        Show static evaluation of the position"
+                    << "\n  bench                       Run internal performance tests"
+                    << "\n  compiler                    Show information about the compiler"
+                    << "\n  load [file|<<EOF]           Load variant rules from a file or text"
+                    << "\n  check [file|<<EOF]          Validate a variant configuration"
+                    << "\n  flip                        Flip the board perspective"
+                    << sync_endl;
 
       // Additional custom non-UCI commands, mainly for debugging.
       // Do not use these commands during a search!
       else if (token == "flip")     pos.flip();
       else if (token == "bench")    bench(pos, is, states);
       else if (token == "d")        sync_cout << pos << sync_endl;
+      else if (token == "vinfo")
+      {
+          const std::string variantName = Options["UCI_Variant"];
+          print_variant_info(variants.get(variantName), variantName);
+      }
       else if (token == "eval")     trace_eval(pos);
       else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
       else if (token == "export_net")
@@ -430,18 +491,13 @@ void UCI::loop(int argc, char* argv[]) {
           is.seekg(0);
           position(pos, is, states);
       }
-      #ifdef __EMSCRIPTEN__
-      else if (token == "bench_eval") bench_eval(pos);
-      #endif
       else if (!token.empty() && token[0] != '#')
           sync_cout << "Unknown command: " << cmd << sync_endl;
 
   } while (token != "quit" && argc == 1); // Command line args are one-shot
 
-  #ifdef __EMSCRIPTEN__
-  // TODO: Ideally, we should send message to foreground and terminate gracefully from there
-  emscripten_force_exit(0);
-  #endif
+  if (CurrentProtocol == XBOARD && XBoard::stateMachine)
+      XBoard::stateMachine->shutdown_ponder_worker();
 }
 
 
@@ -518,35 +574,71 @@ std::string UCI::square(const Position& pos, Square s) {
 /// UCI::dropped_piece() generates a piece label string from a Move.
 
 string UCI::dropped_piece(const Position& pos, Move m) {
-  assert(type_of(m) == DROP);
+  assert(is_drop_move(m));
   if (dropped_piece_type(m) == pos.promoted_piece_type(in_hand_piece_type(m)))
       // Dropping as promoted piece
-      return std::string{'+', pos.piece_to_char()[in_hand_piece_type(m)]};
+      return std::string("+") + pos.piece_symbol(make_piece(WHITE, in_hand_piece_type(m)));
   else
-      return std::string{pos.piece_to_char()[dropped_piece_type(m)]};
+      return pos.piece_symbol(make_piece(WHITE, dropped_piece_type(m)));
 }
 
+string UCI::exchange(const Position &pos, Move m) {
+  assert(is_drop_move(m));
+  if (type_of(m) != DROP)
+      return std::string{};
+  if (exchange_piece(m) == NO_PIECE_TYPE) {
+      return std::string{};
+  }
+  assert(pos.capture_type() == PRISON);
+  return std::string{'#', pos.piece_to_char()[exchange_piece(m)]};
+}
 
 /// UCI::move() converts a Move to a string in coordinate notation (g1f3, a7a8q).
 /// The only special case is castling, where we print in the e1g1 notation in
 /// normal chess mode, and in e1h1 notation in chess960 mode. Internally all
-/// castling moves are always encoded as 'king captures rook'.
+/// castling moves are always encoded as 'king captures rook'. Some fairy
+/// special moves use suffixes: clone moves append 'c', swap moves append 's',
+/// self-destruct moves append 'x', and pulls append ",<pulled-square>".
 
 string UCI::move(const Position& pos, Move m) {
 
   Square from = from_sq(m);
   Square to = to_sq(m);
+  bool wallMove = pos.walling(pos.side_to_move()) && is_gating(m);
+  bool cloneMove = pos.is_clone_move(m);
+  bool pullMove = pos.is_pull_move(m);
+  bool swapMove = pos.is_swap_move(m);
 
   if (m == MOVE_NONE)
       return CurrentProtocol == USI ? "resign" : "(none)";
 
+  if (is_pass(m) && CurrentProtocol == XBOARD)
+      return "@@@@";
+  if (is_pass(m))
+      return "0000";
+  if (is_self_destruct(m))
+      return UCI::square(pos, from) + UCI::square(pos, to) + "x";
+
   if (m == MOVE_NULL)
       return "0000";
 
-  if (is_pass(m) && CurrentProtocol == XBOARD)
-      return "@@@@";
+  bool potionMove = false;
+  std::string potionPrefix;
 
-  if (is_gating(m) && gating_square(m) == to)
+  if (pos.potions_enabled() && is_gating(m))
+      for (int idx = 0; idx < Variant::POTION_TYPE_NB; ++idx)
+      {
+          PieceType potionPiece = pos.potion_piece(static_cast<Variant::PotionType>(idx));
+          if (!potionMove && potionPiece != NO_PIECE_TYPE
+              && gating_type(m) == potionPiece)
+          {
+              potionMove = true;
+              potionPrefix = pos.piece_symbol(make_piece(BLACK, gating_type(m)))
+                             + "@" + UCI::square(pos, gating_square(m));
+          }
+      }
+
+  if (is_gating(m) && gating_square(m) == to && !potionMove)
       from = to_sq(m), to = from_sq(m);
   else if (type_of(m) == CASTLING && !pos.is_chess960())
   {
@@ -556,29 +648,47 @@ string UCI::move(const Position& pos, Move m) {
           to = to_sq(m);
   }
 
-  string move = (type_of(m) == DROP ? UCI::dropped_piece(pos, m) + (CurrentProtocol == USI ? '*' : '@')
-                                    : UCI::square(pos, from)) + UCI::square(pos, to);
+  string move = (is_drop_move(m)
+          ? UCI::dropped_piece(pos, m) + UCI::exchange(pos, m) + (CurrentProtocol == USI ? '*' : '@')
+          : UCI::square(pos, from))
+                  + UCI::square(pos, to);
 
-  // Wall square
-  if (pos.walling() && CurrentProtocol == XBOARD)
+  // Wall square.
+  // Keep the legacy "<base>,<to><gate>" form on output for GUI compatibility.
+  if (wallMove && CurrentProtocol == XBOARD)
       move += "," + UCI::square(pos, to) + UCI::square(pos, gating_square(m));
 
   if (type_of(m) == PROMOTION)
-      move += pos.piece_to_char()[make_piece(BLACK, promotion_type(m))];
+      move += pos.piece_symbol(make_piece(BLACK, promotion_type(m)));
   else if (type_of(m) == PIECE_PROMOTION)
       move += '+';
   else if (type_of(m) == PIECE_DEMOTION)
       move += '-';
-  else if (is_gating(m))
+  else if (is_gating(m) && !potionMove && !pos.walling(pos.side_to_move()))
   {
-      move += pos.piece_to_char()[make_piece(BLACK, gating_type(m))];
+      move += pos.piece_symbol(make_piece(BLACK, gating_type(m)));
       if (gating_square(m) != from)
           move += UCI::square(pos, gating_square(m));
   }
+  else if (cloneMove)
+      move += "c";
+  else if (swapMove)
+      move += "s";
 
-  // Wall square
-  if (pos.walling() && CurrentProtocol != XBOARD)
+  if (pos.paired_drop(m))
+      move += "," + UCI::square(pos, pos.secondary_drop_square(m));
+  else if (is_insert_move(m))
+      move += "," + UCI::square(pos, from_sq(m));
+  else if (pullMove)
+      move += "," + UCI::square(pos, pull_square(m));
+
+  // Wall square.
+  // Keep the legacy "<base>,<to><gate>" form on output for GUI compatibility.
+  if (wallMove && CurrentProtocol != XBOARD)
       move += "," + UCI::square(pos, to) + UCI::square(pos, gating_square(m));
+
+  if (potionMove)
+      move = potionPrefix + "," + move;
 
   return move;
 }
@@ -589,19 +699,92 @@ string UCI::move(const Position& pos, Move m) {
 
 Move UCI::to_move(const Position& pos, string& str) {
 
-  if (str.length() == 5)
+  if (!str.empty())
   {
-      if (str[4] == '=')
-          // shogi moves refraining from promotion might use equals sign
-          str.pop_back();
-      else
-          // Junior could send promotion piece in uppercase
-          str[4] = char(tolower(str[4]));
+      // shogi moves refraining from promotion might use equals sign
+      str.erase(std::remove(str.begin(), str.end(), '='), str.end());
+
+      // Junior could send promotion/gating piece in uppercase
+      if (str.size() >= 5)
+      {
+          size_t last = str.size() - 1;
+          if (Variant::is_piece_id_suffix(str[last]))
+          {
+              if (last >= 1 && std::isalpha(static_cast<unsigned char>(str[last - 1])))
+                  str[last - 1] = char(std::tolower(static_cast<unsigned char>(str[last - 1])));
+          }
+          else if (std::isalpha(static_cast<unsigned char>(str[last])))
+              str[last] = char(std::tolower(static_cast<unsigned char>(str[last])));
+      }
   }
 
-  for (const auto& m : MoveList<LEGAL>(pos))
-      if (str == UCI::move(pos, m) || (is_pass(m) && str == UCI::square(pos, from_sq(m)) + UCI::square(pos, to_sq(m))))
+  for (const auto& m : MoveList<LEGAL>(pos)) {
+      auto move_str = UCI::move(pos, m);
+      string move_str_alt;
+      string move_str_short_wall;
+
+      if (pos.paired_drop(m))
+      {
+          size_t sep = move_str.find(CurrentProtocol == USI ? '*' : '@');
+          size_t comma = move_str.find(',');
+          if (sep != string::npos && comma != string::npos)
+          {
+              string first = move_str.substr(sep + 1, comma - sep - 1);
+              string second = move_str.substr(comma + 1);
+              move_str_alt = move_str.substr(0, sep + 1) + second + "," + first;
+          }
+      }
+
+      if (pos.walling(pos.side_to_move()) && is_gating(m))
+      {
+          size_t comma = move_str.find(',');
+          std::string to = UCI::square(pos, to_sq(m));
+          std::string gate = UCI::square(pos, gating_square(m));
+          if (comma != string::npos && to.size() == 2 && gate.size() == 2)
+          {
+              std::string base = move_str.substr(0, comma);
+              move_str_short_wall = base + "," + gate;
+              // Legacy walling commands encode a wall relocation as
+              // "<base>,<oldWall><newWall>". Only the final wall square matters
+              // to move legality, so also accept any 4-char suffix ending in the
+              // actual target wall square.
+              if (str.size() == base.size() + 5
+                  && str.rfind(base + ",", 0) == 0
+                  && str.substr(str.size() - gate.size()) == gate)
+                  move_str_short_wall = str;
+          }
+      }
+
+      // special processing of optional gating suffix from xboard
+      // like "b1c3o" => "b1c3"
+      if (CurrentProtocol == XBOARD && str.length() == 5 && move_str.length() == 4) {
+          if (memcmp(str.c_str(), move_str.c_str(), 4) == 0){
+              PieceType pt = pos.committed_piece_type(m, false);
+              PieceType ptCastling = pos.committed_piece_type(m, true);
+              if (
+                    (
+                        pt != NO_PIECE_TYPE
+                        &&
+                        pos.piece_to_char()[make_piece(BLACK, pt)] == str[4]
+                    )
+                    ||
+                    (
+                        ptCastling != NO_PIECE_TYPE
+                        &&
+                        pos.piece_to_char()[make_piece(BLACK, ptCastling)] == str[4]
+                    )
+              ) {
+                  return m;
+              }
+          }
+      }
+
+      if (   str == move_str
+          || (!move_str_alt.empty() && str == move_str_alt)
+          || (!move_str_short_wall.empty() && str == move_str_short_wall)
+          || (is_pass(m) && str == UCI::square(pos, from_sq(m)) + UCI::square(pos, to_sq(m))))
           return m;
+  }
 
   return MOVE_NONE;
 }

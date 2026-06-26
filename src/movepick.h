@@ -21,6 +21,7 @@
 
 #include <array>
 #include <limits>
+#include <memory>
 #include <type_traits>
 
 #include "movegen.h"
@@ -28,6 +29,15 @@
 #include "types.h"
 
 namespace Stockfish {
+
+inline Piece captured_piece_or_on(const Position& pos, Move m) {
+  Piece captured = pos.captured_piece(m);
+  return captured != NO_PIECE ? captured : pos.piece_on(to_sq(m));
+}
+
+inline PieceType captured_type(const Position& pos, Move m) {
+  return type_of(captured_piece_or_on(pos, m));
+}
 
 /// StatsEntry stores the stat table value. It is usually a number but could
 /// be a move or even a nested history. We use a class instead of naked value
@@ -140,13 +150,21 @@ public:
                                            Move,
                                            const Move*,
                                            int);
+  ~MovePicker();
   Move next_move(bool skipQuiets = false);
 
 private:
   template<PickType T, typename Pred> Move select(Pred);
   template<GenType> void score();
+  bool is_qsearch_tt_move(Move m) const;
+  bool is_useless_potion(Move m) const;
+  void init_move_list_storage();
+  template<GenType Type>
+  bool resume_deferred_potions(ExtMove* appendBegin, ExtMove* baseEnd, bool& deferred);
+  ExtMove* prune_useless_potions(ExtMove* begin, ExtMove* end) const;
   ExtMove* begin() { return cur; }
   ExtMove* end() { return endMoves; }
+  static constexpr int MOVE_PICK_OVERFLOW_CAPACITY = MAX_MOVES * 4;
 
   const Position& pos;
   const ButterflyHistory* mainHistory;
@@ -161,7 +179,23 @@ private:
   Value threshold;
   Depth depth;
   int ply;
-  ExtMove moves[MAX_MOVES];
+  ExtMove* moveList;
+  ExtMove* quietListBegin = nullptr;
+  ExtMove* captureBaseEnd = nullptr;
+  ExtMove* quietBaseEnd = nullptr;
+  ExtMove* evasionBaseEnd = nullptr;
+  ExtMove* qcheckBaseEnd = nullptr;
+  bool capturePotionsDeferred = false;
+  bool quietPotionsDeferred = false;
+  bool evasionPotionsDeferred = false;
+  bool qcheckPotionsDeferred = false;
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+  Thread* thread = nullptr;
+  ExtMove* baseMoveList = nullptr;
+  std::unique_ptr<ExtMove[]> moveListPtr;
+#else
+  ExtMove moves[MOVE_PICK_OVERFLOW_CAPACITY];
+#endif
 };
 
 } // namespace Stockfish

@@ -20,6 +20,10 @@
 #define MOVEGEN_H_INCLUDED
 
 #include <algorithm>
+#include <cassert>
+#include <cstdio>
+#include <memory>
+#include <new>
 
 #include "types.h"
 
@@ -48,6 +52,9 @@ struct ExtMove {
   operator float() const = delete;
 };
 
+class Thread;
+
+
 inline bool operator<(const ExtMove& f, const ExtMove& s) {
   return f.value < s.value;
 }
@@ -55,51 +62,55 @@ inline bool operator<(const ExtMove& f, const ExtMove& s) {
 template<GenType>
 ExtMove* generate(const Position& pos, ExtMove* moveList);
 
-constexpr size_t moveListSize = sizeof(ExtMove) * MAX_MOVES;
+template<GenType>
+ExtMove* generate_without_potions(const Position& pos, ExtMove* moveList);
+
+template<GenType>
+ExtMove* append_potions(const Position& pos, ExtMove* listBegin, ExtMove* baseEnd);
+
+// Some variant-specific generators (potions, exchanges) can exceed MAX_MOVES.
+// Keep a larger shared capacity so move lists stay in-bounds.
+constexpr int MOVEGEN_OVERFLOW_CAPACITY = MAX_MOVES * 4;
+constexpr size_t moveListSizeOverflow = sizeof(ExtMove) * MOVEGEN_OVERFLOW_CAPACITY;
 
 /// The MoveList struct is a simple wrapper around generate(). It sometimes comes
 /// in handy to use this class instead of the low level generate() function.
 template<GenType T>
 struct MoveList {
 
-  
-#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
-    explicit MoveList(const Position& pos)
-    {
-        this->moveList = (ExtMove*)malloc(moveListSize);
-        if (this->moveList == 0)
-        {
-            printf("Error: Failed to allocate memory in heap.");
-            exit(1);
-        }
-        this->last = generate<T>(pos, this->moveList);
-    }
+  MoveList(const MoveList&) = delete;
+  MoveList& operator=(const MoveList&) = delete;
+  MoveList(MoveList&&) = delete;
+  MoveList& operator=(MoveList&&) = delete;
 
-    ~MoveList()
-    {
-        free(this->moveList);
-    }
+#ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
+    explicit MoveList(const Position& pos);
+    ~MoveList();
 #else
     explicit MoveList(const Position& pos) : last(generate<T>(pos, moveList))
     {
-        ;
+        assert(last - moveList <= MOVEGEN_OVERFLOW_CAPACITY);
     }
 #endif
   
-  const ExtMove* begin() const { return moveList; }
+  const ExtMove* begin() const {
+    return moveList;
+  }
   const ExtMove* end() const { return last; }
-  size_t size() const { return last - moveList; }
+  size_t size() const { return last - begin(); }
   bool contains(Move move) const {
     return std::find(begin(), end(), move) != end();
   }
 
 private:
-    ExtMove* last;
 #ifdef USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
-    ExtMove* moveList = 0;
+    Thread* thread;
+    std::unique_ptr<ExtMove[]> moveListPtr;
+    ExtMove* moveList;
 #else
-    ExtMove moveList[MAX_MOVES];
+    ExtMove moveList[MOVEGEN_OVERFLOW_CAPACITY];
 #endif
+    ExtMove* last;
 };
 
 } // namespace Stockfish

@@ -32,10 +32,10 @@
 // the calls at compile time), try to load them at runtime. To do this we need
 // first to define the corresponding function pointers.
 extern "C" {
-typedef bool(*fun1_t)(LOGICAL_PROCESSOR_RELATIONSHIP,
-                      PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PDWORD);
-typedef bool(*fun2_t)(USHORT, PGROUP_AFFINITY);
-typedef bool(*fun3_t)(HANDLE, CONST GROUP_AFFINITY*, PGROUP_AFFINITY);
+typedef BOOL (WINAPI *fun1_t)(LOGICAL_PROCESSOR_RELATIONSHIP,
+                              PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PDWORD);
+typedef BOOL (WINAPI *fun2_t)(USHORT, PGROUP_AFFINITY);
+typedef BOOL (WINAPI *fun3_t)(HANDLE, CONST GROUP_AFFINITY*, PGROUP_AFFINITY);
 }
 #endif
 
@@ -65,28 +65,9 @@ namespace Stockfish {
 
 namespace {
 
-#if defined(__EMSCRIPTEN__)
-
-#define MACRO_STRINGIFY_INTERNAL(X) #X
-#define MACRO_STRINGIFY(X) MACRO_STRINGIFY_INTERNAL(X)
-
-const string Version =
-  "["
-  "commit: "      MACRO_STRINGIFY(EM_COMMIT) ", "
-  "upstream: "    MACRO_STRINGIFY(EM_UPSTREAM) ", "
-  "emscripten: "  MACRO_STRINGIFY(EM_EMSCRIPTEN)
-  "]";
-
-#undef MACRO_STRINGIFY
-#undef MACRO_STRINGIFY_INTERNAL
-
-#else
-
 /// Version number. If Version is left empty, then compile date in the format
 /// DD-MM-YY and show in engine_info.
 const string Version = "";
-
-#endif
 
 /// Our fancy logging facility. The trick here is to replace cin.rdbuf() and
 /// cout.rdbuf() with two Tie objects that tie cin and cout to a file stream. We
@@ -96,23 +77,38 @@ const string Version = "";
 
 struct Tie: public streambuf { // MSVC requires split streambuf for cin and cout
 
+  using traits_type = std::streambuf::traits_type;
+
   Tie(streambuf* b, streambuf* l) : buf(b), logBuf(l) {}
 
-  int sync() override { return logBuf->pubsync(), buf->pubsync(); }
-  int overflow(int c) override { return log(buf->sputc((char)c), "<< "); }
+  int sync() override {
+    const int logResult = logBuf->pubsync();
+    const int bufResult = buf->pubsync();
+    return logResult == 0 && bufResult == 0 ? 0 : -1;
+  }
+  int overflow(int c) override {
+    if (traits_type::eq_int_type(c, traits_type::eof()))
+        return traits_type::not_eof(c);
+    return log(buf->sputc(traits_type::to_char_type(c)), "<< ");
+  }
   int underflow() override { return buf->sgetc(); }
-  int uflow() override { return log(buf->sbumpc(), ">> "); }
+  int uflow() override {
+    int c = buf->sbumpc();
+    return traits_type::eq_int_type(c, traits_type::eof()) ? c : log(c, ">> ");
+  }
 
   streambuf *buf, *logBuf;
 
   int log(int c, const char* prefix) {
 
+    static std::mutex logMutex;
     static int last = '\n'; // Single log file
+    std::lock_guard<std::mutex> lock(logMutex);
 
     if (last == '\n')
         logBuf->sputn(prefix, 3);
 
-    return last = logBuf->sputc((char)c);
+    return last = logBuf->sputc(traits_type::to_char_type(c));
   }
 };
 
@@ -131,7 +127,7 @@ public:
 
     if (!fname.empty() && !l.file.is_open())
     {
-        l.file.open(fname, ifstream::out);
+        l.file.open(fname, ofstream::out);
 
         if (!l.file.is_open())
         {
@@ -161,7 +157,10 @@ public:
 
 string engine_info(bool to_uci, bool to_xboard) {
 
-  const string months("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec");
+  static constexpr const char* MonthNames[] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+  };
   string month, day, year;
   stringstream ss, date(__DATE__); // From compiler, format is "Sep 21 2008"
 
@@ -170,10 +169,19 @@ string engine_info(bool to_uci, bool to_xboard) {
   if (Version.empty())
   {
       date >> month >> day >> year;
-      ss << setw(2) << day << setw(2) << (1 + months.find(month) / 4) << year.substr(2);
+      int monthNumber = 0;
+      for (int i = 0; i < 12; ++i)
+          if (month == MonthNames[i])
+          {
+              monthNumber = i + 1;
+              break;
+          }
+      ss << setw(2) << day << setw(2) << monthNumber << year.substr(2);
   }
 
-#ifdef LARGEBOARDS
+#ifdef VERY_LARGE_BOARDS
+  ss << " VLB";
+#elif defined(LARGEBOARDS)
   ss << " LB";
 #endif
 
@@ -323,17 +331,17 @@ void dbg_print() {
 /// Used to serialize access to std::cout to avoid multiple threads writing at
 /// the same time.
 
-std::ostream& operator<<(std::ostream& os, SyncCout sc) {
+SyncCout::SyncCout() {
+  mutex().lock();
+}
 
+SyncCout::~SyncCout() {
+  mutex().unlock();
+}
+
+std::mutex& SyncCout::mutex() {
   static std::mutex m;
-
-  if (sc == IO_LOCK)
-      m.lock();
-
-  if (sc == IO_UNLOCK)
-      m.unlock();
-
-  return os;
+  return m;
 }
 
 
@@ -374,15 +382,20 @@ void prefetch(void* addr) {
 
 void* std_aligned_alloc(size_t alignment, size_t size) {
 
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0)
+      return nullptr;
+
+  size_t roundedSize = size;
+  if (roundedSize % alignment)
+      roundedSize += alignment - (roundedSize % alignment);
+
 #if defined(POSIXALIGNEDALLOC)
   void *mem;
-  return posix_memalign(&mem, alignment, size) ? nullptr : mem;
+  return posix_memalign(&mem, alignment, roundedSize) ? nullptr : mem;
 #elif defined(_WIN32)
-  return _mm_malloc(size, alignment);
-#elif defined(__EMSCRIPTEN__)
-  return aligned_alloc(alignment, size);
+  return _mm_malloc(roundedSize, alignment);
 #else
-  return aligned_alloc(alignment, size);
+  return aligned_alloc(alignment, roundedSize);
 #endif
 }
 
@@ -478,7 +491,8 @@ void* aligned_large_pages_alloc(size_t allocSize) {
   size_t size = ((allocSize + alignment - 1) / alignment) * alignment;
   void *mem = std_aligned_alloc(alignment, size);
 #if defined(MADV_HUGEPAGE)
-  madvise(mem, size, MADV_HUGEPAGE);
+  if (mem)
+      madvise(mem, size, MADV_HUGEPAGE);
 #endif
   return mem;
 }
@@ -533,7 +547,7 @@ int best_group(size_t idx) {
 
   // Early exit if the needed API is not available at runtime
   HMODULE k32 = GetModuleHandle("Kernel32.dll");
-  auto fun1 = (fun1_t)(void(*)())GetProcAddress(k32, "GetLogicalProcessorInformationEx");
+  auto fun1 = reinterpret_cast<fun1_t>(GetProcAddress(k32, "GetLogicalProcessorInformationEx"));
   if (!fun1)
       return -1;
 
@@ -544,6 +558,8 @@ int best_group(size_t idx) {
   // Once we know returnLength, allocate the buffer
   SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buffer, *ptr;
   ptr = buffer = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)malloc(returnLength);
+  if (!buffer)
+      return -1;
 
   // Second call, now we expect to succeed
   if (!fun1(RelationAll, buffer, &returnLength))
@@ -569,6 +585,9 @@ int best_group(size_t idx) {
   }
 
   free(buffer);
+
+  if (nodes <= 0)
+      return -1;
 
   std::vector<int> groups;
 
@@ -602,8 +621,8 @@ void bindThisThread(size_t idx) {
 
   // Early exit if the needed API are not available at runtime
   HMODULE k32 = GetModuleHandle("Kernel32.dll");
-  auto fun2 = (fun2_t)(void(*)())GetProcAddress(k32, "GetNumaNodeProcessorMaskEx");
-  auto fun3 = (fun3_t)(void(*)())GetProcAddress(k32, "SetThreadGroupAffinity");
+  auto fun2 = reinterpret_cast<fun2_t>(GetProcAddress(k32, "GetNumaNodeProcessorMaskEx"));
+  auto fun3 = reinterpret_cast<fun3_t>(GetProcAddress(k32, "SetThreadGroupAffinity"));
 
   if (!fun2 || !fun3)
       return;
@@ -632,10 +651,6 @@ string binaryDirectory;  // path of the executable directory
 string workingDirectory; // path of the working directory
 
 void init(int argc, char* argv[]) {
-    #ifdef __EMSCRIPTEN__
-    return;
-    #endif
-
     (void)argc;
     string pathSeparator;
 
@@ -657,8 +672,8 @@ void init(int argc, char* argv[]) {
 
     // extract the working directory
     workingDirectory = "";
-    char buff[40000];
-    char* cwd = GETCWD(buff, 40000);
+    std::vector<char> buff(40000);
+    char* cwd = GETCWD(buff.data(), buff.size());
     if (cwd)
         workingDirectory = cwd;
 

@@ -18,11 +18,13 @@
 
 // Code for calculating NNUE evaluation function
 
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <new>
 #include <set>
 #include <sstream>
-#include <iomanip>
-#include <fstream>
+#include <vector>
 
 #include "../evaluate.h"
 #include "../position.h"
@@ -33,6 +35,8 @@
 #include "evaluate_nnue.h"
 
 namespace Stockfish::Eval::NNUE {
+
+  constexpr std::uint32_t MaxDescriptionLength = 4096;
 
   // Input feature converter
   LargePagePtr<FeatureTransformer> featureTransformer;
@@ -50,16 +54,26 @@ namespace Stockfish::Eval::NNUE {
   template <typename T>
   void initialize(AlignedPtr<T>& pointer) {
 
-    pointer.reset(reinterpret_cast<T*>(std_aligned_alloc(alignof(T), sizeof(T))));
-    std::memset(pointer.get(), 0, sizeof(T));
+    void* memory = std_aligned_alloc(alignof(T), sizeof(T));
+    if (!memory)
+    {
+      pointer.reset();
+      return;
+    }
+    pointer.reset(new (memory) T{});
   }
 
   template <typename T>
   void initialize(LargePagePtr<T>& pointer) {
 
     static_assert(alignof(T) <= 4096, "aligned_large_pages_alloc() may fail for such a big alignment requirement of T");
-    pointer.reset(reinterpret_cast<T*>(aligned_large_pages_alloc(sizeof(T))));
-    std::memset(pointer.get(), 0, sizeof(T));
+    void* memory = aligned_large_pages_alloc(sizeof(T));
+    if (!memory)
+    {
+      pointer.reset();
+      return;
+    }
+    pointer.reset(new (memory) T{});
   }
 
   // Read evaluation function parameters
@@ -98,19 +112,22 @@ namespace Stockfish::Eval::NNUE {
     version     = read_little_endian<std::uint32_t>(stream);
     *hashValue  = read_little_endian<std::uint32_t>(stream);
     size        = read_little_endian<std::uint32_t>(stream);
-    if (!stream || version != Version) return false;
+    if (!stream || version != Version || size > MaxDescriptionLength) return false;
     desc->resize(size);
-    stream.read(&(*desc)[0], size);
+    if (size)
+      stream.read(desc->data(), size);
     return !stream.fail();
   }
 
   // Write network header
   bool write_header(std::ostream& stream, std::uint32_t hashValue, const std::string& desc)
   {
+    if (desc.size() > MaxDescriptionLength) return false;
     write_little_endian<std::uint32_t>(stream, Version);
     write_little_endian<std::uint32_t>(stream, hashValue);
     write_little_endian<std::uint32_t>(stream, desc.size());
-    stream.write(&desc[0], desc.size());
+    if (!desc.empty())
+      stream.write(desc.data(), desc.size());
     return !stream.fail();
   }
 
@@ -119,17 +136,28 @@ namespace Stockfish::Eval::NNUE {
 
     std::uint32_t hashValue;
     if (!read_header(stream, &hashValue, &netDescription)) return false;
-    if (hashValue != HashValue) return false;
+    if (hashValue != hash_value()) return false;
+    if (!featureTransformer)
+        return false;
     if (!Detail::read_parameters(stream, *featureTransformer)) return false;
     for (std::size_t i = 0; i < LayerStacks; ++i)
+    {
+      if (!network[i])
+          return false;
       if (!Detail::read_parameters(stream, *(network[i]))) return false;
+    }
     return stream && stream.peek() == std::ios::traits_type::eof();
   }
 
   // Write network parameters
   bool write_parameters(std::ostream& stream) {
 
-    if (!write_header(stream, HashValue, netDescription)) return false;
+    if (!featureTransformer)
+        return false;
+    for (std::size_t i = 0; i < LayerStacks; ++i)
+        if (!network[i])
+            return false;
+    if (!write_header(stream, hash_value(), netDescription)) return false;
     if (!Detail::write_parameters(stream, *featureTransformer)) return false;
     for (std::size_t i = 0; i < LayerStacks; ++i)
       if (!Detail::write_parameters(stream, *(network[i]))) return false;
@@ -297,11 +325,15 @@ namespace Stockfish::Eval::NNUE {
   std::string trace(Position& pos) {
 
     std::stringstream ss;
+    auto* st = pos.state();
+    const bool savedRefreshNeeded = st->nnueRefreshNeeded;
+    st->nnueRefreshNeeded = true;
 
-    char board[3*RANK_NB+1][8*FILE_NB+2];
-    std::memset(board, ' ', sizeof(board));
-    for (int row = 0; row < 3*pos.ranks()+1; ++row)
-      board[row][8*FILE_NB+1] = '\0';
+    const int boardRows = 3 * pos.ranks() + 1;
+    const int boardCols = 8 * pos.files() + 2;
+    std::vector<std::string> board(boardRows, std::string(boardCols - 1, ' '));
+    for (auto& row : board)
+      row.push_back('\0');
 
     // A lambda to output one box of the board
     auto writeSquare = [&board, &pos](File file, Rank rank, Piece pc, Value value) {
@@ -316,7 +348,7 @@ namespace Stockfish::Eval::NNUE {
       if (pc != NO_PIECE)
         board[y+1][x+4] = pos.piece_to_char()[pc];
       if (value != VALUE_NONE)
-        format_cp_compact(value, &board[y+2][x+2]);
+        format_cp_compact(value, board[y+2].data() + x + 2);
     };
 
     // We estimate the value of each piece by doing a differential evaluation from
@@ -335,8 +367,6 @@ namespace Stockfish::Eval::NNUE {
 
         if (pc != NO_PIECE && type_of(pc) != pos.nnue_king())
         {
-          auto st = pos.state();
-
           pos.remove_piece(sq);
           st->accumulator.computed[WHITE] = false;
           st->accumulator.computed[BLACK] = false;
@@ -355,10 +385,13 @@ namespace Stockfish::Eval::NNUE {
 
     ss << " NNUE derived piece values:\n";
     for (int row = 0; row < 3*pos.ranks()+1; ++row)
-        ss << board[row] << '\n';
+        ss << board[row].c_str() << '\n';
     ss << '\n';
 
     auto t = trace_evaluate(pos);
+    st->nnueRefreshNeeded = savedRefreshNeeded;
+    st->accumulator.computed[WHITE] = false;
+    st->accumulator.computed[BLACK] = false;
 
     ss << " NNUE network contributions "
        << (pos.side_to_move() == WHITE ? "(White to move)" : "(Black to move)") << std::endl
@@ -396,8 +429,11 @@ namespace Stockfish::Eval::NNUE {
   bool load_eval(std::string name, std::istream& stream) {
 
     initialize();
-    fileName = name;
-    return read_parameters(stream);
+    bool loaded = read_parameters(stream);
+    fileName = loaded ? name : std::string();
+    if (!loaded)
+        netDescription.clear();
+    return loaded;
   }
 
   // Save eval, to a file stream or a memory stream
@@ -414,6 +450,12 @@ namespace Stockfish::Eval::NNUE {
 
     std::string actualFilename;
     std::string msg;
+
+    if (fileName.empty())
+    {
+        sync_cout << "Failed to export a net" << sync_endl;
+        return false;
+    }
 
     if (filename.has_value())
         actualFilename = filename.value();

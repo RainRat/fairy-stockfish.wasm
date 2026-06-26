@@ -418,19 +418,22 @@ class TBTables {
     };
 
     static constexpr int Size = 1 << 12; // 4K table, indexed by key's 12 lsb
-    static constexpr int Overflow = 1;  // Number of elements allowed to map to the last bucket
 
-    Entry hashTable[Size + Overflow];
+    Entry hashTable[Size];
 
     std::deque<TBTable<WDL>> wdlTable;
     std::deque<TBTable<DTZ>> dtzTable;
+
+    static uint32_t probe_distance(uint32_t homeBucket, uint32_t bucket) {
+        return (bucket - homeBucket) & (Size - 1);
+    }
 
     void insert(Key key, TBTable<WDL>* wdl, TBTable<DTZ>* dtz) {
         uint32_t homeBucket = (uint32_t)key & (Size - 1);
         Entry entry{ key, wdl, dtz };
 
-        // Ensure last element is empty to avoid overflow when looking up
-        for (uint32_t bucket = homeBucket; bucket < Size + Overflow - 1; ++bucket) {
+        for (uint32_t dist = 0; dist < Size; ++dist) {
+            uint32_t bucket = (homeBucket + dist) & (Size - 1);
             Key otherKey = hashTable[bucket].key;
             if (otherKey == key || !hashTable[bucket].get<WDL>()) {
                 hashTable[bucket] = entry;
@@ -440,10 +443,11 @@ class TBTables {
             // Robin Hood hashing: If we've probed for longer than this element,
             // insert here and search for a new spot for the other element instead.
             uint32_t otherHomeBucket = (uint32_t)otherKey & (Size - 1);
-            if (otherHomeBucket > homeBucket) {
+            if (probe_distance(otherHomeBucket, bucket) < dist) {
                 std::swap(entry, hashTable[bucket]);
                 key = otherKey;
                 homeBucket = otherHomeBucket;
+                dist = probe_distance(homeBucket, bucket);
             }
         }
         std::cerr << "TB hash table size too low!" << std::endl;
@@ -453,10 +457,13 @@ class TBTables {
 public:
     template<TBType Type>
     TBTable<Type>* get(Key key) {
-        for (const Entry* entry = &hashTable[(uint32_t)key & (Size - 1)]; ; ++entry) {
+        uint32_t homeBucket = (uint32_t)key & (Size - 1);
+        for (uint32_t dist = 0; dist < Size; ++dist) {
+            const Entry* entry = &hashTable[(homeBucket + dist) & (Size - 1)];
             if (entry->key == key || !entry->get<Type>())
                 return entry->get<Type>();
         }
+        return nullptr;
     }
 
     void clear() {
@@ -983,7 +990,7 @@ uint8_t* set_sizes(PairsData* d, uint8_t* data) {
 
     // groupLen[] is a zero-terminated list of group lengths, the last groupIdx[]
     // element stores the biggest index that is the tb size.
-    uint64_t tbSize = d->groupIdx[std::find(d->groupLen, d->groupLen + 7, 0) - d->groupLen];
+    uint64_t tbSize = d->groupIdx[std::find(d->groupLen, d->groupLen + TBPIECES + 1, 0) - d->groupLen];
 
     d->sizeofBlock = 1ULL << *data++;
     d->span = 1ULL << *data++;
@@ -1161,7 +1168,20 @@ void* mapped(TBTable<Type>& e, const Position& pos) {
     fname =  (e.key == pos.material_key() ? w + 'v' + b : b + 'v' + w)
            + (Type == WDL ? ".rtbw" : ".rtbz");
 
-    uint8_t* data = TBFile(fname).map(&e.baseAddress, &e.mapping, Type);
+    TBFile file(fname);
+
+    // WDL presence is checked at table-registration time, but DTZ files are
+    // optional. Treat a missing file as an unmapped table instead of asserting
+    // in TBFile::map() on debug builds.
+    if (!file.is_open())
+    {
+        e.baseAddress = nullptr;
+        e.mapping = 0;
+        e.ready.store(true, std::memory_order_release);
+        return nullptr;
+    }
+
+    uint8_t* data = file.map(&e.baseAddress, &e.mapping, Type);
 
     if (data)
         set(e, data);
@@ -1175,6 +1195,8 @@ Ret probe_table(const Position& pos, ProbeState* result, WDLScore wdl = WDLDraw)
 
     if (pos.count<ALL_PIECES>() == 2) // KvK
         return Ret(WDLDraw);
+
+    assert(pos.material_key_is_ok());
 
     TBTable<Type>* entry = TBTables.get<Type>(pos.material_key());
 
@@ -1494,7 +1516,7 @@ int Tablebases::probe_dtz(Position& pos, ProbeState* result) {
                       : -probe_dtz(pos, result);
 
         // If the move mates, force minDTZ to 1
-        if (dtz == 1 && pos.checkers() && MoveList<LEGAL>(pos).size() == 0)
+        if (dtz == 1 && pos.evasion_checkers() && MoveList<LEGAL>(pos).size() == 0)
             minDTZ = 1;
 
         // Convert result from 1-ply search. Zeroing moves are already accounted
@@ -1562,7 +1584,7 @@ bool Tablebases::root_probe(Position& pos, Search::RootMoves& rootMoves) {
         }
 
         // Make sure that a mating move is assigned a dtz value of 1
-        if (   pos.checkers()
+        if (   pos.evasion_checkers()
             && dtz == 2
             && MoveList<LEGAL>(pos).size() == 0)
             dtz = 1;

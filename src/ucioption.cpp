@@ -18,6 +18,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <ostream>
 #include <sstream>
 #include <iostream>
@@ -44,8 +47,22 @@ namespace PSQT {
 
 namespace UCI {
 
+namespace {
+
+bool parse_double_noexcept(const std::string& text, double& out) {
+    errno = 0;
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0' || errno == ERANGE)
+        return false;
+    out = parsed;
+    return true;
+}
+
+}
+
 // standard variants of XBoard/WinBoard
-std::set<string> standard_variants = {
+std::set<string, UCI::CaseInsensitiveLess> standard_variants = {
     "normal", "nocastle", "fischerandom", "knightmate", "3check", "makruk", "shatranj",
     "asean", "seirawan", "crazyhouse", "bughouse", "suicide", "giveaway", "losers", "atomic",
     "capablanca", "gothic", "janus", "caparandom", "grand", "shogi", "xiangqi", "duck",
@@ -53,6 +70,9 @@ std::set<string> standard_variants = {
 };
 
 void init_variant(const Variant* v) {
+    const bool useBoardSizeMagics = bool(Options["DynamicMagicsByBoardSize"]) || v->cylindrical || v->toroidal;
+    v->magicGeometry = Bitboards::init_magics(useBoardSizeMagics ? v->maxFile : FILE_MAX,
+                                              useBoardSizeMagics ? v->maxRank : RANK_MAX);
     pieceMap.init(v);
     Bitboards::init_pieces();
 }
@@ -63,9 +83,9 @@ void on_hash_size(const Option& o) { TT.resize(size_t(o)); }
 void on_logger(const Option& o) { start_logger(o); }
 void on_threads(const Option& o) { Threads.set(size_t(o)); }
 void on_tb_path(const Option& o) { Tablebases::init(o); }
+void on_variant_load_warnings(const Option& o) { variants.set_verbose_load_warnings(bool(o)); }
 
-void on_use_NNUE(const Option& ) { Eval::NNUE::init(); }
-void on_eval_file(const Option& ) { Eval::NNUE::init(); }
+void on_nnue_change(const Option& ) { Eval::NNUE::init(); }
 
 void on_variant_path(const Option& o) {
     std::stringstream ss((std::string)o);
@@ -80,7 +100,7 @@ void on_variant_set(const Option &o) {
     // Re-initialize NNUE
     Eval::NNUE::init();
 
-    const Variant* v = variants.find(o)->second;
+    const Variant* v = variants.get(o);
     init_variant(v);
     PSQT::init(v);
 }
@@ -88,7 +108,7 @@ void on_variant_change(const Option &o) {
     // Variant initialization
     on_variant_set(o);
 
-    const Variant* v = variants.find(o)->second;
+    const Variant* v = variants.get(o);
     // Do not send setup command for known variants
     if (standard_variants.find(o) != standard_variants.end())
         return;
@@ -109,7 +129,7 @@ void on_variant_change(const Option &o) {
         }
         // Send setup command
         sync_cout << "setup (" << v->pieceToCharTable << ") "
-                  << v->maxFile + 1 << "x" << v->maxRank + 1
+                  << v->maxFile + 1 << "x" << v->maxRank + 1 + ( v->commitGates ? 2 : 0 )
                   << "+" << pocketsize << "_" << v->variantTemplate
                   << " " << v->startFen
                   << sync_endl;
@@ -143,11 +163,11 @@ void on_variant_change(const Option &o) {
             {
                 if (pt == PAWN && !v->firstRankPawnDrops)
                     suffix += "j";
-                else if (pt == v->dropNoDoubled)
-                    suffix += std::string(v->dropNoDoubledCount, 'f');
+                else if (piece_set(pt) & v->dropNoDoubled.get(WHITE))
+                    suffix += std::string(v->dropNoDoubledCount.get(WHITE), 'f');
                 else if (pt == BISHOP && v->dropOppositeColoredBishop)
                     suffix += "s";
-                suffix += "@" + std::to_string(pt == PAWN && !v->promotionZonePawnDrops && v->promotionRegion[WHITE] ? rank_of(lsb(v->promotionRegion[WHITE])) : v->maxRank + 1);
+                suffix += "@" + std::to_string(pt == PAWN && !v->promotionZonePawnDrops && bool(v->promotionRegion[WHITE]) ? rank_of(lsb(static_cast<Bitboard>(v->promotionRegion[WHITE]))) : v->maxRank + 1);
             }
             sync_cout << "piece " << v->pieceToChar[pt] << "& " << pieceMap.find(pt == KING ? v->kingType : pt)->second->betza << suffix << sync_endl;
             PieceType promType = v->promotedPieceType[pt];
@@ -170,7 +190,10 @@ void on_variant_change(const Option &o) {
 bool CaseInsensitiveLess::operator() (const string& s1, const string& s2) const {
 
   return std::lexicographical_compare(s1.begin(), s1.end(), s2.begin(), s2.end(),
-         [](char c1, char c2) { return tolower(c1) < tolower(c2); });
+         [](char c1, char c2) {
+             return std::tolower(static_cast<unsigned char>(c1))
+                  < std::tolower(static_cast<unsigned char>(c2));
+         });
 }
 
 
@@ -181,11 +204,12 @@ void init(OptionsMap& o) {
   constexpr int MaxHashMB = Is64Bit ? 33554432 : 2048;
 
   o["Debug Log File"]        << Option("", on_logger);
-  o["Threads"]               << Option(1, 1, 512, on_threads);
+  o["Threads"]               << Option(1, 1, 1024, on_threads);
   o["Hash"]                  << Option(16, 1, MaxHashMB, on_hash_size);
   o["Clear Hash"]            << Option(on_clear_hash);
   o["Ponder"]                << Option(false);
   o["MultiPV"]               << Option(1, 1, 500);
+  o["Verbosity"]             << Option(1, 0, 2);
   o["Skill Level"]           << Option(20, -20, 20);
   o["Move Overhead"]         << Option(10, 0, 5000);
   o["Slow Mover"]            << Option(100, 10, 1000);
@@ -200,14 +224,16 @@ void init(OptionsMap& o) {
   o["SyzygyProbeDepth"]      << Option(1, 1, 100);
   o["Syzygy50MoveRule"]      << Option(true);
   o["SyzygyProbeLimit"]      << Option(7, 0, 7);
-  o["Use NNUE"]              << Option(true, on_use_NNUE);
+  o["Use NNUE"]              << Option(true, on_nnue_change);
 #ifndef NNUE_EMBEDDING_OFF
-  o["EvalFile"]              << Option(EvalFileDefaultName, on_eval_file);
+  o["EvalFile"]              << Option(EvalFileDefaultName, on_nnue_change);
 #else
-  o["EvalFile"]              << Option("<empty>", on_eval_file);
+  o["EvalFile"]              << Option("<empty>", on_nnue_change);
 #endif
   o["TsumeMode"]             << Option(false);
+  o["VerboseVariantLoadWarnings"] << Option(false, on_variant_load_warnings);
   o["VariantPath"]           << Option("<empty>", on_variant_path);
+  o["DynamicMagicsByBoardSize"] << Option(false);
   o["usemillisec"]           << Option(true); // time unit for UCCI
 }
 
@@ -301,7 +327,11 @@ Option::Option(double v, int minv, int maxv, OnChange f) : type("spin"), min(min
 
 Option::operator double() const {
   assert(type == "check" || type == "spin");
-  return (type == "spin" ? stof(currentValue) : currentValue == "true");
+  if (type != "spin")
+      return currentValue == "true";
+
+  double parsed = 0.0;
+  return parse_double_noexcept(currentValue, parsed) ? parsed : 0.0;
 }
 
 Option::operator std::string() const {
@@ -340,10 +370,13 @@ Option& Option::operator=(const string& v) {
 
   assert(!type.empty());
 
+  double parsedSpin = 0.0;
+  const bool invalidSpin = type == "spin" && (!parse_double_noexcept(v, parsedSpin) || parsedSpin < min || parsedSpin > max);
+
   if (   (type != "button" && v.empty())
       || (type == "check" && v != "true" && v != "false")
       || (type == "combo" && (std::find(comboValues.begin(), comboValues.end(), v) == comboValues.end()))
-      || (type == "spin" && (stof(v) < min || stof(v) > max)))
+      || invalidSpin)
       return *this;
 
   if (type == "combo")

@@ -41,3 +41,6 @@ src/*.txt
 # IDEs
 .vscode
 .idea
+
+# Local tooling for Fairyground compatibility helper
+/node_modules
