@@ -114,7 +114,11 @@ struct ScopedSpellContext {
   ScopedSpellContext(Bitboard freezeExtra, Bitboard jumpRemoved)
       : prev(current_spell_context() ? *current_spell_context() : SpellContext()),
         prevActive(current_spell_context() && current_spell_context()->active()),
-        ctx(freezeExtra, jumpRemoved),
+        // Nested move-generation and legality checks must retain any
+        // persistent effect already being evaluated while adding the new
+        // compound move's effect.
+        ctx((current_spell_context() ? current_spell_context()->freezeExtra : Bitboard(0)) | freezeExtra,
+            (current_spell_context() ? current_spell_context()->jumpRemoved : Bitboard(0)) | jumpRemoved),
         active(ctx.active()) {
     if (active)
       set_current_spell_context(&ctx);
