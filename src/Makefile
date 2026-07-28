@@ -94,11 +94,11 @@ endif
 
 
 ### 2.1. General and architecture defaults
-largeboards = no
+largeboards = yes
 verylargeboards = no
-all = no
+all = yes
 precomputedmagics = yes
-nnue = no
+nnue = yes
 load_net = $(if $(filter $(nnue),yes),net)
 
 ifeq ($(ARCH),)
@@ -110,7 +110,8 @@ endif
 ifeq ($(ARCH), $(filter $(ARCH), \
                  x86-64-vnni512 x86-64-vnni256 x86-64-avx512 x86-64-bmi2 x86-64-avx2 \
                  x86-64-sse41-popcnt x86-64-modern x86-64-ssse3 x86-64-sse3-popcnt \
-                 x86-64 ppc-64 e2k armv8 apple-silicon general-64))
+                 x86-64 x86-32-sse41-popcnt x86-32-sse2 x86-32 ppc-64 ppc-32 e2k \
+                 armv7 armv7-neon armv8 apple-silicon general-64 general-32 wasm))
    SUPPORTED_ARCH=true
 else
    SUPPORTED_ARCH=false
@@ -277,6 +278,10 @@ ifeq ($(findstring e2k,$(ARCH)),e2k)
 	ssse3 = yes
 	sse41 = yes
 	popcnt = yes
+endif
+
+ifeq ($(ARCH),wasm)
+include emscripten/Makefile
 endif
 
 endif
@@ -866,9 +871,10 @@ config-sanity: $(load_net)
 	@test "$(debug)" = "yes" || test "$(debug)" = "no"
 	@test "$(optimize)" = "yes" || test "$(optimize)" = "no"
 	@test "$(SUPPORTED_ARCH)" = "true"
-	@test "$(arch)" = "any" || test "$(arch)" = "x86_64" || test "$(arch)" = "ppc64" || \
-	 test "$(arch)" = "e2k" || test "$(arch)" = "armv8" || test "$(arch)" = "arm64"
-	@test "$(bits)" = "64"
+	@test "$(arch)" = "any" || test "$(arch)" = "x86_64" || test "$(arch)" = "i386" || \
+	 test "$(arch)" = "ppc64" || test "$(arch)" = "ppc" || test "$(arch)" = "e2k" || \
+	 test "$(arch)" = "armv7" || test "$(arch)" = "armv8" || test "$(arch)" = "arm64" || test "$(arch)" = "wasm"
+	@test "$(bits)" = "32" || test "$(bits)" = "64"
 	@test "$(prefetch)" = "yes" || test "$(prefetch)" = "no"
 	@test "$(popcnt)" = "yes" || test "$(popcnt)" = "no"
 	@test "$(pext)" = "yes" || test "$(pext)" = "no"

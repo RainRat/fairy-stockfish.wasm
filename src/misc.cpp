@@ -66,9 +66,28 @@ namespace Stockfish {
 
 namespace {
 
+#if defined(__EMSCRIPTEN__)
+
+#define MACRO_STRINGIFY_INTERNAL(X) #X
+#define MACRO_STRINGIFY(X) MACRO_STRINGIFY_INTERNAL(X)
+
+const string Version =
+  "["
+  "commit: "      MACRO_STRINGIFY(EM_COMMIT) ", "
+  "upstream: "    MACRO_STRINGIFY(EM_UPSTREAM) ", "
+  "emscripten: "  MACRO_STRINGIFY(EM_EMSCRIPTEN)
+  "]";
+
+#undef MACRO_STRINGIFY
+#undef MACRO_STRINGIFY_INTERNAL
+
+#else
+
 /// Version number. If Version is left empty, then compile date in the format
 /// DD-MM-YY and show in engine_info.
 const string Version = "";
+
+#endif
 
 /// Our fancy logging facility. The trick here is to replace cin.rdbuf() and
 /// cout.rdbuf() with two Tie objects that tie cin and cout to a file stream. We
@@ -410,6 +429,8 @@ void* std_aligned_alloc(size_t alignment, size_t size) {
   return posix_memalign(&mem, alignment, roundedSize) ? nullptr : mem;
 #elif defined(_WIN32)
   return _mm_malloc(roundedSize, alignment);
+#elif defined(__EMSCRIPTEN__)
+  return aligned_alloc(alignment, roundedSize);
 #else
   return aligned_alloc(alignment, roundedSize);
 #endif
@@ -624,6 +645,9 @@ string binaryDirectory;  // path of the executable directory
 string workingDirectory; // path of the working directory
 
 void init(int argc, char* argv[]) {
+#ifdef __EMSCRIPTEN__
+    return;
+#endif
     string pathSeparator;
 
     // extract the path+name of the executable binary
