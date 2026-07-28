@@ -83,6 +83,22 @@ namespace {
         return {token, s.substr(token.size() + 1)};
     }
 
+    bool parse_bounded_decimal(const std::string& value, int maximum, int& result) {
+        if (value.empty())
+            return false;
+        int parsed = 0;
+        for (unsigned char c : value)
+        {
+            int digit = c - '0';
+            if (!std::isdigit(c) || parsed > maximum / 10
+                || (parsed == maximum / 10 && digit > maximum % 10))
+                return false;
+            parsed = parsed * 10 + digit;
+        }
+        result = parsed;
+        return true;
+    }
+
     template <typename Apply>
     void parse_color_triplet(const Config& config, const std::string& key, Apply&& apply) {
         if (config.find(key) != config.end())
@@ -93,6 +109,31 @@ namespace {
         const std::string blackKey = key + "Black";
         if (config.find(blackKey) != config.end())
             apply(blackKey, BLACK);
+    }
+
+    bool parse_laser_outcome(const std::string& outcome_str, Variant::LaserOutcome& outcome, bool DoCheck, const std::string& key) {
+        if (outcome_str == "D") outcome = Variant::OUTCOME_DESTROY;
+        else if (outcome_str == "C") outcome = Variant::OUTCOME_DESTROY_CONTINUE;
+        else if (outcome_str == "S") outcome = Variant::OUTCOME_ABSORB;
+        else if (outcome_str == "T") outcome = Variant::OUTCOME_TRANSMIT;
+        else if (outcome_str == "R") outcome = Variant::OUTCOME_REFLECT_RIGHT;
+        else if (outcome_str == "L") outcome = Variant::OUTCOME_REFLECT_LEFT;
+        else if (outcome_str == "B") outcome = Variant::OUTCOME_REFLECT_BACK;
+        else if (outcome_str == "X") outcome = Variant::OUTCOME_SPLIT;
+        else if (outcome_str == "F") outcome = Variant::OUTCOME_EXIT_FACE;
+        else if (outcome_str == "Y") outcome = Variant::OUTCOME_SPLIT_FORWARD_RIGHT;
+        else if (outcome_str == "Z") outcome = Variant::OUTCOME_SPLIT_FORWARD_LEFT;
+        else if (outcome_str == "G") outcome = Variant::OUTCOME_EXIT_BACK_FACE;
+        else if (outcome_str == "I" || outcome_str == "In") outcome = Variant::OUTCOME_PORTAL_IN;
+        else if (outcome_str == "O" || outcome_str == "Out") outcome = Variant::OUTCOME_PORTAL_OUT;
+        else if (outcome_str == "P" || outcome_str == "Bidirectional") outcome = Variant::OUTCOME_PORTAL_BIDIRECTIONAL;
+        else
+        {
+            if (DoCheck)
+                std::cerr << key << " - Invalid laser outcome: " << outcome_str << std::endl;
+            return false;
+        }
+        return true;
     }
 
     PieceType parse_piece_type_token(const Variant* v, const std::string& token) {
@@ -566,6 +607,15 @@ namespace {
         return parse_named_value(value, target, values);
     }
 
+    template <> bool set(const std::string& value, LibertyAction& target) {
+        static constexpr auto values = std::array{
+            std::pair{"none", LibertyAction::NONE},
+            std::pair{"remove", LibertyAction::REMOVE},
+            std::pair{"forbid", LibertyAction::FORBID},
+        };
+        return parse_named_value(value, target, values);
+    }
+
     template <> bool set(const std::string& value, PointsRule& target) {
         static constexpr auto values = std::array{
             std::pair{"us", POINTS_US},
@@ -858,11 +908,8 @@ namespace {
         PieceSet parsed[PIECE_TYPE_NB];
         std::copy(v->hostageExchange, v->hostageExchange + PIECE_TYPE_NB, parsed);
         bool sawGroup = false;
-        while (std::getline(groups, group, ' '))
+        while (groups >> group)
         {
-            group = trim(group);
-            if (group.empty())
-                continue;
             sawGroup = true;
             auto [token, rest] = split_piece_entry(group);
             PieceType from = parse_piece_type_token(v, token);
@@ -992,6 +1039,7 @@ template <bool Current, class T> bool VariantParser<DoCheck>::parse_attribute(co
                                   : std::is_same_v<T, CastlingRights> ? "CastlingRights"
                                   : std::is_same_v<T, ColorChangeTrigger> ? "ColorChangeTrigger"
                                   : std::is_same_v<T, EnPassantPassedSquares> ? "EnPassantPassedSquares"
+                                  : std::is_same_v<T, LibertyAction> ? "LibertyAction"
                                   : std::is_same_v<T, WallingRule> ? "WallingRule"
                                   : std::is_same_v<T, std::vector<int>> ? "vector<int>"
                                   : typeid(T).name();
@@ -1015,8 +1063,13 @@ template <bool Current, class T> bool VariantParser<DoCheck>::parse_attribute(co
         if constexpr (std::is_same_v<T, PieceSet>)
         {
             PieceSet parsedTarget = NO_PIECE_SET;
-            if (parse_piece_set_token_string(it->second, v, parsedTarget))
+            // For extinctionMustAppear, '*' is an aggregate activation gate,
+            // rather than the expanded set of every concrete piece type.
+            bool aggregateExtinctionAppearance = key == "extinctionMustAppear" && trim(it->second) == "*";
+            if (aggregateExtinctionAppearance || parse_piece_set_token_string(it->second, v, parsedTarget))
             {
+                if (aggregateExtinctionAppearance)
+                    parsedTarget = piece_set(ALL_PIECES);
                 target = parsedTarget;
                 return true;
             }
@@ -1172,6 +1225,13 @@ bool VariantParser<DoCheck>::parse_color_setting_first_piece(const std::string& 
 
 template <bool DoCheck>
 bool VariantParser<DoCheck>::parse_piece_types(Variant* v) {
+    for (Color c : {WHITE, BLACK})
+    {
+        Bitboard region = 0;
+        if (parse_attribute("mobilityRegion" + std::string(c == WHITE ? "White" : "Black"), region))
+            for (PieceType pt = PAWN; pt <= KING; ++pt)
+                v->mobilityRegion[c][pt] = region;
+    }
     for (PieceType pt = PAWN; pt <= KING; ++pt)
     {
         if (pt == CUSTOM_PIECES_ROYAL)
@@ -1185,66 +1245,87 @@ bool VariantParser<DoCheck>::parse_piece_types(Variant* v) {
         if (keyValue != config.end() && !keyValue->second.empty())
         {
             auto [token, rest] = split_piece_entry(keyValue->second);
-            if (!token.empty())
+            const bool remove = trim(keyValue->second) == "-";
+            if (remove)
+                v->remove_piece(pt);
+            else if (!token.empty())
                 v->add_piece(pt, token);
             else
             {
-                if (keyValue->second.at(0) == '-')
-                    v->remove_piece(pt);
-                else
-                {
-                    if (DoCheck)
-                        std::cerr << name << " - Invalid letter: " << keyValue->second.at(0) << std::endl;
-                    return false;
-                }
-            }
-            // betza
-            if (is_custom(pt))
-            {
-                if (!rest.empty())
-                {
-                    if (!validate_custom_piece_betza_structure(rest, name))
-                        return false;
-                    if (!validate_custom_piece_betza(rest, name, v))
-                        return false;
-                    v->customPiece[pt - CUSTOM_PIECES] = rest;
-                    // Is there an en passant flag in the Betza notation?
-                    if (v->customPiece[pt - CUSTOM_PIECES].find('e') != std::string::npos)
-                    {
-                        v->enPassantTypes[WHITE] |= piece_set(pt);
-                        v->enPassantTypes[BLACK] |= piece_set(pt);
-                    }
-                }
-                else
-                {
-                    if (DoCheck)
-                        std::cerr << name << " - Missing Betza move notation" << std::endl;
-                    return false;
-                }
-            }
-            else if (pt != KING && !rest.empty())
-            {
                 if (DoCheck)
-                    std::cerr << name << " only supports a piece letter here. Use customPieceN = "
-                              << keyValue->second << " and remap " << name << " to that letter instead." << std::endl;
+                    std::cerr << name << " - Invalid syntax." << std::endl;
                 return false;
             }
-            else if (pt == KING)
+
+            if (remove)
             {
-                if (!rest.empty())
+                if (pt == KING)
                 {
-                    if (!validate_custom_piece_betza_structure(rest, name))
-                        return false;
-                    if (!validate_custom_piece_betza(rest, name, v))
-                        return false;
-                    // custom royal piece
-                    v->add_piece(CUSTOM_PIECES_ROYAL, token);
-                    v->customPiece[CUSTOM_PIECES_ROYAL - CUSTOM_PIECES] = rest;
-                    v->kingType = CUSTOM_PIECES_ROYAL;
-                    v->castlingKingPiece[WHITE] = v->castlingKingPiece[BLACK] = CUSTOM_PIECES_ROYAL;
+                    // A removed king definition must also remove the reserved
+                    // custom-royal slot used by king = <symbol>:<Betza>.
+                    v->remove_piece(CUSTOM_PIECES_ROYAL);
+                    v->kingType = NO_PIECE_TYPE;
+                    v->castlingKingPiece = NO_PIECE_TYPE;
                 }
-                else
-                    v->kingType = KING;
+            }
+            else
+            {
+                // betza
+                if (is_custom(pt))
+                {
+                    if (!rest.empty())
+                    {
+                        if (!validate_custom_piece_betza_structure(rest, name))
+                            return false;
+                        if (!validate_custom_piece_betza(rest, name, v))
+                            return false;
+                        v->customPiece[pt - CUSTOM_PIECES] = rest;
+                        for (Color c : {WHITE, BLACK})
+                            v->enPassantTypes[c] &= ~piece_set(pt);
+                        // Is there an en passant flag in the Betza notation?
+                        if (v->customPiece[pt - CUSTOM_PIECES].find('e') != std::string::npos)
+                        {
+                            v->enPassantTypes[WHITE] |= piece_set(pt);
+                            v->enPassantTypes[BLACK] |= piece_set(pt);
+                        }
+                    }
+                    else
+                    {
+                        if (DoCheck)
+                            std::cerr << name << " - Missing Betza move notation" << std::endl;
+                        return false;
+                    }
+                }
+                else if (pt != KING && !rest.empty())
+                {
+                    if (DoCheck)
+                        std::cerr << name << " only supports a piece letter here. Use customPieceN = "
+                                  << keyValue->second << " and remap " << name << " to that letter instead." << std::endl;
+                    return false;
+                }
+                else if (pt == KING)
+                {
+                    if (!rest.empty())
+                    {
+                        if (!validate_custom_piece_betza_structure(rest, name))
+                            return false;
+                        if (!validate_custom_piece_betza(rest, name, v))
+                            return false;
+                        // custom royal piece
+                        v->add_piece(CUSTOM_PIECES_ROYAL, token);
+                        v->customPiece[CUSTOM_PIECES_ROYAL - CUSTOM_PIECES] = rest;
+                        v->kingType = CUSTOM_PIECES_ROYAL;
+                        v->castlingKingPiece[WHITE] = v->castlingKingPiece[BLACK] = CUSTOM_PIECES_ROYAL;
+                    }
+                    else
+                    {
+                        v->remove_piece(CUSTOM_PIECES_ROYAL);
+                        v->kingType = KING;
+                        for (Color c : {WHITE, BLACK})
+                            if (v->castlingKingPiece[c] == CUSTOM_PIECES_ROYAL)
+                                v->castlingKingPiece[c] = KING;
+                    }
+                }
             }
         }
         // mobility region
@@ -1285,14 +1366,14 @@ bool VariantParser<DoCheck>::parse_piece_values(Variant* v) {
                 if (points < 0)
                 {
                     if (DoCheck)
-                        std::cerr << "piecePoints - Negative value clamped to 0." << std::endl;
-                    points = 0;
+                        std::cerr << "piecePoints - Invalid negative value: " << points << "." << std::endl;
+                    return false;
                 }
                 else if (points > MAX_PIECE_POINTS)
                 {
                     if (DoCheck)
-                        std::cerr << "piecePoints - Value exceeds MAX_PIECE_POINTS and was clamped." << std::endl;
-                    points = MAX_PIECE_POINTS;
+                        std::cerr << "piecePoints - Value exceeds MAX_PIECE_POINTS (" << MAX_PIECE_POINTS << "): " << points << "." << std::endl;
+                    return false;
                 }
                 parsed[pt] = points;
             }
@@ -1348,7 +1429,190 @@ bool VariantParser<DoCheck>::parse_legacy_attributes(Variant* v) {
 
 template <bool DoCheck>
 bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
-    // Parse the official config options
+    parse_attribute("laserGame", v->laserGame);
+    parse_attribute("laserDiagonal", v->laserDiagonal);
+    parse_attribute("laserAutoFire", v->laserAutoFire);
+    parse_attribute("laserRotationPathFilter", v->laserRotationPathFilter);
+    parse_attribute("laserFireAnyRotation", v->laserFireAnyRotation);
+    parse_attribute("laserFireSelectedEmitter", v->laserFireSelectedEmitter);
+    parse_attribute("laserRotationRequiresAction", v->laserRotationRequiresAction);
+    parse_attribute("rotationDelta", v->rotationDelta);
+    parse_attribute("rotationTwoWay", v->rotationTwoWay);
+    parse_attribute("laserEmitterOrientationOffset", v->laserEmitterOrientationOffset);
+    auto portal_fallback = config.find("laserPortalFallback");
+    if (portal_fallback != config.end())
+    {
+        Variant::LaserOutcome outcome;
+        if (!parse_laser_outcome(portal_fallback->second, outcome, DoCheck, "laserPortalFallback")
+            || outcome == Variant::OUTCOME_PORTAL_IN
+            || outcome == Variant::OUTCOME_PORTAL_OUT
+            || outcome == Variant::OUTCOME_PORTAL_BIDIRECTIONAL)
+        {
+            if (DoCheck)
+                std::cerr << "laserPortalFallback must be a non-portal laser outcome." << std::endl;
+            return false;
+        }
+        v->laserPortalFallback = outcome;
+    }
+    if (v->rotationDelta < 0 || v->rotationDelta > 3
+        || v->laserEmitterOrientationOffset < 0 || v->laserEmitterOrientationOffset > 3)
+    {
+        if (DoCheck)
+            std::cerr << "Laser orientation offsets must be in [0, 3]." << std::endl;
+        return false;
+    }
+    for (Color c : {WHITE, BLACK})
+    {
+        const std::string key = c == WHITE ? "rotationAllowedOrientationsWhite"
+                                           : "rotationAllowedOrientationsBlack";
+        auto it = config.find(key);
+        if (it == config.end())
+            continue;
+        std::istringstream iss(it->second);
+        std::string entry;
+        while (iss >> entry)
+        {
+            size_t colon = entry.find(':');
+            if (colon == std::string::npos || colon == 0 || colon == entry.size() - 1)
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Malformed entry: " << entry << std::endl;
+                return false;
+            }
+            PieceType base = colon == std::string::npos ? NO_PIECE_TYPE
+                                                        : parse_piece_type_token(v, entry.substr(0, colon));
+            std::string values = colon == std::string::npos ? "" : entry.substr(colon + 1);
+            if (base == NO_PIECE_TYPE || values.empty())
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Malformed entry: " << entry << std::endl;
+                return false;
+            }
+            for (char value : values)
+            {
+                if (value < '0' || value > '3')
+                {
+                    if (DoCheck)
+                        std::cerr << key << " - Invalid orientation: " << value << std::endl;
+                    return false;
+                }
+                v->rotationAllowedOrientations[c][base] |= uint8_t(1u << (value - '0'));
+            }
+        }
+    }
+
+    for (Color c : {WHITE, BLACK})
+    {
+        const std::string key = c == WHITE ? "laserPromotionOrientationWhite" : "laserPromotionOrientationBlack";
+        auto it = config.find(key);
+        if (it == config.end())
+            continue;
+        std::istringstream iss(it->second);
+        std::string entry;
+        while (iss >> entry)
+        {
+            size_t colon = entry.find(':');
+            PieceType pt = colon == std::string::npos ? NO_PIECE_TYPE
+                                                      : parse_piece_type_token(v, entry.substr(0, colon));
+            std::string orient = colon == std::string::npos ? "" : entry.substr(colon + 1);
+            if (pt == NO_PIECE_TYPE || orient.size() != 1 || orient[0] < '0' || orient[0] > '3')
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Malformed entry: " << entry << std::endl;
+                return false;
+            }
+            v->laserPromotionOrientation[c][pt] = orient[0] - '0';
+            v->hasLaserPromotionOrientation[c][pt] = true;
+        }
+    }
+    parse_attribute("orientedPieceTypes", v->orientedPieceTypes, v);
+    parse_attribute("rotateAfterMove", v->rotateAfterMove);
+
+    auto it_orients = config.find("orientationCounts");
+    if (it_orients != config.end())
+    {
+        std::istringstream iss(it_orients->second);
+        std::string entry;
+        while (iss >> entry)
+        {
+            size_t colon = entry.find(':');
+            if (colon == std::string::npos || colon == 0 || colon == entry.size() - 1)
+            {
+                if (DoCheck)
+                    std::cerr << "orientationCounts - Malformed entry: " << entry << std::endl;
+                return false;
+            }
+            std::string sym = entry.substr(0, colon);
+            std::string count_str = entry.substr(colon + 1);
+            PieceType pt = parse_piece_type_token(v, sym);
+            if (pt == NO_PIECE_TYPE)
+            {
+                if (DoCheck)
+                    std::cerr << "orientationCounts - Unknown piece symbol: " << sym << std::endl;
+                return false;
+            }
+            int count;
+            if (!parse_bounded_decimal(count_str, 4, count) || count < 1)
+            {
+                if (DoCheck)
+                    std::cerr << "orientationCounts - Invalid orientation count: " << count_str << std::endl;
+                return false;
+            }
+            v->orientationCounts[pt] = count;
+        }
+    }
+
+    // Validate semantic references after orientation counts are known.
+    for (Color c : {WHITE, BLACK})
+    {
+        const std::string rotationKey = c == WHITE ? "rotationAllowedOrientationsWhite"
+                                                   : "rotationAllowedOrientationsBlack";
+        auto rotationIt = config.find(rotationKey);
+        if (rotationIt != config.end())
+        {
+            std::istringstream iss(rotationIt->second);
+            std::string entry;
+            while (iss >> entry)
+            {
+                size_t colon = entry.find(':');
+                PieceType base = parse_piece_type_token(v, entry.substr(0, colon));
+                std::string values = entry.substr(colon + 1);
+                int count = v->orientationCounts[base] > 0 ? v->orientationCounts[base] : 4;
+                if (!(v->orientedPieceTypes & base)
+                    || std::any_of(values.begin(), values.end(), [&](char value) {
+                           return value - '0' >= count;
+                       }))
+                {
+                    if (DoCheck)
+                        std::cerr << rotationKey << " - Invalid oriented piece entry: " << entry << std::endl;
+                    return false;
+                }
+            }
+        }
+
+        const std::string promotionKey = c == WHITE ? "laserPromotionOrientationWhite"
+                                                    : "laserPromotionOrientationBlack";
+        auto promotionIt = config.find(promotionKey);
+        if (promotionIt != config.end())
+        {
+            std::istringstream iss(promotionIt->second);
+            std::string entry;
+            while (iss >> entry)
+            {
+                size_t colon = entry.find(':');
+                PieceType base = parse_piece_type_token(v, entry.substr(0, colon));
+                int orientation = entry[colon + 1] - '0';
+                int count = v->orientationCounts[base] > 0 ? v->orientationCounts[base] : 4;
+                if (!(v->orientedPieceTypes & base) || orientation >= count)
+                {
+                    if (DoCheck)
+                        std::cerr << promotionKey << " - Invalid oriented piece entry: " << entry << std::endl;
+                    return false;
+                }
+            }
+        }
+    }
+
     parse_attribute("variantTemplate", v->variantTemplate);
     parse_attribute("pieceToCharTable", v->pieceToCharTable);
     parse_attribute("pocketSize", v->pocketSize);
@@ -1429,6 +1693,34 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("blastOnSelfDestruct", v->blastOnSelfDestruct);
     parse_attribute("selfDestructTypes", v->selfDestructTypes, v);
     parse_attribute("blastPromotion", v->blastPromotion);
+    const bool hasLegacyBlastShape = config.count("blastDiagonals")
+                                  || config.count("blastOrthogonals")
+                                  || config.count("blastCenter");
+    std::string blastPattern = v->blastPattern;
+    if (parse_attribute("blastPattern", blastPattern))
+    {
+        blastPattern = trim(blastPattern);
+        if (blastPattern == "-")
+            v->blastPattern.clear();
+        else
+        {
+            std::vector<std::pair<int, int>> offsets;
+            bool includeCenter = false;
+            if (hasLegacyBlastShape || !parse_blast_pattern(blastPattern, offsets, includeCenter))
+            {
+                if (DoCheck)
+                    std::cerr << "blastPattern must use symmetric leaper atoms or tuple leapers, with an optional trailing '*', and cannot be combined with legacy blast shape options." << std::endl;
+                return false;
+            }
+            v->blastPattern = blastPattern;
+        }
+    }
+    else if (hasLegacyBlastShape && !v->blastPattern.empty())
+    {
+        if (DoCheck)
+            std::cerr << "Legacy blast shape options cannot override an inherited blastPattern; set blastPattern = - to select the legacy shape." << std::endl;
+        return false;
+    }
     parse_attribute("blastDiagonals", v->blastDiagonals);
     parse_attribute("blastCenter", v->blastCenter);
     parse_attribute("blastOnCaptureMoverCenter", v->blastOnCaptureMoverCenter);
@@ -1451,8 +1743,8 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("removeConnectN", v->removeConnectN);
     if (v->removeConnectN < 0 || v->removeConnectN > int(SQUARE_NB)) {
         if (DoCheck)
-            std::cerr << "removeConnectN - Value must be in range [0, " << int(SQUARE_NB) << "]. Clamping." << std::endl;
-        v->removeConnectN = std::clamp(v->removeConnectN, 0, int(SQUARE_NB));
+            std::cerr << "removeConnectN - Value must be in range [0, " << int(SQUARE_NB) << "]." << std::endl;
+        return false;
     }
     parse_attribute("removeConnectNByType", v->removeConnectNByType);
     parse_attribute("surroundCaptureOpposite", v->surroundCaptureOpposite);
@@ -1460,6 +1752,8 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("surroundCaptureEdge", v->surroundCaptureEdge);
     parse_attribute("surroundCaptureMaxRegion", v->surroundCaptureMaxRegion);
     parse_attribute("surroundCaptureHostileRegion", v->surroundCaptureHostileRegion);
+    parse_attribute("libertyCapture", v->libertyCapture);
+    parse_attribute("libertySelfCapture", v->libertySelfCapture);
     parse_attribute("doubleStep", v->doubleStep);
     parse_color_setting("doubleStepRegion", v->doubleStepRegion);
     parse_color_setting("tripleStepRegion", v->tripleStepRegion);
@@ -1469,6 +1763,7 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("castling", v->castling);
     parse_attribute("castlingDroppedPiece", v->castlingDroppedPiece);
     parse_attribute("castlingPromotedPiece", v->castlingPromotedPiece);
+    parse_attribute("castlingIgnoreCheck", v->castlingIgnoreCheck);
     parse_attribute("castlingForbiddenPlies", v->castlingForbiddenPlies);
     parse_attribute("castlingKingsideFile", v->castlingKingsideFile);
     parse_attribute("castlingQueensideFile", v->castlingQueensideFile);
@@ -1482,6 +1777,7 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("checking", v->checking);
     parse_attribute("allowChecks", v->allowChecks);
     parse_attribute("royalPieceNoThroughCheck", v->royalPieceNoThroughCheck);
+    parse_attribute("checkedRoyalsIgnoreFreeze", v->checkedRoyalsIgnoreFreeze);
     parse_color_setting("dropChecks", v->dropChecks);
     parse_color_setting("dropMates", v->dropMates);
     parse_color_setting("mustCapture", v->mustCapture);
@@ -1506,6 +1802,9 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("pushNoImmediateReturn", v->pushNoImmediateReturn);
     parse_attribute("stepwisePushing", v->stepwisePushing);
     parse_attribute("adjacentSwapMoveTypes", v->adjacentSwapMoveTypes, v);
+    parse_attribute("adjacentSwapTargetTypes", v->adjacentSwapTargetTypes, v);
+    parse_attribute("adjacentSwapFriendly", v->adjacentSwapFriendly);
+    parse_attribute("adjacentSwapDiagonal", v->adjacentSwapDiagonal);
     parse_attribute("adjacentSwapRequiresEmptyNeighbor", v->adjacentSwapRequiresEmptyNeighbor);
     parse_attribute("swapNoImmediateReturn", v->swapNoImmediateReturn);
     parse_attribute("swapForbiddenPlies", v->swapForbiddenPlies);
@@ -1566,6 +1865,13 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("captureDrops", v->captureDrops, v);
     if (!parse_color_setting_piece("dropNoDoubled", v->dropNoDoubled, v)) return false;
     parse_color_setting("dropNoDoubledCount", v->dropNoDoubledCount);
+    for (Color c : {WHITE, BLACK})
+        if (v->dropNoDoubledCount.get(c) < 0)
+        {
+            if (DoCheck)
+                std::cerr << "dropNoDoubledCount - Invalid negative value." << std::endl;
+            return false;
+        }
     parse_attribute("freeDrops", v->freeDrops);
     parse_attribute("payPointsToDrop", v->payPointsToDrop);
     parse_attribute("potions", v->potions);
@@ -1573,6 +1879,14 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("jumpPotion", v->potionPiece[Variant::POTION_JUMP], v);
     parse_attribute("freezeCooldown", v->potionCooldown[Variant::POTION_FREEZE]);
     parse_attribute("jumpCooldown", v->potionCooldown[Variant::POTION_JUMP]);
+    for (int cooldown : v->potionCooldown)
+        if (cooldown < 0 || cooldown > (1 << POTION_COOLDOWN_BITS))
+        {
+            if (DoCheck)
+                std::cerr << "Potion cooldown must be between 0 and "
+                          << (1 << POTION_COOLDOWN_BITS) << "." << std::endl;
+            return false;
+        }
     if (v->potionPiece[Variant::POTION_FREEZE] != NO_PIECE_TYPE
         && v->potionPiece[Variant::POTION_FREEZE] == v->potionPiece[Variant::POTION_JUMP])
     {
@@ -1597,8 +1911,8 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     if (v->cloneMoveTypes & PAWN)
     {
         if (DoCheck)
-            std::cerr << "cloneMoveTypes - PAWN is not supported for clone moves and will be ignored." << std::endl;
-        v->cloneMoveTypes &= ~piece_set(PAWN);
+            std::cerr << "cloneMoveTypes - PAWN is not supported for clone moves." << std::endl;
+        return false;
     }
     parse_attribute("forcedJumpContinuation", v->forcedJumpContinuation);
     parse_attribute("forcedJumpSameDirection", v->forcedJumpSameDirection);
@@ -1607,6 +1921,7 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     parse_attribute("diagonalLines", v->diagonalLines);
     parse_color_setting("pass", v->pass);
     parse_color_setting("passOnStalemate", v->passOnStalemate);
+    parse_attribute("doublePassEndsGame", v->doublePassEndsGame);
     parse_attribute("passUntilSetup", v->passUntilSetup);
     if (!parse_multimoves(v))
         return false;
@@ -1679,7 +1994,8 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
         v->pseudoRoyalTypes = v->extinctionPieceTypes;
         v->pseudoRoyalCount = v->extinctionPieceCount + 1;
     }
-    if (!parse_color_setting_piece("flagPiece", v->flagPiece, v)) return false;
+    if (!parse_color_setting_piece("flagPiece", v->flagPieceTypes, v)) return false;
+    if (!parse_color_setting_piece("flagPieceTypes", v->flagPieceTypes, v)) return false;
     parse_color_setting("flagRegion", v->flagRegion);
     parse_attribute("flagPieceCount", v->flagPieceCount);
     parse_attribute("flagPieceBlockedWin", v->flagPieceBlockedWin);
@@ -1721,14 +2037,236 @@ bool VariantParser<DoCheck>::parse_official_options(Variant* v) {
     if (v->payPointsToDrop)
         v->pointsCounting = true;
 
-    // Report invalid options
-    if (DoCheck)
+    auto it_stacked_pt = config.find("stackedPieceType");
+    if (it_stacked_pt != config.end())
+    {
+        if (!parse_piece_type_map(it_stacked_pt->second, v, v->stackedPieceType))
+        {
+            if (DoCheck)
+                std::cerr << "stackedPieceType - Invalid syntax." << std::endl;
+            return false;
+        }
+    }
+    std::fill(std::begin(v->unstackedPieceType), std::end(v->unstackedPieceType), NO_PIECE_TYPE);
+    v->stackingPieceTypes = v->stackedPieceTypes = NO_PIECE_SET;
+    for (PieceType base = PAWN; base < PIECE_TYPE_NB; ++base)
+    {
+        PieceType result = v->stackedPieceType[base];
+        if (result == NO_PIECE_TYPE)
+            continue;
+        if (result == base || v->stackedPieceType[result] != NO_PIECE_TYPE
+            || v->unstackedPieceType[result] != NO_PIECE_TYPE)
+        {
+            if (DoCheck)
+                std::cerr << "stackedPieceType - Result types must be distinct and unique." << std::endl;
+            return false;
+        }
+        v->unstackedPieceType[result] = base;
+        v->stackingPieceTypes |= base;
+        v->stackedPieceTypes |= result;
+    }
+
+    auto it_emitters = config.find("laserEmitters");
+    if (it_emitters != config.end())
+    {
+        bool hasPieceEmitter = false;
+        std::string val = it_emitters->second;
+        std::istringstream iss(val);
+        std::string token;
+        while (std::getline(iss, token, ','))
+        {
+            token = trim(token);
+            if (token.rfind("piece:", 0) == 0)
+            {
+                if (hasPieceEmitter)
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Multiple piece emitters are not supported." << std::endl;
+                    return false;
+                }
+                hasPieceEmitter = true;
+                std::string symbol = token.substr(6);
+                v->emitterPieceType = parse_piece_type_token(v, symbol);
+                if (v->emitterPieceType == NO_PIECE_TYPE)
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Unknown piece symbol: " << symbol << std::endl;
+                    return false;
+                }
+                if (!v->is_oriented(v->emitterPieceType))
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Piece emitter must be an oriented piece type: "
+                                  << symbol << std::endl;
+                    return false;
+                }
+            }
+            else
+            {
+                Color explicitColor = COLOR_NB;
+                if (token.rfind("white@", 0) == 0)
+                    explicitColor = WHITE, token.erase(0, 6);
+                else if (token.rfind("black@", 0) == 0)
+                    explicitColor = BLACK, token.erase(0, 6);
+                size_t colon = token.find(':');
+                if (colon == std::string::npos || colon < 2)
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Malformed token: " << token << std::endl;
+                    return false;
+                }
+                std::string sq_str = token.substr(0, colon);
+                std::string dir_str = token.substr(colon + 1);
+                std::string rank_str = sq_str.size() > 1 ? sq_str.substr(1) : "";
+                int rankNumber;
+                if (sq_str.size() < 2 || sq_str[0] < 'a' || sq_str[0] > 'z'
+                    || !parse_bounded_decimal(rank_str, RANK_NB, rankNumber)
+                    || rankNumber < 1)
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Invalid square coordinates: " << sq_str << std::endl;
+                    return false;
+                }
+                File f = File(sq_str[0] - 'a');
+                int rank = rankNumber - 1;
+                if (rank < 0 || rank >= RANK_NB)
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Invalid square coordinates: " << sq_str << std::endl;
+                    return false;
+                }
+                Rank r = Rank(rank);
+                if (f > v->maxFile || r > v->maxRank)
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Square out of board bounds: " << sq_str << std::endl;
+                    return false;
+                }
+                int dir;
+                if (!parse_bounded_decimal(dir_str, 3, dir))
+                {
+                    if (DoCheck)
+                        std::cerr << "laserEmitters - Invalid direction: " << dir_str << std::endl;
+                    return false;
+                }
+                Square sq = make_square(f, r);
+                Color c = explicitColor != COLOR_NB ? explicitColor
+                                                     : (rank_of(sq) > v->maxRank / 2 ? BLACK : WHITE);
+                v->staticEmitters[c].push_back(sq);
+                v->staticEmitterDirs[c].push_back(v->laserDiagonal ? (dir == 0 ? NORTH_EAST : dir == 1 ? SOUTH_EAST : dir == 2 ? SOUTH_WEST : NORTH_WEST) : (dir == 0 ? NORTH : dir == 1 ? EAST : dir == 2 ? SOUTH : WEST));
+            }
+        }
+    }
+
+    if (!v->laserAutoFire && v->emitterPieceType == NO_PIECE_TYPE
+        && (!v->staticEmitters[WHITE].empty() || !v->staticEmitters[BLACK].empty()))
+    {
+        if (DoCheck)
+            std::cerr << "laserAutoFire = false requires a piece laser emitter." << std::endl;
+        return false;
+    }
+    if (v->laserFireSelectedEmitter
+        && (!v->staticEmitters[WHITE].empty() || !v->staticEmitters[BLACK].empty()))
+    {
+        if (DoCheck)
+            std::cerr << "laserFireSelectedEmitter is incompatible with static laser emitters."
+                      << std::endl;
+        return false;
+    }
+
+    auto parse_optics = [&](const std::string& key, const std::string& val,
+                            Variant::LaserOptics& optics) {
+        std::istringstream iss(val);
+        std::string outcome_str;
+        int face = 0;
+        while (std::getline(iss, outcome_str, '/'))
+        {
+            if (face >= 4)
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Too many laser outcome faces: expected 4." << std::endl;
+                return false;
+            }
+            outcome_str.erase(0, outcome_str.find_first_not_of(" \t"));
+            outcome_str.erase(outcome_str.find_last_not_of(" \t") + 1);
+            Variant::LaserOutcome outcome;
+            if (!parse_laser_outcome(outcome_str, outcome, DoCheck, key))
+                return false;
+            optics.outcomes[face++] = outcome;
+        }
+        if (face != 4)
+        {
+            if (DoCheck)
+                std::cerr << key << " - Incomplete laser outcome faces: expected 4, got " << face << std::endl;
+            return false;
+        }
+        return true;
+    };
+
+    // 1. Parse base piece optics (keys without ':')
+    for (auto const& [key, val] : config)
+    {
+        if (key.rfind("laser_", 0) == 0 && key.find(':') == std::string::npos)
+        {
+            config.find(key);
+            std::string symbol = key.substr(6);
+            PieceType pt = parse_piece_type_token(v, symbol);
+            if (pt == NO_PIECE_TYPE)
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Unknown piece symbol: " << symbol << std::endl;
+                return false;
+            }
+            if (!parse_optics(key, val, v->pieceOptics[pt][0]))
+                return false;
+        }
+    }
+
+    // 2. A base optical definition applies to every orientation unless an
+    // orientation-specific key overrides it below.
+    for (PieceType pt = PAWN; pt <= CUSTOM_PIECES_END; ++pt)
+        if (v->orientedPieceTypes & pt)
+            for (int orientation = 1; orientation < v->orientation_count(pt); ++orientation)
+                v->pieceOptics[pt][orientation] = v->pieceOptics[pt][0];
+
+    // 3. Parse explicit orientation overrides (keys with ':')
+    for (auto const& [key, val] : config)
+    {
+        if (key.rfind("laser_", 0) == 0 && key.find(':') != std::string::npos)
+        {
+            config.find(key);
+            std::string symbol = key.substr(6);
+            size_t colon = symbol.find(':');
+            std::string base_symbol = symbol.substr(0, colon);
+            std::string orient_str = symbol.substr(colon + 1);
+            PieceType pt = parse_piece_type_token(v, base_symbol);
+            int orientation;
+            if (!parse_bounded_decimal(orient_str, 3, orientation) || pt == NO_PIECE_TYPE
+                || !(v->orientedPieceTypes & pt))
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Invalid oriented piece override." << std::endl;
+                return false;
+            }
+            int count = v->orientationCounts[pt] > 0 ? v->orientationCounts[pt] : 4;
+            if (orientation < 0 || orientation >= count)
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Orientation out of range: " << orientation << std::endl;
+                return false;
+            }
+            if (!parse_optics(key, val, v->pieceOptics[pt][orientation]))
+                return false;
+        }
+    }
+
+    // Unknown options are diagnosed but ignored so newer configs remain usable.
     {
         const std::set<std::string>& parsedKeys = config.get_consumed_keys();
         for (const auto& it : config)
             if (parsedKeys.find(it.first) == parsedKeys.end())
             {
-                std::cerr << "Invalid option: " << it.first << std::endl;
+                std::cerr << "Unknown option ignored: " << it.first << std::endl;
                 if (looks_like_piece_definition_value(it.second))
                     std::cerr << it.first << " looks like a custom piece definition. Use customPieceN = "
                               << it.second << " for new custom pieces." << std::endl;
@@ -1804,9 +2342,10 @@ bool VariantParser<DoCheck>::check_consistency(Variant* v) {
     }
 
     // Contradictory options
-    if (DoCheck && !v->checking && v->checkCounting)
+    if (!v->checking && v->checkCounting)
     {
-        std::cerr << "checkCounting=true requires checking=true." << std::endl;
+        if (DoCheck)
+            std::cerr << "checkCounting=true requires checking=true." << std::endl;
         valid = false;
     }
     if (DoCheck && !v->checking && v->allowChecks)
@@ -1892,6 +2431,23 @@ bool VariantParser<DoCheck>::check_consistency(Variant* v) {
             std::cerr << "pieceDrops and any walling are incompatible." << std::endl;
         valid = false;
     }
+    if ((v->libertyCapture != LibertyAction::NONE
+      || v->libertySelfCapture != LibertyAction::NONE)
+        && (!v->pieceDrops
+            || v->captureDrops
+            || v->symmetricDropTypes
+            || v->openingSwapDrop
+            || v->selfCapture
+            || v->selfCaptureTypes != NO_PIECE_SET
+            || v->selfCapture.get(WHITE)
+            || v->selfCapture.get(BLACK)
+            || v->selfCaptureTypes.get(WHITE) != NO_PIECE_SET
+            || v->selfCaptureTypes.get(BLACK) != NO_PIECE_SET))
+    {
+        if (DoCheck)
+            std::cerr << "libertyCapture/libertySelfCapture require ordinary single-piece drops onto empty squares." << std::endl;
+        valid = false;
+    }
     if (v->edgeInsertTypes && !v->pieceDrops)
     {
         if (DoCheck)
@@ -1911,11 +2467,10 @@ bool VariantParser<DoCheck>::check_consistency(Variant* v) {
             || v->captureDrops
             || v->symmetricDropTypes
             || v->twoBoards
-            || v->freeDrops
             || v->edgeInsertTypes))
     {
         if (DoCheck)
-            std::cerr << "openingSwapDrop is only supported for simple move-out mandatory drop variants without capture drops, paired drops, self capture, free drops, edge inserts, or two-board reserves." << std::endl;
+            std::cerr << "openingSwapDrop is only supported for simple move-out mandatory drop variants without capture drops, paired drops, self capture, edge inserts, or two-board reserves." << std::endl;
         valid = false;
     }
     if (v->openingSwapMirrorMainDiagonal
@@ -1927,11 +2482,38 @@ bool VariantParser<DoCheck>::check_consistency(Variant* v) {
         valid = false;
     }
 
+    bool hasCustomDropPieceTypes = false;
+    for (int pt = 0; pt < PIECE_TYPE_NB; ++pt)
+        if (v->dropPieceTypes[pt] != NO_PIECE_SET)
+            hasCustomDropPieceTypes = true;
+
+    if (v->symmetricDropTypes && (v->dropPromoted || hasCustomDropPieceTypes))
+    {
+        if (DoCheck)
+            std::cerr << "symmetricDropTypes is incompatible with dropPromoted or custom dropPieceTypes." << std::endl;
+        valid = false;
+    }
+
     bool hasGatingPieceAfter = false;
     for (Color c : {WHITE, BLACK})
         for (int i = 0; i < PIECE_TYPE_NB; ++i)
             if (v->gatingPieceAfter[c][i] != NO_PIECE_TYPE)
                 hasGatingPieceAfter = true;
+
+    if (v->laserGame && (v->gating || v->seirawanGating || v->commitGates
+                         || v->potions || hasGatingPieceAfter))
+    {
+        if (DoCheck)
+            std::cerr << "laserGame is incompatible with legacy gating, potions, and commit gates." << std::endl;
+        valid = false;
+    }
+
+    if (v->laserGame && (v->cylindrical || v->toroidal || v->hexBoard))
+    {
+        if (DoCheck)
+            std::cerr << "laserGame is not supported on wrapped or hexagonal boards." << std::endl;
+        valid = false;
+    }
 
     if (v->wallingRule != NO_WALLING && (v->seirawanGating || v->potions || v->gating || hasGatingPieceAfter))
     {
@@ -1976,13 +2558,19 @@ bool VariantParser<DoCheck>::check_consistency(Variant* v) {
         if (v->flipEnclosedPieces)
         {
             if (DoCheck)
+            {
                 std::cerr << "Can not use kings with flipEnclosedPieces." << std::endl;
+                std::cerr << "Reason: Flip processing recolors the KING, causing royal_square() assumptions to fail." << std::endl;
+            }
             valid = false;
         }
         if (v->wallingRule==DUCK)
         {
             if (DoCheck)
+            {
                 std::cerr << "Can not use kings with wallingRule = duck." << std::endl;
+                std::cerr << "Reason: Evasion generation does not support compound blocking with duck placement." << std::endl;
+            }
             valid = false;
         }
         // We can not fully check support for custom king movements at this point,
@@ -2052,7 +2640,7 @@ bool VariantParser<DoCheck>::check_consistency(Variant* v) {
                 std::cerr << "Can not use flagPieceSafe with blastOnCapture (flagPieceSafe uses simple assessment that does not see blast)." << std::endl;
             valid = false;
         }
-        if ((v->antiRoyalTypes & v->flagPiece.get(WHITE)) || (v->antiRoyalTypes & v->flagPiece.get(BLACK)))
+        if ((v->antiRoyalTypes & v->flagPieceTypes.get(WHITE)) || (v->antiRoyalTypes & v->flagPieceTypes.get(BLACK)))
         {
             if (DoCheck)
                 std::cerr << "Flag piece can not be anti-royal when flagPieceSafe is enabled." << std::endl;
@@ -2073,6 +2661,9 @@ Variant* VariantParser<DoCheck>::parse() {
 template <bool DoCheck>
 Variant* VariantParser<DoCheck>::parse(Variant* v) {
     parseHadError = false;
+    // Inherited variants carry derived caches from their parent. All parsing
+    // below must use the fields being mutated, not those stale caches.
+    v->concluded = false;
     int cfgMaxRank = -1;
     int cfgMaxFile = -1;
     const auto itRank = config.find("maxRank");
@@ -2147,6 +2738,11 @@ bool VariantParser<DoCheck>::parse_gating_piece_after(Variant* v) {
 template <bool DoCheck>
 bool VariantParser<DoCheck>::parse_capture_maps(Variant* v) {
     const bool hasCaptureForbidden = config.find("captureForbidden") != config.end();
+    auto sync_color_maps = [&]() {
+        for (Color c : { WHITE, BLACK })
+            std::copy(v->captureForbidden, v->captureForbidden + PIECE_TYPE_NB, v->captureForbiddenByColor[c]);
+    };
+    sync_color_maps();
     auto parse_capture_map = [&](const std::string& key, bool allow) {
         auto it = config.find(key);
         if (it == config.end())
@@ -2155,11 +2751,13 @@ bool VariantParser<DoCheck>::parse_capture_maps(Variant* v) {
         std::string entry;
         std::stringstream ss(it->second);
         PieceSet parsed[PIECE_TYPE_NB];
+        bool sawEntry = false;
         if (allow && !hasCaptureForbidden)
             std::fill(std::begin(parsed), std::end(parsed), v->pieceTypes);
         else
             std::copy(v->captureForbidden, v->captureForbidden + PIECE_TYPE_NB, parsed);
         while (ss >> entry) {
+            sawEntry = true;
             size_t sep = entry.find(':');
             if (sep == std::string::npos || sep == 0 || sep + 1 >= entry.size()) {
                 if (DoCheck)
@@ -2197,14 +2795,69 @@ bool VariantParser<DoCheck>::parse_capture_maps(Variant* v) {
                     parsed[attacker] |= targetSet;
             }
         }
+        if (!sawEntry)
+        {
+            if (DoCheck)
+                std::cerr << key << " - Empty value." << std::endl;
+            return false;
+        }
         std::copy(parsed, parsed + PIECE_TYPE_NB, v->captureForbidden);
+        sync_color_maps();
         return true;
     };
     if (!parse_capture_map("captureForbidden", false))
         return false;
     if (!parse_capture_map("captureAllowed", true))
         return false;
-    return true;
+
+    auto parse_color_capture_map = [&](const std::string& key, Color c, bool allow) {
+        auto it = config.find(key);
+        if (it == config.end())
+            return true;
+
+        bool sawEntry = false;
+        std::string entry;
+        std::stringstream ss(it->second);
+        PieceSet parsed[PIECE_TYPE_NB];
+        std::copy(v->captureForbiddenByColor[c], v->captureForbiddenByColor[c] + PIECE_TYPE_NB, parsed);
+        while (ss >> entry) {
+            sawEntry = true;
+            size_t sep = entry.find(':');
+            if (sep == std::string::npos || sep == 0 || sep + 1 >= entry.size()) {
+                if (DoCheck)
+                    std::cerr << key << " - Invalid mapping token: " << entry << std::endl;
+                return false;
+            }
+            PieceSet attackerSet = NO_PIECE_SET, targetSet = NO_PIECE_SET;
+            if (!parse_piece_set_token_string(entry.substr(0, sep), v, attackerSet, true, false)
+                || !parse_piece_set_token_string(entry.substr(sep + 1), v, targetSet, true, true)
+                || !attackerSet || !targetSet)
+            {
+                if (DoCheck)
+                    std::cerr << key << " - Invalid capture mapping: " << entry << std::endl;
+                return false;
+            }
+            for (PieceSet ps = attackerSet; ps; ) {
+                PieceType attacker = pop_lsb(ps);
+                if (allow)
+                    parsed[attacker] &= ~targetSet;
+                else
+                    parsed[attacker] |= targetSet;
+            }
+        }
+        if (!sawEntry)
+        {
+            if (DoCheck)
+                std::cerr << key << " - Empty value." << std::endl;
+            return false;
+        }
+        std::copy(parsed, parsed + PIECE_TYPE_NB, v->captureForbiddenByColor[c]);
+        return true;
+    };
+    return parse_color_capture_map("captureForbiddenWhite", WHITE, false)
+        && parse_color_capture_map("captureForbiddenBlack", BLACK, false)
+        && parse_color_capture_map("captureAllowedWhite", WHITE, true)
+        && parse_color_capture_map("captureAllowedBlack", BLACK, true);
 }
 
 template <bool DoCheck>
@@ -2289,6 +2942,12 @@ bool VariantParser<DoCheck>::parse_priority_drops(Variant* v) {
         }
         else if (sawToken)
             v->isPriorityDrop = parsedPriorityDrops;
+        else
+        {
+            if (DoCheck)
+                std::cerr << "priorityDropTypes - Empty value." << std::endl;
+            return false;
+        }
     }
     return true;
 }
@@ -2307,21 +2966,32 @@ bool VariantParser<DoCheck>::parse_multimoves(Variant* v) {
                 return false;
             }
     }
-    if (DoCheck)
+    int64_t firstMultimove = v->multimoves.size() >= 2 ? v->multimoves[v->multimoves.size() - 2]
+                           : v->multimoves.size() == 1 ? v->multimoves.back() : 1;
+    int64_t secondMultimove = v->multimoves.empty() ? 1 : v->multimoves.back();
+    int64_t cycle = 2 * firstMultimove - 1 + 2 * secondMultimove - 1;
+    if (cycle <= 0 || cycle > std::numeric_limits<int>::max())
     {
-        int usedPly = 0;
-        size_t usedEntries = 0;
-        for (int n : v->multimoves)
-        {
-            int segment = 2 * n - 1;
-            if (segment <= 0 || usedPly + segment >= START_MULTIMOVES)
-                break;
-            usedPly += segment;
-            ++usedEntries;
-        }
-        if (usedEntries < v->multimoves.size())
-            std::cerr << "multimoves - start pattern exceeds START_MULTIMOVES (" << START_MULTIMOVES
-                      << "), tail entries will be ignored." << std::endl;
+        if (DoCheck)
+            std::cerr << "multimoves - Derived cycle exceeds the supported int range." << std::endl;
+        return false;
+    }
+
+    int64_t usedPly = 0;
+    size_t usedEntries = 0;
+    for (int n : v->multimoves)
+    {
+        int64_t segment = 2 * int64_t(n) - 1;
+        if (segment <= 0 || usedPly + segment >= START_MULTIMOVES)
+            break;
+        usedPly += segment;
+        ++usedEntries;
+    }
+    if (usedEntries < v->multimoves.size())
+    {
+        if (DoCheck)
+            std::cerr << "multimoves - start pattern exceeds START_MULTIMOVES (" << START_MULTIMOVES << ")." << std::endl;
+        return false;
     }
     return true;
 }

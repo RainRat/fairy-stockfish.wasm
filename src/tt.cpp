@@ -35,6 +35,8 @@ TranspositionTable TT; // Our global transposition table
 
 void TTEntry::save(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev) {
 
+  assert(m == MOVE_NONE || is_ok(m));
+
   // Preserve any existing move for the same position
   if (m || TTKey(k) != keyTag)
       storedMove = TTMove(m);
@@ -42,7 +44,7 @@ void TTEntry::save(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev) 
   // Overwrite less valuable entries (cheapest checks first)
   if (b == BOUND_EXACT
       || TTKey(k) != keyTag
-      || d - DEPTH_OFFSET > depth8 - 4)
+      || d - DEPTH_OFFSET > int(depth8) - 4)
   {
       assert(d > DEPTH_OFFSET);
       assert(d < 256 + DEPTH_OFFSET);
@@ -65,10 +67,19 @@ void TranspositionTable::resize(size_t mbSize) {
   Threads.main()->wait_for_search_finished();
 
   aligned_large_pages_free(table);
+  table = nullptr;
 
-  clusterCount = mbSize * 1024 * 1024 / sizeof(Cluster);
+  clusterCount = std::max<size_t>(1, mbSize * 1024 * 1024 / sizeof(Cluster));
 
   table = static_cast<Cluster*>(aligned_large_pages_alloc(clusterCount * sizeof(Cluster)));
+  if (!table && mbSize > 1)
+  {
+      std::cerr << "Failed to allocate " << mbSize
+                << "MB for transposition table; falling back to 1MB." << std::endl;
+      clusterCount = std::max<size_t>(1, 1024 * 1024 / sizeof(Cluster));
+      table = static_cast<Cluster*>(aligned_large_pages_alloc(clusterCount * sizeof(Cluster)));
+  }
+
   if (!table)
   {
       std::cerr << "Failed to allocate " << mbSize
@@ -86,19 +97,20 @@ void TranspositionTable::resize(size_t mbSize) {
 void TranspositionTable::clear() {
 
   std::vector<std::thread> threads;
+  const size_t threadCount = size_t(Options["Threads"]);
 
-  for (size_t idx = 0; idx < Options["Threads"]; ++idx)
+  for (size_t idx = 0; idx < threadCount; ++idx)
   {
-      threads.emplace_back([this, idx]() {
+      threads.emplace_back([this, idx, threadCount]() {
 
           // Thread binding gives faster search on systems with a first-touch policy
-          if (Options["Threads"] > 8)
+          if (threadCount > 8)
               WinProcGroup::bindThisThread(idx);
 
           // Each thread will zero its part of the hash table
-          const size_t stride = size_t(clusterCount / Options["Threads"]),
+          const size_t stride = size_t(clusterCount / threadCount),
                        start  = size_t(stride * idx),
-                       len    = idx != Options["Threads"] - 1 ?
+                       len    = idx != threadCount - 1 ?
                                 stride : clusterCount - start;
 
           std::memset(&table[start], 0, len * sizeof(Cluster));

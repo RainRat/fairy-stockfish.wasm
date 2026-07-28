@@ -19,10 +19,10 @@
 // Code for calculating NNUE evaluation function
 
 #include <fstream>
-#include <iomanip>
+#include <cmath>
 #include <iostream>
 #include <new>
-#include <set>
+#include <cstring>
 #include <sstream>
 #include <vector>
 
@@ -37,6 +37,8 @@
 namespace Stockfish::Eval::NNUE {
 
   constexpr std::uint32_t MaxDescriptionLength = 4096;
+  constexpr std::uint64_t StackAlignment = CacheLineSize;
+  constexpr std::size_t TraceCellWidth = 12;
 
   // Input feature converter
   LargePagePtr<FeatureTransformer> featureTransformer;
@@ -95,6 +97,56 @@ namespace Stockfish::Eval::NNUE {
   }
 
   }  // namespace Detail
+
+  namespace {
+
+  static std::size_t compute_bucket(const Position& pos) {
+    int maxPieces = currentNnueVariant->nnueMaxPieces;
+    if (maxPieces <= 0)
+        return 0;
+    return std::min((pos.count<ALL_PIECES>() - 1) * 8 / maxPieces, 7);
+  }
+
+  static void append_trace_cell(std::ostream& os, const std::string& text) {
+    if (text.size() >= TraceCellWidth)
+    {
+      os << text;
+      return;
+    }
+
+    const std::size_t leftPad = (TraceCellWidth - text.size()) / 2;
+    const std::size_t rightPad = TraceCellWidth - text.size() - leftPad;
+    os << std::string(leftPad, ' ') << text << std::string(rightPad, ' ');
+  }
+
+  struct EvalBuffers {
+#if defined(ALIGNAS_ON_STACK_VARIABLES_BROKEN)
+    TransformedFeatureType transformedFeaturesUnaligned[
+      FeatureTransformer::BufferSize + StackAlignment / sizeof(TransformedFeatureType)];
+    char bufferUnaligned[Network::BufferSize + StackAlignment];
+
+    TransformedFeatureType* transformedFeatures;
+    char* buffer;
+
+    EvalBuffers()
+      : transformedFeatures(align_ptr_up<StackAlignment>(&transformedFeaturesUnaligned[0]))
+      , buffer(align_ptr_up<StackAlignment>(&bufferUnaligned[0]))
+    {
+      ASSERT_ALIGNED(transformedFeatures, StackAlignment);
+      ASSERT_ALIGNED(buffer, StackAlignment);
+    }
+#else
+    alignas(StackAlignment) TransformedFeatureType transformedFeatures[FeatureTransformer::BufferSize];
+    alignas(StackAlignment) char buffer[Network::BufferSize];
+
+    EvalBuffers() {
+      ASSERT_ALIGNED(transformedFeatures, StackAlignment);
+      ASSERT_ALIGNED(buffer, StackAlignment);
+    }
+#endif
+  };
+
+  }  // namespace
 
   // Initialize the evaluation function parameters
   void initialize() {
@@ -166,42 +218,23 @@ namespace Stockfish::Eval::NNUE {
 
   // Evaluation function. Perform differential calculation.
   Value evaluate(const Position& pos, bool adjusted) {
+    EvalBuffers buffers;
 
-    // We manually align the arrays on the stack because with gcc < 9.3
-    // overaligning stack variables with alignas() doesn't work correctly.
+    const std::size_t bucket = compute_bucket(pos);
+    const auto psqt = featureTransformer->transform(pos, buffers.transformedFeatures, bucket);
+    const auto output = network[bucket]->propagate(buffers.transformedFeatures, buffers.buffer);
 
-    constexpr uint64_t alignment = CacheLineSize;
+    int psqtVal = psqt;
+    int positionalVal = output[0];
 
-#if defined(ALIGNAS_ON_STACK_VARIABLES_BROKEN)
-    TransformedFeatureType transformedFeaturesUnaligned[
-      FeatureTransformer::BufferSize + alignment / sizeof(TransformedFeatureType)];
-    char bufferUnaligned[Network::BufferSize + alignment];
+    int delta_npm = std::abs(pos.non_pawn_material(WHITE) - pos.non_pawn_material(BLACK));
+    // When the difference in non-pawn material is small, we slightly bias towards positional evaluation
+    int npmCloseBonus = (adjusted && delta_npm <= BishopValueMg - KnightValueMg ? 7 : 0);
 
-    auto* transformedFeatures = align_ptr_up<alignment>(&transformedFeaturesUnaligned[0]);
-    auto* buffer = align_ptr_up<alignment>(&bufferUnaligned[0]);
-#else
-    alignas(alignment)
-      TransformedFeatureType transformedFeatures[FeatureTransformer::BufferSize];
-    alignas(alignment) char buffer[Network::BufferSize];
-#endif
+    int materialScale = 128 - npmCloseBonus;
+    int positionalScale = 128 + npmCloseBonus;
 
-    ASSERT_ALIGNED(transformedFeatures, alignment);
-    ASSERT_ALIGNED(buffer, alignment);
-
-    const std::size_t bucket = std::min((pos.count<ALL_PIECES>() - 1) * 8 / currentNnueVariant->nnueMaxPieces, 7);
-    const auto psqt = featureTransformer->transform(pos, transformedFeatures, bucket);
-    const auto output = network[bucket]->propagate(transformedFeatures, buffer);
-
-    int materialist = psqt;
-    int positional  = output[0];
-
-    int delta_npm = abs(pos.non_pawn_material(WHITE) - pos.non_pawn_material(BLACK));
-    int entertainment = (adjusted && delta_npm <= BishopValueMg - KnightValueMg ? 7 : 0);
-
-    int A = 128 - entertainment;
-    int B = 128 + entertainment;
-
-    int sum = (A * materialist + B * positional) / 128;
+    int sum = (materialScale * psqtVal + positionalScale * positionalVal) / 128;
 
     return static_cast<Value>( sum / OutputScale );
   }
@@ -215,33 +248,13 @@ namespace Stockfish::Eval::NNUE {
   };
 
   static NnueEvalTrace trace_evaluate(const Position& pos) {
-
-    // We manually align the arrays on the stack because with gcc < 9.3
-    // overaligning stack variables with alignas() doesn't work correctly.
-
-    constexpr uint64_t alignment = CacheLineSize;
-
-#if defined(ALIGNAS_ON_STACK_VARIABLES_BROKEN)
-    TransformedFeatureType transformedFeaturesUnaligned[
-      FeatureTransformer::BufferSize + alignment / sizeof(TransformedFeatureType)];
-    char bufferUnaligned[Network::BufferSize + alignment];
-
-    auto* transformedFeatures = align_ptr_up<alignment>(&transformedFeaturesUnaligned[0]);
-    auto* buffer = align_ptr_up<alignment>(&bufferUnaligned[0]);
-#else
-    alignas(alignment)
-      TransformedFeatureType transformedFeatures[FeatureTransformer::BufferSize];
-    alignas(alignment) char buffer[Network::BufferSize];
-#endif
-
-    ASSERT_ALIGNED(transformedFeatures, alignment);
-    ASSERT_ALIGNED(buffer, alignment);
+    EvalBuffers buffers;
 
     NnueEvalTrace t{};
-    t.correctBucket = std::min((pos.count<ALL_PIECES>() - 1) * 8 / currentNnueVariant->nnueMaxPieces, 7);
+    t.correctBucket = compute_bucket(pos);
     for (std::size_t bucket = 0; bucket < LayerStacks; ++bucket) {
-      const auto psqt = featureTransformer->transform(pos, transformedFeatures, bucket);
-      const auto output = network[bucket]->propagate(transformedFeatures, buffer);
+      const auto psqt = featureTransformer->transform(pos, buffers.transformedFeatures, bucket);
+      const auto output = network[bucket]->propagate(buffers.transformedFeatures, buffers.buffer);
 
       int materialist = psqt;
       int positional  = output[0];
@@ -259,6 +272,7 @@ namespace Stockfish::Eval::NNUE {
     buffer[0] = (v < 0 ? '-' : v > 0 ? '+' : ' ');
 
     int cp = std::abs(100 * v / PawnValueEg);
+    if (cp > 99999) cp = 99999;
 
     if (cp >= 10000)
     {
@@ -279,7 +293,7 @@ namespace Stockfish::Eval::NNUE {
       buffer[1] = '0' + cp / 100; cp %= 100;
       buffer[2] = '.';
       buffer[3] = '0' + cp / 10; cp %= 10;
-      buffer[4] = '0' + cp / 1;
+      buffer[4] = '0' + cp;
     }
   }
 
@@ -288,6 +302,7 @@ namespace Stockfish::Eval::NNUE {
     buffer[0] = (v < 0 ? '-' : v > 0 ? '+' : ' ');
 
     int cp = std::abs(100 * v / PawnValueEg);
+    if (cp > 99999) cp = 99999;
 
     if (cp >= 10000)
     {
@@ -298,23 +313,15 @@ namespace Stockfish::Eval::NNUE {
       buffer[5] = '0' + cp / 10; cp %= 10;
       buffer[6] = '0' + cp;
     }
-    else if (cp >= 1000)
+    else
     {
       buffer[1] = ' ';
-      buffer[2] = '0' + cp / 1000; cp %= 1000;
+      buffer[2] = (cp >= 1000 ? '0' + cp / 1000 : ' ');
+      if (cp >= 1000) cp %= 1000;
       buffer[3] = '0' + cp / 100; cp %= 100;
       buffer[4] = '.';
       buffer[5] = '0' + cp / 10; cp %= 10;
       buffer[6] = '0' + cp;
-    }
-    else
-    {
-      buffer[1] = ' ';
-      buffer[2] = ' ';
-      buffer[3] = '0' + cp / 100; cp %= 100;
-      buffer[4] = '.';
-      buffer[5] = '0' + cp / 10; cp %= 10;
-      buffer[6] = '0' + cp / 1;
     }
   }
 
@@ -351,6 +358,11 @@ namespace Stockfish::Eval::NNUE {
         format_cp_compact(value, board[y+2].data() + x + 2);
     };
 
+    auto invalidate = [&st] {
+      st->accumulator.computed[WHITE] = false;
+      st->accumulator.computed[BLACK] = false;
+    };
+
     // We estimate the value of each piece by doing a differential evaluation from
     // the current base eval, simulating the removal of the piece from its square.
     Value base = evaluate(pos);
@@ -368,36 +380,49 @@ namespace Stockfish::Eval::NNUE {
         if (pc != NO_PIECE && type_of(pc) != pos.nnue_king())
         {
           pos.remove_piece(sq);
-          st->accumulator.computed[WHITE] = false;
-          st->accumulator.computed[BLACK] = false;
+          invalidate();
 
           Value eval = evaluate(pos);
           eval = pos.side_to_move() == WHITE ? eval : -eval;
           v = base - eval;
 
           pos.put_piece(pc, sq, isPromoted, unpromotedPc);
-          st->accumulator.computed[WHITE] = false;
-          st->accumulator.computed[BLACK] = false;
+          invalidate();
         }
 
         writeSquare(f, r, pc, v);
       }
 
     ss << " NNUE derived piece values:\n";
-    for (int row = 0; row < 3*pos.ranks()+1; ++row)
+    for (int row = 0; row < boardRows; ++row)
         ss << board[row].c_str() << '\n';
     ss << '\n';
 
     auto t = trace_evaluate(pos);
     st->nnueRefreshNeeded = savedRefreshNeeded;
-    st->accumulator.computed[WHITE] = false;
-    st->accumulator.computed[BLACK] = false;
+    invalidate();
 
     ss << " NNUE network contributions "
        << (pos.side_to_move() == WHITE ? "(White to move)" : "(Black to move)") << std::endl
        << "+------------+------------+------------+------------+\n"
-       << "|   Bucket   |  Material  | Positional |   Total    |\n"
-       << "|            |   (PSQT)   |  (Layers)  |            |\n"
+       << "|";
+    append_trace_cell(ss, "Bucket");
+    ss << "|";
+    append_trace_cell(ss, "Material");
+    ss << "|";
+    append_trace_cell(ss, "Positional");
+    ss << "|";
+    append_trace_cell(ss, "Total");
+    ss << "|\n"
+       << "|";
+    append_trace_cell(ss, "");
+    ss << "|";
+    append_trace_cell(ss, "(PSQT)");
+    ss << "|";
+    append_trace_cell(ss, "(Layers)");
+    ss << "|";
+    append_trace_cell(ss, "");
+    ss << "|\n"
        << "+------------+------------+------------+------------+\n";
 
     for (std::size_t bucket = 0; bucket < LayerStacks; ++bucket)
@@ -409,11 +434,15 @@ namespace Stockfish::Eval::NNUE {
       format_cp_aligned_dot(t.positional[bucket], buffer[1]);
       format_cp_aligned_dot(t.psqt[bucket] + t.positional[bucket], buffer[2]);
 
-      ss <<  "|  " << bucket    << "        "
-         << " |  " << buffer[0] << "  "
-         << " |  " << buffer[1] << "  "
-         << " |  " << buffer[2] << "  "
-         << " |";
+      ss << "|";
+      append_trace_cell(ss, std::to_string(bucket));
+      ss << "|";
+      append_trace_cell(ss, buffer[0]);
+      ss << "|";
+      append_trace_cell(ss, buffer[1]);
+      ss << "|";
+      append_trace_cell(ss, buffer[2]);
+      ss << "|";
       if (bucket == t.correctBucket)
           ss << " <-- this bucket is used";
       ss << '\n';

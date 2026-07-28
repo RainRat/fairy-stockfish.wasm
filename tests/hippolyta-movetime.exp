@@ -1,0 +1,35 @@
+#!/usr/bin/expect -f
+
+set timeout 2
+
+source [file join [file dirname [file normalize [info script]]] expect_common.tcl]
+
+set engine [lindex $argv 0]
+if {$engine eq ""} {
+    set engine [fsx_default_engine]
+}
+
+spawn $engine
+send "uci\r"
+expect {
+    -re {uciok} {}
+    timeout {send_user "engine did not acknowledge uci\n"; exit 1}
+}
+send "setoption name VariantPath value [fsx_variants_ini]\r"
+expect {
+    -re {info string variant hippolyta} {}
+    timeout {}
+}
+send "setoption name UCI_Variant value hippolyta\r"
+expect {
+    -re {info string variant hippolyta} {}
+    timeout {send_user "hippolyta variant load timed out\n"; exit 1}
+}
+send "position startpos\r"
+send "go movetime 10\r"
+
+expect {
+    -re {bestmove } { send "quit\r"; exit 0 }
+    -re {currmove } { send_user "unexpected slow currmove output during movetime search\n"; send "quit\r"; exit 1 }
+    timeout { send_user "hippolyta movetime search did not finish promptly\n"; send "quit\r"; exit 1 }
+}

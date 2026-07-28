@@ -75,8 +75,17 @@ bool Bitbases::probe(Square wksq, Square wpsq, Square bksq, Color stm) {
   return false;
 #endif
 
+  assert(KPKBitbaseInitialized);
+
   if (!KPKBitbaseInitialized)
       return false;
+
+  if (file_of(wpsq) > FILE_D)
+  {
+      wpsq = flip_file(wpsq, FILE_H);
+      wksq = flip_file(wksq, FILE_H);
+      bksq = flip_file(bksq, FILE_H);
+  }
 
   assert(file_of(wpsq) <= FILE_D);
 

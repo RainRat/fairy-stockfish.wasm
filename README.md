@@ -1,17 +1,46 @@
-## fairy-stockfish-nnue.wasm
+# Fairy-Stockfish-X
 
-[![npm version](https://badge.fury.io/js/fairy-stockfish-nnue.wasm.svg)](https://badge.fury.io/js/fairy-stockfish-nnue.wasm)
-[![CI](https://github.com/ianfab/fairy-stockfish.wasm/actions/workflows/ci.yml/badge.svg)](https://github.com/ianfab/fairy-stockfish.wasm/actions/workflows/ci.yml)
+Fairy-Stockfish-X is an experimental version of [Fairy-Stockfish](https://github.com/fairy-stockfish/Fairy-Stockfish). It is used to test new features and support unique chess variants.
 
-WebAssembly port of [Fairy-Stockfish](https://github.com/ianfab/Fairy-Stockfish) with NNUE support, currently used by [pychess.org](https://www.pychess.org) for client-side analysis.
+## Usage in Chess GUIs
 
-See [fairy-stockfish-nnue-wasm-demo](https://github.com/ianfab/fairy-stockfish-nnue-wasm-demo) for a demo.
+Fairy-Stockfish-X can be used in any UCI-compatible chess GUI, such as [Cute Chess](https://cutechess.com/), Arena, or BanksiaGUI.
 
-For development, see [`src/emscripten/README.md`](src/emscripten/README.md).
+### Installation
 
-Current default branch is `nnue`.
+1. Download or [build](DEVELOPING.md#building-from-source) the Fairy-Stockfish-X binary.
+2. Add the engine to your GUI as a new UCI engine.
 
-To release a new version:
-* Make sure CI passes (update reference bench if required)
-* Bump version number in `src/emscripten/public/package.json`
-* Create and push a tag with the name corresponding to the version number
+### Loading Variants
+
+Fairy-Stockfish-X often requires two UCI options to be set in the GUI's engine configuration:
+
+- `VariantPath`: Set this to the path of the `variants.ini` file.
+- `UCI_Variant`: Set this to the name of the variant you want to play, such as `antichess`, `shogi`, or `atomic`.
+
+In most GUIs, these can be configured in the “Engine Settings” or “Edit Engine” dialog.
+
+### Move Notation
+
+The engine uses standard coordinate notation for moves.
+
+- Normal moves use the source and destination squares, such as `e2e4` or `g1f3`.
+- Promotions use a trailing piece character without an equals sign, such as `e7e8q`.
+- Drops use the piece letter, an `@` symbol, and the destination square, such as `P@b2`.
+
+## Documentation
+
+- **[DEVELOPING.md](DEVELOPING.md):** Build instructions, CLI usage, and bindings.
+- **[src/variants.ini](src/variants.ini):** Variant-specific settings and compatibility aliases.
+- **[dllbinding_usage.md](dllbinding_usage.md):** C API and shared-library usage.
+- **[AGENTS.md](AGENTS.md):** Development guidance for working on the codebase.
+
+## Purpose
+
+This project has three main goals:
+
+1. Test new features before they move to the main project.
+2. Provide a place to experiment with new ideas.
+3. Support chess variants that are too unusual for the standard engine.
+
+For standard functionality, please visit the [main Fairy-Stockfish repository](https://github.com/fairy-stockfish/Fairy-Stockfish).

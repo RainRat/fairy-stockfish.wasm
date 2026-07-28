@@ -18,8 +18,6 @@
 
 #include <algorithm>
 #include <iostream>
-#include <sstream>
-
 #include "types.h"
 #include "misc.h"
 #include "uci.h"
@@ -32,10 +30,25 @@ bool Tune::update_on_last;
 const UCI::Option* LastOption = nullptr;
 static std::map<std::string, int> TuneResults;
 
+namespace {
+
+void trim_in_place(string& text) {
+  const size_t first = text.find_first_not_of(" \t\n\r\f\v");
+  if (first == string::npos)
+  {
+      text.clear();
+      return;
+  }
+
+  const size_t last = text.find_last_not_of(" \t\n\r\f\v");
+  text = text.substr(first, last - first + 1);
+}
+
+} // namespace
+
 string Tune::next(string& names, bool pop) {
 
   string name;
-
   do {
       size_t comma = names.find(',');
       string token = names.substr(0, comma);
@@ -43,8 +56,8 @@ string Tune::next(string& names, bool pop) {
       if (pop)
           names.erase(0, comma == string::npos ? names.size() : comma + 1);
 
-      std::stringstream ws(token);
-      name += (ws >> token, token); // Remove trailing whitespace
+      trim_in_place(token);
+      name += token;
 
   } while (  std::count(name.begin(), name.end(), '(')
            - std::count(name.begin(), name.end(), ')'));

@@ -16,6 +16,7 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
 #include <string>
 #include <iostream>
 #include <fstream>
@@ -174,6 +175,7 @@ namespace {
         v->doubleStepRegion[BLACK].set('P', AllSquares);
         return v;
     }
+#ifdef ALLVARS // Spell Chess requires the expanded all-variants move list.
     Variant* spell_chess_variant() {
         Variant* v = chess_variant()->init();
         v->variantTemplate = "spell-chess";
@@ -196,6 +198,7 @@ namespace {
         v->startFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[JJFFFFFjjfffff] w KQkq - 0 1";
         return v;
     }
+#endif
     // Berolina Chess
     // https://www.chessvariants.com/dpieces.dir/berlin.html
     Variant* berolina_variant() {
@@ -455,7 +458,7 @@ namespace {
     // https://lichess.org/variant/kingOfTheHill
     Variant* kingofthehill_variant() {
         Variant* v = chess_variant_base()->init();
-        v->flagPiece = KING;
+        v->flagPieceTypes = piece_set(KING);
         v->flagRegion = (Rank4BB | Rank5BB) & (FileDBB | FileEBB);
         v->flagMove = false;
         return v;
@@ -465,7 +468,7 @@ namespace {
     Variant* racingkings_variant() {
         Variant* v = chess_variant_base()->init();
         v->startFen = "8/8/8/8/8/8/krbnNBRK/qrbnNBRQ w - - 0 1";
-        v->flagPiece = KING;
+        v->flagPieceTypes = piece_set(KING);
         v->flagRegion = Rank8BB;
         v->flagMove = true;
         v->castling = false;
@@ -566,6 +569,7 @@ namespace {
         v->promotionPieceTypes[BLACK] = piece_set(COMMONER) | QUEEN | ROOK | BISHOP | KNIGHT;
         v->extinctionValue = -VALUE_MATE;
         v->extinctionPieceTypes = piece_set(COMMONER) | QUEEN | ROOK | BISHOP | KNIGHT | PAWN;
+        v->extinctionAllPieceTypes = false;
         return v;
     }
     // Kinglet
@@ -998,7 +1002,7 @@ namespace {
         v->shogiPawnDropMateIllegal = false;
         v->extinctionValue = -VALUE_MATE;
         v->extinctionPieceTypes = piece_set(COMMONER);
-        v->flagPiece = COMMONER;
+        v->flagPieceTypes = piece_set(COMMONER);
         v->flagRegion[WHITE] = Rank4BB;
         v->flagRegion[BLACK] = Rank1BB;
         v->flagPieceSafe = true;
@@ -1246,7 +1250,7 @@ namespace {
         v->doubleStep = false;
         v->castling = false;
         v->stalemateValue = -VALUE_MATE;
-        v->flagPiece = BREAKTHROUGH_PIECE;
+        v->flagPieceTypes = piece_set(BREAKTHROUGH_PIECE);
         v->flagRegion[WHITE] = Rank8BB;
         v->flagRegion[BLACK] = Rank1BB;
         return v;
@@ -1285,8 +1289,9 @@ namespace {
         v->maxFile = FILE_H;
         v->reset_pieces();
         v->add_piece(IMMOBILE_PIECE, 'p');
-        v->startFen = "8/8/8/8/8/8/8/8[PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPpppppppppppppppppppppppppppppppp] w 0 1";
+        v->startFen = "8/8/8/8/8/8/8/8[] w 0 1";
         v->pieceDrops = true;
+        v->freeDrops = true;
         v->doubleStep = false;
         v->castling = false;
         v->immobilityIllegal = false;
@@ -1304,7 +1309,7 @@ namespace {
     // https://en.wikipedia.org/wiki/Reversi#Othello
     Variant* flipello_variant() {
         Variant* v = flipersi_variant()->init();
-        v->startFen = "8/8/8/3pP3/3Pp3/8/8/8[PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPpppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp] w 0 1";
+        v->startFen = "8/8/8/3pP3/3Pp3/8/8/8[] w 0 1";
         v->passOnStalemate = true;
         return v;
     }
@@ -1653,7 +1658,7 @@ namespace {
         v->doubleStep = false;
         v->castling = false;
         v->stalemateValue = -VALUE_MATE;
-        v->flagPiece = KNIGHT;
+        v->flagPieceTypes = piece_set(KNIGHT);
         v->flagRegion = make_bitboard(SQ_E5);
         v->flagMove = true;
         return v;
@@ -1882,7 +1887,7 @@ namespace {
         Variant* v = flipello_variant()->init();
         v->maxRank = RANK_10;
         v->maxFile = FILE_J;
-        v->startFen = "10/10/10/10/4pP4/4Pp4/10/10/10/10[PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPpppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp] w - - 0 1";
+        v->startFen = "10/10/10/10/4pP4/4Pp4/10/10/10/10[] w - - 0 1";
         v->enclosingDropStart = make_bitboard(SQ_E5, SQ_F5, SQ_E6, SQ_F6);
         return v;
     }
@@ -2030,7 +2035,9 @@ void VariantMap::init() {
     add("nocastle", nocastle_variant());
     add("armageddon", armageddon_variant());
     add("torpedo", torpedo_variant());
+#ifdef ALLVARS
     add("spell-chess", spell_chess_variant());
+#endif
     add("berolina", berolina_variant());
     add("pawnsideways", pawnsideways_variant());
     add("pawnback", pawnback_variant());
@@ -2163,7 +2170,38 @@ void VariantMap::init() {
 
 // Pre-calculate derived properties
 Variant* Variant::conclude() {
+    concluded = true;
+
     rebuild_piece_symbol_maps();
+
+    std::vector<std::pair<int, int>> blastOffsets;
+    if (blastPattern.empty())
+    {
+        if (blastOrthogonals)
+            for (const auto& offset : {std::pair<int, int>{1, 0}, {0, 1}, {-1, 0}, {0, -1}})
+                blastOffsets.push_back(offset);
+        if (blastDiagonals)
+            for (const auto& offset : {std::pair<int, int>{1, 1}, {1, -1}, {-1, 1}, {-1, -1}})
+                blastOffsets.push_back(offset);
+        blastPatternCenter = blastCenter;
+    }
+    else
+    {
+        bool valid = parse_blast_pattern(blastPattern, blastOffsets, blastPatternCenter);
+        assert(valid);
+        (void)valid;
+    }
+    blastPatternHasNonCenter = !blastOffsets.empty();
+    std::fill(std::begin(blastPatternMask), std::end(blastPatternMask), Bitboard(0));
+    for (Square s = SQ_A1; s < SQUARE_NB; ++s)
+        for (const auto& [dr, df] : blastOffsets)
+        {
+            int r = int(rank_of(s)) + dr;
+            int f = int(file_of(s)) + df;
+            if (r < 0 || r > int(maxRank) || f < 0 || f > int(maxFile))
+                continue;
+            blastPatternMask[s] |= Bitboard(1) << make_square(File(f), Rank(r));
+        }
 
     // Backward compatibility: legacy extinctionPseudoRoyal used extinction
     // piece fields to define pseudo-royal behavior.
@@ -2178,13 +2216,20 @@ Variant* Variant::conclude() {
     {
         PieceType pt = pop_lsb(ps);
         captureForbidden[pt] |= pt;
+        for (Color c : { WHITE, BLACK })
+            captureForbiddenByColor[c][pt] |= pt;
     }
     captureForbiddenToKing = NO_PIECE_SET;
+    for (Color c : { WHITE, BLACK })
+        captureForbiddenToKingByColor[c] = NO_PIECE_SET;
     for (PieceSet ps = pieceTypes; ps; )
     {
         PieceType pt = pop_lsb(ps);
         if (captureForbidden[pt] & KING)
             captureForbiddenToKing |= pt;
+        for (Color c : { WHITE, BLACK })
+            if (captureForbiddenByColor[c][pt] & KING)
+                captureForbiddenToKingByColor[c] |= pt;
     }
 
     // Enforce consistency to allow runtime optimizations
@@ -2334,6 +2379,7 @@ Variant* Variant::conclude() {
                     && captureType == MOVE_OUT
                     && !twoBoards
                     && !restrictedMobility
+                    && !stackingPieceTypes
                     && kingType == KING
                    )
                  ? endgameEval : NO_EG_EVAL;
@@ -2426,12 +2472,13 @@ Variant* Variant::conclude() {
       multimoveOffset = 0;
       for (int j : multimoves)
       {
-          if (multimoveOffset + 2 * j - 1 >= START_MULTIMOVES)
+          int64_t segment = 2 * int64_t(j) - 1;
+          if (multimoveOffset + segment >= START_MULTIMOVES)
               break;
           // Initialize alternating non-passing/passing moves
-          for (int k = 0; k < 2 * j - 1; k++)
+          for (int k = 0; k < segment; k++)
               multimovePass.set(multimoveOffset + k, k % 2);
-          multimoveOffset += 2 * j - 1;
+          multimoveOffset += int(segment);
       }
       int firstMultimove =  multimoves.size() >= 2 ? multimoves[multimoves.size() - 2]
                           : multimoves.size() == 1 ? multimoves[multimoves.size() - 1]
@@ -2459,11 +2506,35 @@ void VariantMap::parse_istream(std::istream& file) {
     std::set<std::string> duplicateVariants = {};
     while (file.get() && std::getline(std::getline(file, variant, ']'), input))
     {
+        bool invalidSyntax = false;
+
+        if (variant.find('\n') != std::string::npos)
+        {
+            if (DoCheck)
+                std::cerr << "Malformed section header: missing closing bracket ']'." << std::endl;
+            invalidSyntax = true;
+        }
+
+        std::string trimmed_input = trim_ascii_spaces(input);
+        if (!trimmed_input.empty() && trimmed_input[0] != ';' && trimmed_input[0] != '#')
+        {
+            if (DoCheck)
+                std::cerr << "Invalid syntax after closing bracket: '" << trimmed_input << "'." << std::endl;
+            invalidSyntax = true;
+        }
+
         // Extract variant template, if specified
         if (!std::getline(std::getline(std::stringstream(variant), variant, ':'), variant_template))
             variant_template = "";
         variant = trim_ascii_spaces(variant);
         variant_template = trim_ascii_spaces(variant_template);
+
+        if (variant.empty())
+        {
+            if (DoCheck)
+                std::cerr << "Malformed section header: empty variant name." << std::endl;
+            invalidSyntax = true;
+        }
 
         // Read variant rules
         Config attribs = {};
@@ -2480,6 +2551,7 @@ void VariantMap::parse_istream(std::istream& file) {
                 {
                     if (DoCheck)
                         std::cerr << "Invalid syntax: '" << input << "'." << std::endl;
+                    invalidSyntax = true;
                     continue;
                 }
                 if (std::getline(ss, key, '='))
@@ -2556,6 +2628,13 @@ void VariantMap::parse_istream(std::istream& file) {
                     else
                         ++warnings.boardSize;
                 }
+                continue;
+            }
+
+            if (invalidSyntax)
+            {
+                if (DoCheck)
+                    std::cerr << "Variant '" << variant << "' has invalid configuration. Skipping." << std::endl;
                 continue;
             }
 
@@ -2661,6 +2740,7 @@ void VariantMap::set_verbose_load_warnings(bool verbose) {
 }
 
 void VariantMap::add(std::string s, Variant* v) {
+  v->name = s;
   const Variant* concluded = v->conclude();
   auto it = find(s);
   if (it != end() && it->second != concluded) {

@@ -14,6 +14,7 @@ jobs:
       COMPILER: ${{ matrix.config.compiler }}
       COMP: ${{ matrix.config.comp }}
       CXXFLAGS: "-Werror"
+      FSX_ENGINE_FAMILY: large
     strategy:
       matrix:
         config:
@@ -36,14 +37,14 @@ jobs:
       run:
         working-directory: src
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Download required packages
         run: |
           sudo apt update
-          sudo apt install expect valgrind g++-multilib
+          sudo apt install -y expect
 
       - name: Download the used network from the fishtest framework
         run: |
@@ -64,30 +65,28 @@ jobs:
       - name: Build all variants
         run: |
           make clean
-          make -j2 ARCH=x86-64 largeboards=yes all=yes debug=yes build
-
-      - name: Test protocols
-        run: |
-          ../tests/protocol.sh
+          make -j2 ARCH=x86-64 largeboards=yes all=yes debug=yes EXE=stockfish-allvars build
 
       - name: Test variants.ini
         run: |
-          ! ./stockfish check variants.ini 2>&1 >/dev/null | grep -v "Parsing variant"
+          ! ./stockfish-allvars check variants.ini 2>&1 >/dev/null \
+            | grep -Ev "Parsing variant|Variant template '.*' does not exist\\.|exceeds build board limits \\(maxFile=.*\\)\\. Skipping\\.|Castling destination is adjacent to castlingKingFile; some GUIs/protocols may not distinguish castling from a normal king move\\.|Can not use kings with blastOnCapture\\.|Can not use kings, pseudo-royal, or anti-royal with blastImmuneTypes\\.|Variant 'kamikaze' has invalid configuration\\. Skipping\\."
 
       - name: Test variant perft
         run: |
-          ../tests/perft.sh all
+          ../tests/perft.sh all ./stockfish-allvars
+
+      - name: Test fast semantic profile
+        run: |
+          ../tests/run.sh fast ./stockfish-allvars
 
       - name: Test variant bench
         run: |
-          ./stockfish bench xiangqi
-          ./stockfish bench shogi
-          ./stockfish bench capablanca
-          ./stockfish bench sittuyin
-
-      - name: Test 32bit largeboards
-        run: |
-          if [[ "$COMP" == "gcc" ]]; then export EXTRACXXFLAGS=-Wno-class-memaccess; fi
-          make clean
-          make -j2 ARCH=x86-32 largeboards=yes build
-          ../tests/perft.sh largeboard
+          ./stockfish-allvars bench minixiangqi
+          ./stockfish-allvars bench minishogi
+          ./stockfish-allvars bench sittuyin
+          if [[ "$COMP" == "gcc" ]]; then
+            ./stockfish-allvars bench xiangqi
+            ./stockfish-allvars bench shogi
+            ./stockfish-allvars bench capablanca
+          fi

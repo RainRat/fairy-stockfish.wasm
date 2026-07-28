@@ -214,26 +214,33 @@ public:
         if (fd == -1)
             return *baseAddress = nullptr, nullptr;
 
-        fstat(fd, &statbuf);
+        if (fstat(fd, &statbuf) == -1)
+        {
+            ::close(fd);
+            return *baseAddress = nullptr, nullptr;
+        }
 
         if (statbuf.st_size % 64 != 16)
         {
+            ::close(fd);
             std::cerr << "Corrupt tablebase file " << fname << std::endl;
-            exit(EXIT_FAILURE);
+            return *baseAddress = nullptr, nullptr;
         }
 
         *mapping = statbuf.st_size;
         *baseAddress = mmap(nullptr, statbuf.st_size, PROT_READ, MAP_SHARED, fd, 0);
+
+        if (*baseAddress == MAP_FAILED)
+        {
+            ::close(fd);
+            std::cerr << "Could not mmap() " << fname << std::endl;
+            return *baseAddress = nullptr, nullptr;
+        }
+
 #if defined(MADV_RANDOM)
         madvise(*baseAddress, statbuf.st_size, MADV_RANDOM);
 #endif
         ::close(fd);
-
-        if (*baseAddress == MAP_FAILED)
-        {
-            std::cerr << "Could not mmap() " << fname << std::endl;
-            exit(EXIT_FAILURE);
-        }
 #else
         // Note FILE_FLAG_RANDOM_ACCESS is only a hint to Windows and as such may get ignored.
         HANDLE fd = CreateFile(fname.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -247,8 +254,9 @@ public:
 
         if (size_low % 64 != 16)
         {
+            CloseHandle(fd);
             std::cerr << "Corrupt tablebase file " << fname << std::endl;
-            exit(EXIT_FAILURE);
+            return *baseAddress = nullptr, nullptr;
         }
 
         HANDLE mmap = CreateFileMapping(fd, nullptr, PAGE_READONLY, size_high, size_low, nullptr);
@@ -257,7 +265,7 @@ public:
         if (!mmap)
         {
             std::cerr << "CreateFileMapping() failed" << std::endl;
-            exit(EXIT_FAILURE);
+            return *baseAddress = nullptr, nullptr;
         }
 
         *mapping = (uint64_t)mmap;
@@ -267,7 +275,9 @@ public:
         {
             std::cerr << "MapViewOfFile() failed, name = " << fname
                       << ", error = " << GetLastError() << std::endl;
-            exit(EXIT_FAILURE);
+            CloseHandle(mmap);
+            *mapping = 0;
+            return *baseAddress = nullptr, nullptr;
         }
 #endif
         uint8_t* data = (uint8_t*)*baseAddress;
@@ -1544,7 +1554,6 @@ int Tablebases::probe_dtz(Position& pos, ProbeState* result) {
 // A return value false indicates that not all probes were successful.
 bool Tablebases::root_probe(Position& pos, Search::RootMoves& rootMoves) {
 
-    ProbeState result;
     StateInfo st;
 
     // Obtain 50-move counter for the root position
@@ -1558,6 +1567,7 @@ bool Tablebases::root_probe(Position& pos, Search::RootMoves& rootMoves) {
     // Probe and rank each move
     for (auto& m : rootMoves)
     {
+        ProbeState result = OK;
         pos.do_move(m.pv[0], st);
 
         // Calculate dtz for the current move counting from the root position
@@ -1623,7 +1633,6 @@ bool Tablebases::root_probe_wdl(Position& pos, Search::RootMoves& rootMoves) {
 
     static const int WDL_to_rank[] = { -1000, -899, 0, 899, 1000 };
 
-    ProbeState result;
     StateInfo st;
     WDLScore wdl;
 
@@ -1632,6 +1641,7 @@ bool Tablebases::root_probe_wdl(Position& pos, Search::RootMoves& rootMoves) {
     // Probe and rank each move
     for (auto& m : rootMoves)
     {
+        ProbeState result = OK;
         pos.do_move(m.pv[0], st);
 
         if (pos.is_draw(1))

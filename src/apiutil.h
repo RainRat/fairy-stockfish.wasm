@@ -415,15 +415,15 @@ inline bool has_insufficient_material(Color c, const Position& pos) {
         || pos.count_in_hand(c, ALL_PIECES)
         || (pos.extinction_value() != VALUE_NONE && (pos.extinction_piece_types(c) & ~pos.pseudo_royal_types()))
         || (pos.variant()->nFoldRule && pos.variant()->nFoldValue != VALUE_DRAW)
-        || (pos.flag_region(c) && pos.count(c, pos.flag_piece(c)))
+        || (pos.flag_region(c) && pos.pieces(c, pos.flag_piece_types(c)))
         || pos.points_goal() > 0
         || pos.check_counting()
         || pos.material_counting() != NO_MATERIAL_COUNTING
         || pos.variant()->extinctionPseudoRoyal
-        || pos.connect_n() > 0
-        || pos.connect_nxn() > 0
-        || pos.collinear_n() > 0
-        || pos.connect_group() > 0
+        || pos.connect_n() != 0
+        || pos.connect_nxn() != 0
+        || pos.collinear_n() != 0
+        || pos.connect_group() != 0
         || !pos.connect_piece_goal_types(c).empty()
         || pos.variant()->castlingWins
         || pos.variant()->connectRegion1[c]
@@ -704,6 +704,10 @@ inline int read_fen_number(const std::string& text, size_t& idx) {
 }
 
 inline Validation check_for_valid_characters(const std::string& firstFenPart, const std::string& validSpecialCharactersFirstField, const Variant* v) {
+    PieceType lastPt = NO_PIECE_TYPE;
+    Piece lastPc = NO_PIECE;
+    bool orientationSeen = false;
+    bool promotedPrefix = false;
     for (size_t i = 0; i < firstFenPart.size();)
     {
         char c = firstFenPart[i];
@@ -711,20 +715,79 @@ inline Validation check_for_valid_characters(const std::string& firstFenPart, co
         {
             if (v && v->shogiStylePromotions)
             {
+                lastPt = NO_PIECE_TYPE;
+                lastPc = NO_PIECE;
+                promotedPrefix = true;
                 ++i;
                 continue;
             }
             std::cerr << "Invalid piece character: '+'." << std::endl;
             return NOK;
         }
+        if (c == '~' && i + 1 < firstFenPart.size() && firstFenPart[i + 1] == ':')
+        {
+            if (lastPt == NO_PIECE_TYPE)
+            {
+                std::cerr << "Promotion origin specified without a promoted piece." << std::endl;
+                return NOK;
+            }
+            i += 2;
+            std::string originSymbol = read_piece_symbol(firstFenPart, i);
+            Piece origin = v ? v->piece_from_symbol(originSymbol) : NO_PIECE;
+            if (!v || origin == NO_PIECE || v->promotedPieceType[type_of(origin)] != lastPt
+                || lastPc == NO_PIECE || color_of(origin) != color_of(lastPc))
+            {
+                std::cerr << "Invalid promoted-piece origin: '" << originSymbol << "'." << std::endl;
+                return NOK;
+            }
+            lastPt = NO_PIECE_TYPE;
+            lastPc = NO_PIECE;
+            orientationSeen = false;
+            continue;
+        }
+        if (c == '(' && v && v->laserGame)
+        {
+            if (orientationSeen || i == 0 || i + 2 >= firstFenPart.size()
+                || !std::isdigit(static_cast<unsigned char>(firstFenPart[i + 1]))
+                || firstFenPart[i + 2] != ')')
+            {
+                std::cerr << "Invalid orientation suffix: '('." << std::endl;
+                return NOK;
+            }
+            if (lastPt == NO_PIECE_TYPE || !v->is_oriented(lastPt))
+            {
+                std::cerr << "Orientation specified for unoriented piece." << std::endl;
+                return NOK;
+            }
+            int orient = firstFenPart[i + 1] - '0';
+            if (orient < 0 || orient >= v->orientation_count(lastPt))
+            {
+                std::cerr << "Invalid orientation digit: '" << firstFenPart[i + 1] << "'." << std::endl;
+                return NOK;
+            }
+            orientationSeen = true;
+            i += 3;
+            continue;
+        }
         if (Variant::is_piece_id_start(c))
         {
             std::string symbol = read_piece_symbol(firstFenPart, i);
-            if (v && v->piece_from_symbol(symbol) != NO_PIECE)
+            Piece pc = v ? v->piece_from_symbol(symbol) : NO_PIECE;
+            if (pc != NO_PIECE)
+            {
+                lastPt = promotedPrefix ? v->promotedPieceType[type_of(pc)] : type_of(pc);
+                lastPc = lastPt == NO_PIECE_TYPE ? NO_PIECE : make_piece(color_of(pc), lastPt);
+                promotedPrefix = false;
+                orientationSeen = false;
                 continue;
+            }
             std::cerr << "Invalid piece character: '" << symbol << "'." << std::endl;
             return NOK;
         }
+        lastPt = NO_PIECE_TYPE;
+        lastPc = NO_PIECE;
+        promotedPrefix = false;
+        orientationSeen = false;
         ++i;
         if (!std::isdigit(static_cast<unsigned char>(c))
             && !contains(validSpecialCharactersFirstField, c))
@@ -810,6 +873,18 @@ inline Validation fill_char_board(CharBoard& board, const std::string& fenBoard,
             }
             continue;
         }
+        if (c == '(' && v && v->laserGame)
+        {
+            i += (i + 2 < fenBoard.size()
+               && std::isdigit(static_cast<unsigned char>(fenBoard[i + 1]))
+               && fenBoard[i + 2] == ')') ? 3 : 1;
+            continue;
+        }
+        if (c == '+' && v && v->laserGame)
+        {
+            i += 1;
+            continue;
+        }
         if (c == '*' || c == '^')
         {
             ++i;
@@ -871,6 +946,15 @@ inline Validation fill_char_board(CharBoard& board, const std::string& fenBoard,
                 return NOK;
             // we mirror the rank index because the black pieces are given first in the FEN
             ++fileIdx;
+        }
+        else if (c == '~')
+        {
+            ++i;
+            if (i < fenBoard.size() && fenBoard[i] == ':')
+            {
+                ++i;
+                read_piece_symbol(fenBoard, i);
+            }
         }
         else if (!contains(validSpecialCharactersFirstField, c))
         {
@@ -1193,7 +1277,12 @@ inline int piece_count(const std::string& fenBoard, Color c, PieceType pt, const
     for (size_t i = 0; i < fenBoard.size();)
     {
         char token = fenBoard[i];
-        if (Variant::is_piece_id_start(token))
+        if (token == '~' && i + 1 < fenBoard.size() && fenBoard[i + 1] == ':')
+        {
+            i += 2;
+            read_piece_symbol(fenBoard, i);
+        }
+        else if (Variant::is_piece_id_start(token))
         {
             std::string symbol = read_piece_symbol(fenBoard, i);
             if (v->piece_from_symbol(symbol) == target)
@@ -1345,7 +1434,7 @@ inline FenValidation validate_fen(const std::string& fen, const Variant* v, bool
     }
 
     // Optional potion extension syntax (spell-chess testing):
-    //   ... [points] [f:e4|j:e4|-] <wf wj bf bj>
+    //   ... [points] [f:e4|j:e4|wf:e4,wj:e4,bf:e4,bj:e4|-] <wf wj bf bj>
     // where <w b> is accepted as compact form.
     auto rtrim = [](std::string& s) {
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
@@ -1366,7 +1455,12 @@ inline FenValidation validate_fen(const std::string& fen, const Variant* v, bool
     {
         size_t lastSpace = modifiedFen.find_last_of(' ');
         std::string lastToken = lastSpace == std::string::npos ? modifiedFen : modifiedFen.substr(lastSpace + 1);
-        if (lastToken == "-" || (lastToken.size() > 3 && lastToken[1] == ':' && (lastToken[0] == 'f' || lastToken[0] == 'j')))
+        bool legacyPotion = lastToken.size() > 3 && lastToken[1] == ':'
+                         && (lastToken[0] == 'f' || lastToken[0] == 'j');
+        bool explicitPotion = lastToken.size() > 4 && lastToken[2] == ':'
+                           && (lastToken[0] == 'w' || lastToken[0] == 'b')
+                           && (lastToken[1] == 'f' || lastToken[1] == 'j');
+        if (lastToken == "-" || legacyPotion || explicitPotion)
         {
             potionInfo = lastToken;
             if (lastSpace == std::string::npos)
@@ -1554,23 +1648,49 @@ inline FenValidation validate_fen(const std::string& fen, const Variant* v, bool
     {
         if (potionInfo != "-")
         {
-            if (!(potionInfo.size() > 3 && potionInfo[1] == ':' && (potionInfo[0] == 'f' || potionInfo[0] == 'j')))
+            if (potionInfo.front() == ',' || potionInfo.back() == ',')
                 return FEN_INVALID_CHAR;
-            std::string sq = potionInfo.substr(2);
-            if (sq.size() < 2 || sq[0] < 'a' || sq[0] > 'a' + v->maxFile)
-                return FEN_INVALID_CHAR;
-            if (!std::all_of(sq.begin() + 1, sq.end(), [](unsigned char ch){ return std::isdigit(ch); }))
-                return FEN_INVALID_CHAR;
-            int rank = 0;
-            for (size_t i = 1; i < sq.size(); ++i)
+
+            bool seenPotionZone[COLOR_NB][Variant::POTION_TYPE_NB] = {};
+            const Color implicitZoneColor = fenParts.size() <= 1 || fenParts[1] == "w"
+                                          ? BLACK
+                                          : WHITE;
+            std::istringstream zones(potionInfo);
+            std::string zone;
+            while (std::getline(zones, zone, ','))
             {
-                int digit = sq[i] - '0';
-                if (rank > (std::numeric_limits<int>::max() - digit) / 10)
+                size_t offset = 0;
+                Color zoneColor = implicitZoneColor;
+                if (zone.size() > 1 && (zone[0] == 'w' || zone[0] == 'b'))
+                {
+                    offset = 1;
+                    zoneColor = zone[0] == 'w' ? WHITE : BLACK;
+                }
+                if (!(zone.size() > offset + 3 && zone[offset + 1] == ':'
+                      && (zone[offset] == 'f' || zone[offset] == 'j')))
                     return FEN_INVALID_CHAR;
-                rank = rank * 10 + digit;
+                const Variant::PotionType potion = zone[offset] == 'f'
+                                                  ? Variant::POTION_FREEZE
+                                                  : Variant::POTION_JUMP;
+                if (seenPotionZone[zoneColor][potion])
+                    return FEN_INVALID_CHAR;
+                seenPotionZone[zoneColor][potion] = true;
+                std::string sq = zone.substr(offset + 2);
+                if (sq.size() < 2 || sq[0] < 'a' || sq[0] > 'a' + v->maxFile)
+                    return FEN_INVALID_CHAR;
+                if (!std::all_of(sq.begin() + 1, sq.end(), [](unsigned char ch){ return std::isdigit(ch); }))
+                    return FEN_INVALID_CHAR;
+                int rank = 0;
+                for (size_t i = 1; i < sq.size(); ++i)
+                {
+                    int digit = sq[i] - '0';
+                    if (rank > (std::numeric_limits<int>::max() - digit) / 10)
+                        return FEN_INVALID_CHAR;
+                    rank = rank * 10 + digit;
+                }
+                if (rank < 1 || rank > v->maxRank + 1)
+                    return FEN_INVALID_CHAR;
             }
-            if (rank < 1 || rank > v->maxRank + 1)
-                return FEN_INVALID_CHAR;
         }
     }
 

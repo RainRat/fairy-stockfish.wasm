@@ -26,8 +26,6 @@
 #include "../../evaluate.h"
 #include "../../misc.h"
 
-#include "half_ka_v2.h"
-
 namespace Stockfish {
   struct StateInfo;
 }
@@ -51,7 +49,7 @@ namespace Stockfish::Eval::NNUE::Features {
     static IndexType make_wall_index(Color perspective, Square s, Square ksq, const Position& pos);
 
     // Index of a feature for a given king position and a points/check plane
-    static IndexType make_points_index(Color perspective, int plane, Square ksq, const Position& pos);
+    static IndexType make_points_index(int plane, Square ksq, const Position& pos);
 
     // Index of a feature for a given king position and potion zone square
     static IndexType make_potion_zone_index(Color perspective, Color potionColor,

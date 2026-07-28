@@ -31,7 +31,6 @@
 namespace Stockfish {
 
 
-
 // Special distance value for dynamic slider length (Betza 'x' modifier)
 constexpr int DYNAMIC_SLIDER_LIMIT = -2;
 // Special distance value for ski/slip sliders (Betza 'j' modifier)
@@ -206,6 +205,14 @@ struct PieceInfo {
           return true;
     return false;
   }
+  inline bool has_typed_universal_hopper() const {
+    for (int initial = 0; initial < 2; ++initial)
+      for (int modality = 0; modality < MOVE_MODALITY_NB; ++modality)
+        for (const auto& [_, profile] : universalHopper[initial][modality])
+          if (profile.hurdlePieceTypes || profile.transparentPieceTypes)
+            return true;
+    return false;
+  }
   inline bool has_universal_capture_hopper() const {
     for (int initial = 0; initial < 2; ++initial)
       if (!universalHopper[initial][MODALITY_CAPTURE].empty())
@@ -222,6 +229,12 @@ struct PieceInfo {
   inline bool has_lame_capture() const {
     for (int initial = 0; initial < 2; ++initial)
       if (!stepsLame[initial][MODALITY_CAPTURE].empty())
+        return true;
+    return false;
+  }
+  inline bool has_simple_hopper_capture() const {
+    for (int initial = 0; initial < 2; ++initial)
+      if (!hopper[initial][MODALITY_CAPTURE].empty())
         return true;
     return false;
   }
@@ -244,12 +257,29 @@ struct PieceInfo {
         return true;
     return false;
   }
+  inline bool needs_generic_attack_assembly() const {
+    return has_runtime_rider_augment()
+        || has_universal_hopper()
+        || has_explicit_initial_moves()
+        || has_simple_hopper_capture()
+        || has_lame_capture()
+        || griffon[0][MODALITY_CAPTURE]
+        || griffon[1][MODALITY_CAPTURE]
+        || manticore[0][MODALITY_CAPTURE]
+        || manticore[1][MODALITY_CAPTURE]
+        || rose[0][MODALITY_CAPTURE]
+        || rose[1][MODALITY_CAPTURE]
+        || !tupleSlider[0][MODALITY_CAPTURE].empty()
+        || !tupleSlider[1][MODALITY_CAPTURE].empty();
+  }
 };
 
 struct PieceMap : public std::map<PieceType, PieceInfo*> {
   PieceMap() {
     direct.fill(nullptr);
     runtimeRiderAugmentTypes = PieceSet(0);
+    simpleHopperCaptureTypes = PieceSet(0);
+    genericAttackAssemblyTypes = PieceSet(0);
   }
   ~PieceMap() { clear_all(); }
   void init(const Variant* v = nullptr);
@@ -266,15 +296,22 @@ struct PieceMap : public std::map<PieceType, PieceInfo*> {
     return direct[pt];
   }
   PieceSet runtime_rider_augment_types() const { return runtimeRiderAugmentTypes; }
+  PieceSet simple_hopper_capture_types() const { return simpleHopperCaptureTypes; }
+  PieceSet generic_attack_assembly_types() const { return genericAttackAssemblyTypes; }
 
 private:
   std::array<PieceInfo*, PIECE_TYPE_NB> direct;
   PieceSet runtimeRiderAugmentTypes;
+  PieceSet simpleHopperCaptureTypes;
+  PieceSet genericAttackAssemblyTypes;
 };
 
 extern PieceMap pieceMap;
 
 bool validate_custom_piece_betza(const std::string& betza, const std::string& name, const Variant* variant = nullptr);
+bool parse_blast_pattern(const std::string& pattern,
+                         std::vector<std::pair<int, int>>& offsets,
+                         bool& includeCenter);
 
 inline std::string piece_name(PieceType pt) {
   return is_custom(pt) ? "customPiece" + std::to_string(pt - CUSTOM_PIECES + 1)

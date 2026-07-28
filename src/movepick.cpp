@@ -67,22 +67,19 @@ bool MovePicker::is_useless_potion(Move m) const {
 
   if (pos.potion_piece(Variant::POTION_FREEZE) == gatingPiece)
   {
+      // Existing freeze zones expire before the opponent's reply. A target is
+      // productive whenever the new zone contains an enemy, even if that
+      // enemy is frozen in the position before this cast.
       Bitboard zone = pos.freeze_zone_from_square(gate);
       Bitboard enemies = pos.pieces(~pos.side_to_move());
       return !(zone & enemies);
   }
 
   if (pos.potion_piece(Variant::POTION_JUMP) == gatingPiece)
-  {
-      if (pos.piece_on(gate) == NO_PIECE)
-          return true;
-
-      const bool initial = pos.not_moved_pieces(pos.side_to_move()) & from_sq(m);
-      const MoveModality modality = pos.capture(m) ? MODALITY_CAPTURE : MODALITY_QUIET;
-      Bitboard path = pos.between_bb(from_sq(m), to_sq(m), type_of(pos.moved_piece(m)), modality, initial);
-      path &= ~square_bb(to_sq(m));
-      return !(path & square_bb(gate));
-  }
+      // A Jump target changes the persistent state even when the
+      // accompanying move does not cross it.  It may also deliberately
+      // replace the currently active target, which expires after this turn.
+      return false;
 
   return false;
 }
@@ -139,7 +136,7 @@ MovePicker::MovePicker(const Position& p, Move ttm, Value th, const GateHistory*
 
   stage = PROBCUT_TT + !(ttm && pos.capture_or_promotion(ttm)
                              && pos.pseudo_legal(ttm)
-                             && (   pos.see_pruning_unreliable()
+                             && (   pos.see_pruning_unreliable(ttm)
                                  || type_of(ttm) == PROMOTION
                                  || pos.see_ge(ttm, threshold)));
 }
@@ -190,7 +187,7 @@ void MovePicker::score() {
 
   static_assert(Type == CAPTURES || Type == QUIETS || Type == EVASIONS, "Wrong type");
   const Color us = pos.side_to_move();
-  const PieceType myFlag = pos.flag_piece(us);
+  const PieceSet myFlag = pos.flag_piece_types(us);
   const Bitboard myGoal = pos.flag_region(us);
   auto distance_to_goal = [&](Square sq) {
       int best = 64;
@@ -200,10 +197,10 @@ void MovePicker::score() {
   };
   auto flag_goal_bonus = [&](Move mv) {
       Piece mp = pos.moved_piece(mv);
-      return (myGoal && mp != NO_PIECE && type_of(mp) == myFlag && (myGoal & square_bb(to_sq(mv)))) ? 30000 : 0;
+      return (myGoal && mp != NO_PIECE && (myFlag & type_of(mp)) && (myGoal & square_bb(to_sq(mv)))) ? 30000 : 0;
   };
   auto king_goal_progress_bonus = [&](Move mv) {
-      if (!myGoal || myFlag != KING)
+      if (!myGoal || myFlag != piece_set(KING))
           return 0;
       Piece mp = pos.moved_piece(mv);
       if (mp == NO_PIECE || type_of(mp) != KING)
@@ -242,7 +239,8 @@ void MovePicker::score() {
       return int(PieceValue[MG][captured_piece_or_on(pos, mv)]);
   };
   auto gate_history_bonus = [&](Move mv) {
-      return is_gating(mv) ? (*gateHistory)[pos.side_to_move()][gating_square(mv)] : 0;
+      const Square gate = gate_history_square(mv);
+      return gate != SQ_NONE ? (*gateHistory)[pos.side_to_move()][gate] : 0;
   };
 
   for (auto& m : *this)
@@ -318,7 +316,7 @@ bool MovePicker::resume_deferred_potions(
     bool& deferred) {
   if (deferred)
   {
-      endMoves = append_potions<Type>(pos, appendBegin, baseEnd);
+      endMoves = append_potions<Type>(pos, appendBegin, baseEnd, true);
       endMoves = prune_useless_potions(baseEnd, endMoves);
       cur = baseEnd;
       if constexpr (Type == CAPTURES || Type == QUIETS || Type == EVASIONS)
@@ -377,9 +375,21 @@ top:
       goto top;
 
   case PROBCUT_INIT:
+      cur = endBadCaptures = moveList;
+      endMoves = generate_without_potions<CAPTURES>(pos, cur);
+      captureBaseEnd = endMoves;
+      capturePotionsDeferred = potions_pending();
+      assert_move_list_bounds();
+
+      score<CAPTURES>();
+      ++stage;
+      goto top;
+
   case QCAPTURE_INIT:
       cur = endBadCaptures = moveList;
       endMoves = generate_without_potions<CAPTURES>(pos, cur);
+      qcaptureBaseEnd = endMoves;
+      qcapturePotionsDeferred = potions_pending();
       assert_move_list_bounds();
 
       score<CAPTURES>();
@@ -388,7 +398,7 @@ top:
 
   case GOOD_CAPTURE:
       if (select<Best>([&](){
-                       return (pos.see_pruning_unreliable() || pos.see_ge(*cur, Value(-69 * cur->value / 1024 - 500 * (pos.captures_to_hand() && pos.gives_check(*cur)))))?
+                       return (pos.see_pruning_unreliable(*cur) || pos.see_ge(*cur, Value(-69 * cur->value / 1024 - 500 * (pos.captures_to_hand() && pos.gives_check(*cur)))))?
                               // Move losing capture to endBadCaptures to be tried later
                               true : (*endBadCaptures++ = *cur, false); }))
           return *(cur - 1);
@@ -483,16 +493,25 @@ top:
       return MOVE_NONE;
 
   case PROBCUT:
-      return select<Best>([&](){
-          return pos.see_pruning_unreliable()
-              || type_of(*cur) == PROMOTION
-              || pos.see_ge(*cur, threshold);
-      });
+      if (Move m = select<Best>([&](){
+              return pos.see_pruning_unreliable(*cur)
+                  || type_of(*cur) == PROMOTION
+                  || pos.see_ge(*cur, threshold);
+          }))
+          return m;
+
+      if (resume_deferred_potions<CAPTURES>(moveList, captureBaseEnd, capturePotionsDeferred))
+          goto top;
+
+      return MOVE_NONE;
 
   case QCAPTURE:
       if (select<Best>([&](){ return   depth > DEPTH_QS_RECAPTURES
                                     || to_sq(*cur) == recaptureSquare; }))
           return *(cur - 1);
+
+      if (resume_deferred_potions<CAPTURES>(moveList, qcaptureBaseEnd, qcapturePotionsDeferred))
+          goto top;
 
       // If we did not find any move and we do not try checks, we have finished
       if (depth != DEPTH_QS_CHECKS)

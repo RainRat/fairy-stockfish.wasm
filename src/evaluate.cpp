@@ -918,7 +918,7 @@ namespace {
     b1 = pos.attacks_bb<ROOK  >(ksq, pos.pieces() ^ pos.pieces(Us, QUEEN));
     b2 = pos.attacks_bb<BISHOP>(ksq, pos.pieces() ^ pos.pieces(Us, QUEEN));
 
-    std::function <Bitboard (Color, PieceType)> get_attacks = [this](Color c, PieceType pt) {
+    auto get_attacks = [this](Color c, PieceType pt) -> Bitboard {
         return attackedBy[c][pt] | (pos.piece_drops() && pos.count_in_hand(c, pt) > 0 ? pos.drop_region(c, pt) & ~pos.pieces() : Bitboard(0));
     };
     for (PieceSet ps = pos.piece_types(); ps;)
@@ -1412,11 +1412,8 @@ namespace {
     // Capture the flag
     if (pos.flag_region(Us))
     {
-        Bitboard ctfPieces = pos.pieces(Us, pos.flag_piece(Us));
+        const PieceSet flagTypes = pos.flag_piece_types(Us);
         Bitboard ctfTargets = pos.flag_region(Us) & pos.board_bb();
-        Bitboard onHold = 0;
-        Bitboard onHold2 = 0;
-        Bitboard processed = 0;
         Bitboard blocked = pos.pieces(Us, PAWN) | attackedBy[Them][ALL_PIECES];
         Bitboard doubleBlocked =  attackedBy2[Them]
                                 | (pos.pieces(Us, PAWN) & (shift<Down>(pos.pieces()) | attackedBy[Them][ALL_PIECES]))
@@ -1426,31 +1423,56 @@ namespace {
         // Traverse all paths of the CTF pieces to the CTF targets.
         // Put squares that are attacked or occupied on hold for one iteration.
         // This reflects that likely a move will be needed to block or capture the attack.
-        // If all piece types are eligible, use the king path as a proxy for distance.
-        PieceType ptCtf = pos.flag_piece(Us) == ALL_PIECES ? KING : pos.flag_piece(Us);
         int64_t ctfAccum = 0;
-        for (int dist = 0; (ctfPieces || onHold || onHold2) && (ctfTargets & ~processed); dist++)
+        Bitboard ctfPieces[PIECE_TYPE_NB] = {};
+        Bitboard onHold[PIECE_TYPE_NB] = {};
+        Bitboard onHold2[PIECE_TYPE_NB] = {};
+        Bitboard processed[PIECE_TYPE_NB] = {};
+        const bool allFlagTypes = bool(flagTypes & piece_set(ALL_PIECES));
+        if (allFlagTypes)
+            ctfPieces[KING] = pos.pieces(Us);
+        else
+            for (PieceType pt = PAWN; pt < PIECE_TYPE_NB; ++pt)
+                if (flagTypes & pt)
+                    ctfPieces[pt] = pos.pieces(Us, pt);
+
+        for (int dist = 0;; dist++)
         {
-            int wins = popcount(ctfTargets & ctfPieces);
+            Bitboard reachable = 0;
+            Bitboard active = 0;
+            Bitboard processedTargets = 0;
+            for (PieceType pt = PAWN; pt < PIECE_TYPE_NB; ++pt)
+            {
+                reachable |= ctfPieces[pt];
+                active |= ctfPieces[pt] | onHold[pt] | onHold2[pt];
+                processedTargets |= processed[pt];
+            }
+            if (!(active && (ctfTargets & ~processedTargets)))
+                break;
+
+            int wins = popcount(ctfTargets & reachable);
             if (wins)
             {
                 int denom = wins + dist * dist;
                 int ctfBonus = (4000 * wins) / denom;
                 ctfAccum += ctfBonus;
             }
-            Bitboard current = ctfPieces & ~ctfTargets;
-            processed |= ctfPieces;
-            ctfPieces = onHold & ~processed;
-            onHold = onHold2 & ~processed;
-            onHold2 = 0;
-            while (current)
+            for (PieceType pt = PAWN; pt < PIECE_TYPE_NB; ++pt)
             {
-                Square s = pop_lsb(current);
-                Bitboard attacks = (  (PseudoAttacks[Us][ptCtf][s] & pos.pieces())
-                                    | (PseudoMoves[0][Us][ptCtf][s] & ~pos.pieces())) & ~processed & pos.board_bb();
-                ctfPieces |= attacks & ~blocked;
-                onHold |= attacks & ~doubleBlocked;
-                onHold2 |= attacks & ~inaccessible;
+                Bitboard current = ctfPieces[pt] & ~ctfTargets;
+                processed[pt] |= ctfPieces[pt];
+                ctfPieces[pt] = onHold[pt] & ~processed[pt];
+                onHold[pt] = onHold2[pt] & ~processed[pt];
+                onHold2[pt] = 0;
+                while (current)
+                {
+                    Square s = pop_lsb(current);
+                    Bitboard attacks = (  (PseudoAttacks[Us][pt][s] & pos.pieces())
+                                        | (PseudoMoves[0][Us][pt][s] & ~pos.pieces())) & ~processed[pt] & pos.board_bb();
+                    ctfPieces[pt] |= attacks & ~blocked;
+                    onHold[pt] |= attacks & ~doubleBlocked;
+                    onHold2[pt] |= attacks & ~inaccessible;
+                }
             }
         }
         // Keep CTF bounded with enough headroom for other evaluation terms.
@@ -1483,8 +1505,8 @@ namespace {
         // Oshi need this term to dominate ordinary mobility/space heuristics,
         // otherwise search can prefer flashy self-ejects that hand the opponent
         // scoring progress without any immediate tactical punishment.
-        score += make_score(120, 90) * goalSign * std::clamp(usPoints - themPoints, -100, 100);
-        score += make_score(240, 180) * goalSign * std::clamp(themToGoal - usToGoal, -100, 100);
+        score += make_score(60, 45) * goalSign * std::clamp(usPoints - themPoints, -100, 100);
+        score += make_score(120, 90) * goalSign * std::clamp(themToGoal - usToGoal, -100, 100);
     }
 
     // Duple-check variants (e.g. Spartan): reward coordinated protection of
@@ -1506,10 +1528,9 @@ namespace {
         int covered = popcount(defended & ~attacked);
 
         score += make_score(70, 45) * covered;
-        score -= make_score(140, 90) * exposed;
-        // In duple-check variants, simultaneous pressure on multiple critical
-        // pseudo-royals increases tactical danger even when currently defended.
-        score -= make_score(35, 22) * attackedCnt * attackedCnt;
+        score -= make_score(90, 60) * exposed;
+        if (attackedCnt > 1)
+            score -= make_score(110, 80) * (attackedCnt - 1);
     }
 
     // Freeze-potion variants: when opponent can currently cast a freeze potion,
@@ -1526,6 +1547,22 @@ namespace {
                           + popcount(majors & shift<NORTH_WEST>(majors));
             score -= make_score(22, 16) * threat * adjacency;
         }
+    }
+
+    // Spell Chess pocket potions bonus / penalty for using unnecessarily
+    if (pos.potions_enabled())
+    {
+        for (int pt = 0; pt < Variant::POTION_TYPE_NB; ++pt)
+        {
+            Variant::PotionType potion = static_cast<Variant::PotionType>(pt);
+            PieceType pPiece = pos.potion_piece(potion);
+            if (pPiece != NO_PIECE_TYPE)
+            {
+                int cnt = pos.count_in_hand(Us, pPiece);
+                score += make_score(60, 60) * cnt;
+            }
+        }
+
     }
 
     // Extinction
@@ -1578,20 +1615,18 @@ namespace {
     // Connect-n
     if (pos.connect_n() > 0 && (pos.connect_value() != VALUE_DRAW))
     {
-        //Calculate eligible pieces for connection once.
-        //Still consider all opponent pieces as blocking.
+        // Calculate eligible pieces for connection once.
+        // Friendly non-eligible pieces and all opponent pieces block connections.
         Bitboard connectPiecesUs = 0;
-        for (PieceSet ps = pos.connect_piece_types(); ps;){
-            PieceType pt = pop_lsb(ps);
-            connectPiecesUs |= pos.pieces(pt);
-        };
-        connectPiecesUs &= pos.pieces(Us);
+        for (PieceSet ps = pos.connect_piece_types(); ps;)
+            connectPiecesUs |= pos.pieces(Us, pop_lsb(ps));
+
+        Bitboard blockers = pos.pieces() & ~connectPiecesUs;
 
         for (const Direction& d : pos.getConnectDirections())
-
         {
             // Find sufficiently large gaps
-            Bitboard b = pos.board_bb() & ~pos.pieces(Them);
+            Bitboard b = pos.board_bb() & ~blockers;
             for (int i = 1; i < pos.connect_n(); i++)
                 b &= shift(d, b);
             // Count number of pieces per gap
@@ -1602,10 +1637,13 @@ namespace {
                 for (int j = 0; j < pos.connect_n(); j++)
                     if (connectPiecesUs & (s - j * d))
                         c++;
-                const int remaining = pos.connect_n() - c;
-                assert(remaining > 0);
-                if (remaining <= 0)
+
+                // A completed connection is adjudicated before evaluation;
+                // avoid treating it as a heuristic gap with zero remainder.
+                if (c == 0 || c >= pos.connect_n())
                     continue;
+
+                const int remaining = pos.connect_n() - c;
                 score += (pos.connect_value() == VALUE_MATE ? 1 : -1) * // At least change the sign for misere variants.
                          (make_score(200, 200) * c / remaining / remaining);
             }
@@ -1659,11 +1697,12 @@ namespace {
         };
 
         auto [usLargest, usComponents] = group_stats(Us);
-        auto [themLargest, themComponents] = group_stats(Them);
         int sign = pos.connect_value() == VALUE_MATE ? 1 : -1;
 
-        score += sign * make_score(120, 80) * (usLargest - themLargest);
-        score += sign * make_score(45, 30) * (themComponents - usComponents);
+        // variant<WHITE>() - variant<BLACK>() preserves the old differential
+        // exactly while avoiding recomputing the opponent's statistics here.
+        score += sign * make_score(240, 160) * usLargest;
+        score -= sign * make_score(90, 60) * usComponents;
     }
 
     // Potential piece flips (Reversi)
@@ -1856,6 +1895,23 @@ namespace {
 
     if (pos.topology_wraps())
     {
+        pe = Pawns::probe(pos);
+
+        std::memset(attackedBy, 0, sizeof(attackedBy));
+        initialize<WHITE>();
+        initialize<BLACK>();
+
+        for (PieceSet ps = pos.piece_types(); ps;)
+        {
+            PieceType pt = pop_lsb(ps);
+            if (pt > PAWN)
+                score += pieces<WHITE>(pt) - pieces<BLACK>(pt);
+        }
+
+        score += variant<WHITE>() - variant<BLACK>();
+
+        score += (mobility[WHITE] - mobility[BLACK]) * 25 / 100;
+
         Value mg = mg_value(score);
         Value eg = eg_value(score);
         Value v =  mg * int(me->game_phase())

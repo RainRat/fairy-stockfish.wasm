@@ -9,6 +9,7 @@
 #include "misc.h"
 #include "types.h"
 #include "bitboard.h"
+#include "endgame.h"
 #include "evaluate.h"
 #include "position.h"
 #include "search.h"
@@ -49,7 +50,7 @@ bool buildPosition(Position& pos, StateListPtr& states, const Variant* v, const 
     UCI::init_variant(v);
     if (strcmp(fen, "startpos") == 0)
         fen = v->startFen.c_str();
-    pos.set(v, std::string(fen), chess960, &states->back(), Threads.main());
+    pos.set(v, std::string(fen), chess960, &states->back(), Threads.empty() ? nullptr : Threads.main());
 
     // parse move list
     if (moveList)
@@ -96,8 +97,10 @@ bool py_move_list_to_vector(PyObject* moveList, std::vector<std::string>& moves)
             return false;
         }
         PyObject *moveStr = PyUnicode_AsEncodedString(item, "UTF-8", "strict");
-        if (!moveStr)
+        if (!moveStr) {
+            PyErr_SetString(PyExc_ValueError, "Failed to encode move string");
             return false;
+        }
         moves.emplace_back(PyBytes_AS_STRING(moveStr));
         Py_XDECREF(moveStr);
     }
@@ -381,6 +384,10 @@ extern "C" PyObject* pyffish_evaluate(PyObject* self, PyObject *args) {
     StateListPtr states(new std::deque<StateInfo>(1));
     if (!buildPosition(pos, states, v, fen, moveList, chess960))
         return NULL;
+
+    Value result;
+    if (pos.is_immediate_game_end(result))
+        return Py_BuildValue("i", normalize_public_mate_score(pos, result));
 
     return Py_BuildValue("i", Eval::evaluate(pos));
 }
@@ -708,8 +715,10 @@ PyMODINIT_FUNC PyInit_pyffish() {
     UCI::init(Options);
     PSQT::init(variants.get(Options["UCI_Variant"]));
     Bitboards::init();
+    UCI::init_variant(variants.get(Options["UCI_Variant"]));
     Position::init();
     Bitbases::init();
+    Endgames::init();
     Search::init();
     Threads.set(Options["Threads"]);
     Search::clear(); // After threads are up

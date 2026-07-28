@@ -28,12 +28,18 @@ export interface FairyStockfish {
     setOption<T>(name: string, value: T): void;
     setOptionInt(name: string, value: number): void;
     setOptionBool(name: string, value: boolean): void;
+    setReadGamePGNLoggingEnabled(enabled: boolean): void;
+    /**
+     * Parse a single PGN game and return a WASM-backed Game object.
+     * Call `game.delete()` after use to release heap memory.
+     */
     readGamePGN(pgn: string): Game;
     variants(): string;
     loadVariantConfig(variantInitContent: string): void;
     capturesToHand(uciVariant: string): boolean;
     startingFen(uciVariant: string): string;
     validateFen(fen: string, uciVariant?: string, chess960?: boolean): number;
+    validatePosition(fen: string, uciVariant: string, uciMoves: string, chess960: boolean): number;
 }
 
 export interface Board {
@@ -42,9 +48,12 @@ export interface Board {
     legalMoves(): string;
     legalMovesSan(): string;
     numberLegalMoves(): number;
+    /**
+     * Push a coordinate move string such as `e2e4`, `a7a8q`, `e2e4c`, or `d4e4s`.
+     */
     push(uciMove: string): boolean;
     pushSan(sanMove: string, notation?: Notation): boolean;
-    pop(): void;
+    pop(): boolean;
     reset(): void;
     is960(): boolean;
     fen(showPromoted?: boolean, countStarted?: number): string;
@@ -60,7 +69,9 @@ export interface Board {
     isGameOver(claimDraw?: boolean): boolean;
     result(claimDraw?: boolean): string;
     checkedPieces(): string;
+    evasionCheckedPieces(): string;
     isCheck(): boolean;
+    isRealCheck(): boolean;
     isBikjang(): boolean;
     isCapture(uciMove: string): boolean;
     moveStack(): string;

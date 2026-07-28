@@ -194,6 +194,13 @@ namespace {
           currentHopperProfile = {};
       }
 
+      if (trim_view(params).empty())
+      {
+          std::cerr << "Invalid Betza parameter entry '' in '" << betza << "'." << std::endl;
+          invalidPiece = true;
+          return;
+      }
+
       size_t pos = 0;
       const bool blockIsLame = lame;
       while (pos < params.size()) {
@@ -201,9 +208,20 @@ namespace {
           if (next_semi == std::string_view::npos) next_semi = params.size();
           std::string_view pair = trim_view(params.substr(pos, next_semi - pos));
           size_t colon = pair.find(':');
-          if (colon != std::string_view::npos) {
+          if (pair.empty() || colon == std::string_view::npos) {
+              std::cerr << "Invalid Betza parameter entry '" << pair << "' in '" << betza << "'." << std::endl;
+              invalidPiece = true;
+              break;
+          }
+          {
               std::string_view key = trim_view(pair.substr(0, colon));
               std::string_view val = trim_view(pair.substr(colon + 1));
+
+              if (key.empty() || val.empty()) {
+                  std::cerr << "Invalid Betza parameter entry '" << pair << "' in '" << betza << "'." << std::endl;
+                  invalidPiece = true;
+                  break;
+              }
 
               if (blockIsLame)
               {
@@ -791,7 +809,7 @@ namespace {
                   for (int df = 0; df <= int(FILE_MAX); ++df)
                       if (dr != 0 || df != 0)
                           universalAtoms.emplace_back(dr, df);
-              commit_atom(universalAtoms, false, i, c);
+              commit_atom(universalAtoms, false, i, c, !lame);
           }
           // Griffon bent slider (one diagonal step, then outward rook slide)
           else if (c == 'O')
@@ -871,6 +889,75 @@ bool validate_custom_piece_betza(const std::string& betza, const std::string& na
     return bool(p);
 }
 
+bool parse_blast_pattern(const std::string& pattern,
+                         std::vector<std::pair<int, int>>& offsets,
+                         bool& includeCenter) {
+    offsets.clear();
+    includeCenter = false;
+
+    std::string_view text = trim_view(pattern);
+    if (text.empty())
+        return false;
+    if (text.back() == '*')
+    {
+        includeCenter = true;
+        text.remove_suffix(1);
+    }
+    if (text.find('*') != std::string_view::npos)
+        return false;
+
+    auto add_symmetric = [&](int dr, int df) {
+        for (int swap : {0, 1})
+        {
+            if (swap && dr == df)
+                continue;
+            int r = swap ? df : dr;
+            int f = swap ? dr : df;
+            for (int sr : {-1, 1})
+                for (int sf : {-1, 1})
+                    offsets.emplace_back(sr * r, sf * f);
+        }
+    };
+
+    for (size_t i = 0; i < text.size();)
+    {
+        auto atom = leaperAtoms.find(text[i]);
+        if (atom != leaperAtoms.end())
+        {
+            for (const auto& [dr, df] : atom->second)
+                add_symmetric(dr, df);
+            ++i;
+            continue;
+        }
+        if (text[i] != '(')
+            return false;
+
+        size_t comma = text.find(',', i + 1);
+        size_t close = text.find(')', i + 1);
+        if (comma == std::string_view::npos || close == std::string_view::npos || comma > close)
+            return false;
+        int dr = 0, df = 0;
+        std::string_view drText = trim_view(text.substr(i + 1, comma - i - 1));
+        std::string_view dfText = trim_view(text.substr(comma + 1, close - comma - 1));
+        const char* drBegin = drText.data();
+        const char* drEnd = drBegin + drText.size();
+        const char* dfBegin = dfText.data();
+        const char* dfEnd = dfBegin + dfText.size();
+        auto [drPtr, drEc] = std::from_chars(drBegin, drEnd, dr);
+        auto [dfPtr, dfEc] = std::from_chars(dfBegin, dfEnd, df);
+        if (drEc != std::errc{} || drPtr != drEnd || dfEc != std::errc{} || dfPtr != dfEnd
+            || (dr == 0 && df == 0) || dr < 0 || df < 0
+            || dr > int(RANK_MAX) || df > int(FILE_MAX))
+            return false;
+        add_symmetric(dr, df);
+        i = close + 1;
+    }
+
+    std::sort(offsets.begin(), offsets.end());
+    offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+    return includeCenter || !offsets.empty();
+}
+
 void PieceMap::init(const Variant* v) {
   clear_all();
   add(PAWN, from_betza("fmWfceF", "pawn"));
@@ -912,7 +999,30 @@ void PieceMap::init(const Variant* v) {
       add(KING, from_betza("K", "king"));
       // Add custom pieces
       for (PieceType pt = CUSTOM_PIECES; pt <= CUSTOM_PIECES_END; ++pt)
-      add(pt, from_betza(v != nullptr ? v->customPiece[pt - CUSTOM_PIECES] : "", "", v));
+      {
+          std::string betza = v != nullptr ? v->customPiece[pt - CUSTOM_PIECES] : "";
+          add(pt, from_betza(betza, "", v));
+      }
+
+      if (v)
+      {
+          const PieceInfo* pawnInfo = get(PAWN);
+          const bool pawnHasCustomNonStepMovement = pawnInfo->has_nonstandard_pawn_movement();
+          v->useFastStandardPawnGenerator =
+                 !pawnHasCustomNonStepMovement
+              && !pawnInfo->has_explicit_initial_moves()
+              && pawnInfo->steps[0][MODALITY_QUIET].size() == 1
+              && pawnInfo->steps[0][MODALITY_QUIET].count(NORTH)
+              && pawnInfo->steps[0][MODALITY_CAPTURE].size() == 2
+              && pawnInfo->steps[0][MODALITY_CAPTURE].count(NORTH_EAST)
+              && pawnInfo->steps[0][MODALITY_CAPTURE].count(NORTH_WEST)
+              && pawnInfo->slider[0][MODALITY_QUIET].empty()
+              && pawnInfo->slider[0][MODALITY_CAPTURE].empty()
+              && pawnInfo->tupleSteps[0][MODALITY_QUIET].empty()
+              && pawnInfo->tupleSteps[0][MODALITY_CAPTURE].empty()
+              && pawnInfo->tupleSlider[0][MODALITY_QUIET].empty()
+              && pawnInfo->tupleSlider[0][MODALITY_CAPTURE].empty();
+      }
 }
 
 void PieceMap::add(PieceType pt, PieceInfo* p) {
@@ -956,6 +1066,14 @@ void PieceMap::add(PieceType pt, PieceInfo* p) {
       runtimeRiderAugmentTypes |= piece_set(pt);
   else
       runtimeRiderAugmentTypes &= ~piece_set(pt);
+  if (p && p->has_simple_hopper_capture())
+      simpleHopperCaptureTypes |= piece_set(pt);
+  else
+      simpleHopperCaptureTypes &= ~piece_set(pt);
+  if (p && p->needs_generic_attack_assembly())
+      genericAttackAssemblyTypes |= piece_set(pt);
+  else
+      genericAttackAssemblyTypes &= ~piece_set(pt);
 }
 
 void PieceMap::clear_all() {
@@ -964,6 +1082,8 @@ void PieceMap::clear_all() {
   clear();
   direct.fill(nullptr);
   runtimeRiderAugmentTypes = PieceSet(0);
+  simpleHopperCaptureTypes = PieceSet(0);
+  genericAttackAssemblyTypes = PieceSet(0);
 }
 
 } // namespace Stockfish

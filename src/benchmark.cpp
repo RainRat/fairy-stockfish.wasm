@@ -148,21 +148,22 @@ vector<string> setup_bench(const Position& current, istream& is) {
   string limitType = next_arg(idx, "depth");
   string evalType  = next_arg(idx, "mixed");
 
-  auto is_uint = [](const string& s) {
-      return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; });
+  auto is_uint = [](const string& s, bool allowZero = true) {
+      return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; })
+             && (allowZero || std::any_of(s.begin(), s.end(), [](char ch) { return ch != '0'; }));
   };
-  if (!is_uint(ttSize))
+  if (!is_uint(ttSize, false))
       ttSize = "16";
-  if (!is_uint(threads))
+  if (!is_uint(threads, false))
       threads = "1";
-  if (limitType != "eval" && !is_uint(limit))
-      limit = "13";
   if (   limitType != "depth"
       && limitType != "perft"
       && limitType != "nodes"
       && limitType != "movetime"
       && limitType != "eval")
       limitType = "depth";
+  if (limitType != "eval" && !is_uint(limit, true))
+      limit = "13";
   if (evalType != "mixed" && evalType != "classical" && evalType != "NNUE")
       evalType = "mixed";
 
@@ -214,10 +215,8 @@ vector<string> setup_bench(const Position& current, istream& is) {
           list.emplace_back(fen);
       else
       {
-          if (evalType == "classical" || (evalType == "mixed" && posCounter % 2 == 0))
-              list.emplace_back("setoption name Use NNUE value false");
-          else if (evalType == "NNUE" || (evalType == "mixed" && posCounter % 2 != 0))
-              list.emplace_back("setoption name Use NNUE value true");
+          bool use_nnue = evalType == "NNUE" || (evalType == "mixed" && posCounter % 2 != 0);
+          list.emplace_back(std::string("setoption name Use NNUE value ") + (use_nnue ? "true" : "false"));
           list.emplace_back("position fen " + fen);
           list.emplace_back(go);
           ++posCounter;

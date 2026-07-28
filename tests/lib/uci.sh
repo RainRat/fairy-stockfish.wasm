@@ -1,0 +1,488 @@
+#!/bin/bash
+
+# Detect project root directory relative to this script
+UCI_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "${UCI_LIB_DIR}/../.." && pwd)
+
+fsx_error() {
+  local test_name="$1"
+  local line="$2"
+  echo "${test_name} failed on line ${line}" >&2
+  exit 1
+}
+
+FSX_EXIT_CLEANUPS=()
+
+fsx_run_exit_cleanups() {
+  local status=$?
+  local cleanup
+
+  set +e
+  for cleanup in "${FSX_EXIT_CLEANUPS[@]}"; do
+    eval "${cleanup}"
+  done
+
+  return "${status}"
+}
+
+fsx_add_exit_cleanup() {
+  local cleanup="${1:-}"
+
+  if [[ -z "${cleanup}" ]]; then
+    return
+  fi
+
+  if [[ ${#FSX_EXIT_CLEANUPS[@]} -eq 0 ]]; then
+    trap fsx_run_exit_cleanups EXIT
+  fi
+
+  FSX_EXIT_CLEANUPS+=("${cleanup}")
+}
+
+setup_test_context() {
+  local engine_arg="${1:-}"
+  local variants_arg="${2:-}"
+  local test_name="${3:-${BASH_SOURCE[1]##*/}}"
+
+  if [[ -z "${SCRIPT_DIR:-}" ]]; then
+    SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)
+  fi
+  if [[ -z "${ROOT_DIR:-}" ]]; then
+    ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+  fi
+
+  ENGINE="${ENGINE:-$(default_engine "${engine_arg}")}"
+  VARIANTS="${VARIANTS:-$(default_variants "${variants_arg}")}"
+  VARIANT_PATH="${VARIANTS}"
+  export SCRIPT_DIR ROOT_DIR ENGINE VARIANTS VARIANT_PATH
+
+  FSX_TEST_NAME="${test_name}"
+  export FSX_TEST_NAME
+  set -E
+  trap 'fsx_error "${FSX_TEST_NAME}" "${LINENO}"' ERR
+}
+
+init_test_env() {
+  setup_test_context "$@"
+}
+
+default_engine() {
+  local custom_engine="${1:-}"
+  if [[ -n "$custom_engine" ]]; then
+    case "$custom_engine" in
+      /*) echo "$custom_engine" ;;
+      *) echo "${ROOT_DIR}/${custom_engine}" ;;
+    esac
+  elif [[ -x "${ROOT_DIR}/src/stockfish" ]]; then
+    echo "${ROOT_DIR}/src/stockfish"
+  else
+    echo "${ROOT_DIR}/stockfish"
+  fi
+}
+
+default_variants() {
+  local custom_variants="${1:-}"
+  if [[ -n "$custom_variants" ]]; then
+    case "$custom_variants" in
+      /*) echo "$custom_variants" ;;
+      *) echo "${ROOT_DIR}/${custom_variants}" ;;
+    esac
+  else
+    echo "${ROOT_DIR}/src/variants.ini"
+  fi
+}
+
+assert_contains_literal() {
+  local haystack="$1"
+  local needle="$2"
+  local context="${3:-contains}"
+
+  if ! grep -Fq "$needle" <<<"$haystack"; then
+    echo "expected output to ${context}: $needle" >&2
+    echo "actual output:" >&2
+    printf '%s\n' "$haystack" >&2
+    return 1
+  fi
+}
+
+assert_not_contains_literal() {
+  local haystack="$1"
+  local needle="$2"
+  local context="${3:-not contain}"
+
+  if grep -Fq "$needle" <<<"$haystack"; then
+    echo "expected output to ${context}: $needle" >&2
+    echo "actual output:" >&2
+    printf '%s\n' "$haystack" >&2
+    return 1
+  fi
+}
+
+uci_timeout() {
+  timeout "${UCI_TIMEOUT:-60s}" "$@"
+}
+
+run_uci() {
+  local engine="$1"
+  local variant_path="$2"
+  local variant="$3"
+  shift 3
+
+  {
+    printf 'uci\n'
+    printf 'setoption name VariantPath value %s\n' "$variant_path"
+    printf 'setoption name UCI_Variant value %s\n' "$variant"
+    cat
+    printf 'quit\n'
+  } | uci_timeout "$engine"
+}
+
+run_uci_cmds() {
+  local engine="$1"
+  local variant_path="$2"
+  local variant="$3"
+  local cmds="$4"
+  run_uci "$engine" "$variant_path" "$variant" <<< "$cmds"
+}
+
+run_cmds() {
+  run_uci_cmds "$@"
+}
+
+probe_variant_available() {
+  local engine="$1"
+  local variant="$2"
+  local variant_path="${3:-${VARIANTS}}"
+  local out
+
+  out=$(run_uci "$engine" "$variant_path" "$variant" <<<'d' 2>&1)
+  FSX_VARIANT_PROBE_OUTPUT="$out"
+  export FSX_VARIANT_PROBE_OUTPUT
+  grep -Fq "info string variant ${variant} " <<<"$out"
+}
+
+declare -A FSX_VARIANT_META_LOADED=()
+declare -A FSX_VARIANT_PARENT=()
+declare -A FSX_VARIANT_MAX_FILE=()
+declare -A FSX_VARIANT_MAX_RANK=()
+
+fsx_file_index() {
+  local value="${1,,}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo $((10#$value - 1))
+  else
+    local code
+    printf -v code '%d' "'${value:0:1}"
+    echo $((code - 97))
+  fi
+}
+
+fsx_variant_load_metadata() {
+  local variant_path="$1"
+  local current_variant=""
+  local current_parent=""
+  local line section
+
+  if [[ -n "${FSX_VARIANT_META_LOADED["$variant_path"]:-}" ]]; then
+    return
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      \[*\])
+        section="${line#[}"
+        section="${section%]}"
+        current_variant="${section%%:*}"
+        current_parent=""
+        if [[ "$section" == *:* ]]; then
+          current_parent="${section#*:}"
+          [[ "$current_parent" == "$current_variant" ]] && current_parent=""
+        fi
+        FSX_VARIANT_PARENT["${variant_path}::${current_variant}"]="${current_parent}"
+        ;;
+      maxFile\ =\ *)
+        if [[ -n "$current_variant" ]]; then
+          FSX_VARIANT_MAX_FILE["${variant_path}::${current_variant}"]="$(fsx_file_index "${line#maxFile = }")"
+        fi
+        ;;
+      maxRank\ =\ *)
+        if [[ -n "$current_variant" ]]; then
+          FSX_VARIANT_MAX_RANK["${variant_path}::${current_variant}"]="$((10#${line#maxRank = } - 1))"
+        fi
+        ;;
+    esac
+  done < "$variant_path"
+
+  FSX_VARIANT_META_LOADED["$variant_path"]=1
+}
+
+fsx_variant_effective_limits() {
+  local variant_path="$1"
+  local variant="$2"
+  local current="$variant"
+  local key parent
+  local max_file=-1
+  local max_rank=-1
+  local depth=0
+
+  fsx_variant_load_metadata "$variant_path"
+
+  while [[ -n "$current" && $depth -lt 32 ]]; do
+    key="${variant_path}::${current}"
+    if [[ $max_file -lt 0 && -n "${FSX_VARIANT_MAX_FILE["$key"]:-}" ]]; then
+      max_file="${FSX_VARIANT_MAX_FILE["$key"]}"
+    fi
+    if [[ $max_rank -lt 0 && -n "${FSX_VARIANT_MAX_RANK["$key"]:-}" ]]; then
+      max_rank="${FSX_VARIANT_MAX_RANK["$key"]}"
+    fi
+    parent="${FSX_VARIANT_PARENT["$key"]:-}"
+    if [[ -z "$parent" || "$parent" == "$current" ]]; then
+      break
+    fi
+    current="$parent"
+    ((++depth))
+  done
+
+  [[ $max_file -lt 0 ]] && max_file=7
+  [[ $max_rank -lt 0 ]] && max_rank=7
+  printf '%s %s\n' "$max_file" "$max_rank"
+}
+
+fsx_build_variant_limits() {
+  local engine="$1"
+  local engine_basen="${engine##*/}"
+
+  case "$engine_basen" in
+    stockfish-large*|stockfish-allvars*)
+      echo "9 11"
+      ;;
+    stockfish-vlb*)
+      echo "16 16"
+      ;;
+    *)
+      echo "7 7"
+      ;;
+  esac
+}
+
+fsx_variant_exceeds_build_limits() {
+  local engine="$1"
+  local variant="$2"
+  local variant_path="${3:-${VARIANTS}}"
+  local variant_file variant_rank build_file build_rank
+
+  read -r variant_file variant_rank < <(fsx_variant_effective_limits "$variant_path" "$variant")
+  read -r build_file build_rank < <(fsx_build_variant_limits "$engine")
+
+  [[ $variant_file -gt $build_file || $variant_rank -gt $build_rank ]]
+}
+
+fsx_variant_skipped_by_build_output() {
+  local variant="$1"
+  local variant_path="${2:-${VARIANTS}}"
+  local out="${3:-${FSX_VARIANT_PROBE_OUTPUT:-}}"
+  local summary_lines candidate
+  local -a candidates
+
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+
+  summary_lines=$(grep -E 'variants skipped because of board size limits|variant templates not found or skipped because of board size limits' <<<"$out" || true)
+  if [[ -z "$summary_lines" ]]; then
+    return 1
+  fi
+
+  candidates=("$variant")
+  fsx_variant_load_metadata "$variant_path"
+  local current="$variant" key parent depth=0
+  while [[ -n "$current" && $depth -lt 32 ]]; do
+    key="${variant_path}::${current}"
+    parent="${FSX_VARIANT_PARENT["$key"]:-}"
+    if [[ -z "$parent" || "$parent" == "$current" ]]; then
+      break
+    fi
+    candidates+=("$parent")
+    current="$parent"
+    ((++depth))
+  done
+
+  local candidate_name
+  for candidate_name in "${candidates[@]}"; do
+    if grep -Fq "$candidate_name" <<<"$summary_lines"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+variant_available() {
+  local engine="$1"
+  local variant="$2"
+  local variant_path="${3:-${VARIANTS}}"
+
+  if probe_variant_available "$engine" "$variant" "$variant_path"; then
+    return 0
+  fi
+
+  if fsx_variant_exceeds_build_limits "$engine" "$variant" "$variant_path"; then
+    return 1
+  fi
+
+  if fsx_variant_skipped_by_build_output "$variant" "$variant_path"; then
+    return 1
+  fi
+
+  echo "expected variant '${variant}' is missing from ${variant_path}" >&2
+  echo "build target ${engine##*/} should provide it; treat this as a regression" >&2
+  exit 1
+}
+
+cleanup_tmp_ini() {
+  if [[ -n "${FSX_TMP_INI:-}" && -e "${FSX_TMP_INI}" ]]; then
+    rm -f "${FSX_TMP_INI}"
+  fi
+  FSX_TMP_INI=
+  TMP_VARIANTS=
+}
+
+create_tmp_ini() {
+  cleanup_tmp_ini
+  FSX_TMP_INI=$(mktemp "${TMPDIR:-/tmp}/fsx-uci-XXXXXX.ini")
+  export FSX_TMP_INI
+  TMP_VARIANTS="${FSX_TMP_INI}"
+  export TMP_VARIANTS
+}
+
+init_tmp_ini() {
+  create_tmp_ini
+  fsx_add_exit_cleanup cleanup_tmp_ini
+}
+
+load_inline_variants() {
+  create_tmp_ini
+  cat >"${FSX_TMP_INI}"
+  fsx_add_exit_cleanup cleanup_tmp_ini
+}
+
+uci_position_command() {
+  local fen_or_startpos="$1"
+  shift
+
+  if [[ "$fen_or_startpos" == "startpos" ]]; then
+    printf 'position startpos'
+  else
+    printf 'position fen %s' "$fen_or_startpos"
+  fi
+
+  if (($#)); then
+    printf ' moves %s' "$*"
+  fi
+  printf '\n'
+}
+
+run_perft() {
+  local variant="$1"
+  local fen_or_startpos="$2"
+  local depth="$3"
+
+  run_uci "${ENGINE}" "${VARIANTS}" "${variant}" <<UCI
+$(uci_position_command "${fen_or_startpos}")
+go perft ${depth}
+UCI
+}
+
+run_display() {
+  local variant="$1"
+  local fen_or_startpos="$2"
+  shift 2
+
+  run_uci "${ENGINE}" "${VARIANTS}" "${variant}" <<UCI
+$(uci_position_command "${fen_or_startpos}" "$@")
+d
+UCI
+}
+
+engine_config_output() {
+  if [[ -z "${FSX_ENGINE_CONFIG_OUTPUT:-}" ]]; then
+    FSX_ENGINE_CONFIG_OUTPUT=$(make -C "${ROOT_DIR}/src" -s config-sanity)
+    export FSX_ENGINE_CONFIG_OUTPUT
+  fi
+  printf '%s\n' "${FSX_ENGINE_CONFIG_OUTPUT}"
+}
+
+engine_config_value() {
+  local key="$1"
+  engine_config_output | sed -n "s/^${key}: //p" | tail -n1
+}
+
+run_engine_stdin() {
+  local engine="$1"
+  local input="$2"
+
+  printf '%s' "$input" | uci_timeout "$engine" 2>&1
+}
+
+bench_nodes() {
+  awk '/Nodes searched  : / {print $4}' | tail -n1
+}
+
+expect_engine_setup() {
+  local spawn_args="${1:-}"
+
+  printf '   set engine [lindex $argv 0]\n'
+  printf '   spawn $engine%s\n' "${spawn_args:+ ${spawn_args}}"
+}
+
+run_expect() {
+  local timeout_seconds="${EXPECT_TIMEOUT:-20}"
+  local exp_file
+  local status
+
+  exp_file=$(mktemp "${TMPDIR:-/tmp}/fsx-expect-XXXXXX.exp")
+  cat >"${exp_file}"
+
+  if timeout "${timeout_seconds}" expect "${exp_file}" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  rm -f "${exp_file}"
+  return "${status}"
+}
+
+
+assert_contains() {
+  local haystack="$1"
+  local pattern="$2"
+  local context="${3:-contains}"
+
+  if ! grep -Eq "$pattern" <<<"$haystack"; then
+    echo "expected output to ${context}: $pattern" >&2
+    echo "actual output:" >&2
+    printf '%s\n' "$haystack" >&2
+    return 1
+  fi
+}
+
+assert_not_contains() {
+  local haystack="$1"
+  local pattern="$2"
+  local context="${3:-not contain}"
+
+  if grep -Eq "$pattern" <<<"$haystack"; then
+    echo "expected output to ${context}: $pattern" >&2
+    echo "actual output:" >&2
+    printf '%s\n' "$haystack" >&2
+    return 1
+  fi
+}
+
+assert_nodes() {
+  local haystack="$1"
+  local expected="$2"
+
+  assert_contains "$haystack" "^Nodes searched: ${expected}$" "have exact node count"
+}

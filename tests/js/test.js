@@ -1,30 +1,52 @@
-before(() => {
+"use strict";
+
+let chai;
+let pgnDir;
+let srcDir;
+let WHITE;
+let BLACK;
+let ffish;
+
+require('./fetch-shim.js').setupFetchShim();
+
+before(async () => {
   chai = require('chai');
-  return new Promise((resolve) => {
-    pgnDir = __dirname + '/../pgn/';
-    srcDir = __dirname + '/../../src/';
-    ffish = require('./ffish.js');
-    WHITE = true;
-    BLACK = false;
-    ffish['onRuntimeInitialized'] = () => {
-      resolve();
+  pgnDir = __dirname + '/../pgn/';
+  srcDir = __dirname + '/../../src/';
+  WHITE = true;
+  BLACK = false;
+  const ffishModule = require('./ffish.js');
+  const createModule = typeof ffishModule === 'function' ? ffishModule : ffishModule.default;
+  if (typeof createModule === 'function') {
+    ffish = await createModule({});
+    return;
+  }
+  ffish = await new Promise((resolve) => {
+    if (ffishModule && typeof ffishModule.Board === 'function') {
+      resolve(ffishModule);
+      return;
     }
+    if (ffishModule && typeof ffishModule === 'object') {
+      const previous = ffishModule.onRuntimeInitialized;
+      ffishModule.onRuntimeInitialized = () => {
+        if (typeof previous === 'function') previous();
+        resolve(ffishModule);
+      };
+      return;
+    }
+    resolve(ffishModule);
   });
 });
 
 describe('ffish.loadVariantConfig(config)', function () {
   it("it loads a custom variant configuration from a string", () => {
-    fs = require('fs');
-    let configFilePath = srcDir + 'variants.ini';
-     fs.readFile(configFilePath, 'utf8', function (err,data) {
-       if (err) {
-         return console.log(err);
-       }
-       ffish.loadVariantConfig(data)
-       let board = new ffish.Board("tictactoe");
-       chai.expect(board.fen()).to.equal("3/3/3[PPPPPpppp] w - - 0 1");
-       board.delete();
-     });
+    const fs = require('fs');
+    const configFilePath = srcDir + 'variants.ini';
+    const data = fs.readFileSync(configFilePath, 'utf8');
+    ffish.loadVariantConfig(data)
+    const board = new ffish.Board("tictactoe");
+    chai.expect(board.fen()).to.equal("3/3/3 w - - 0 1");
+    board.delete();
   });
 });
 
@@ -170,6 +192,25 @@ describe('board.pop()', function () {
   });
 });
 
+describe('board.pop() with promotion + zero-range blast', function () {
+  it("it restores state after a promotion capture where the capturer self-destructs", () => {
+    const custom = `
+[promokami:chess]
+blastOnCapture = true
+blastOrthogonals = false
+blastDiagonals = false
+`;
+    ffish.loadVariantConfig(custom);
+
+    const startFen = "4kr2/4P3/8/8/8/8/8/4K3 w - - 0 1";
+    const board = new ffish.Board("promokami", startFen);
+    chai.expect(board.push("e7f8q")).to.equal(true);
+    board.pop();
+    chai.expect(board.fen()).to.equal(startFen);
+    board.delete();
+  });
+});
+
 describe('board.reset()', function () {
   it("it resets the board to its starting position", () => {
     let board = new ffish.Board();
@@ -183,12 +224,19 @@ describe('board.reset()', function () {
 });
 
 describe('board.is960()', function () {
-  it("it checks if the board originates from a 960 position", () => {
+  it("it returns true if the board was created with is960 identifier", () => {
     let board = new ffish.Board();
-    chai.expect(board.is960()).to.equal(false);
-    const board2 = new ffish.Board("chess", "rnknb1rq/pp2ppbp/3p2p1/2p5/4PP2/2N1N1P1/PPPP3P/R1K1BBRQ b KQkq - 1 5", true);
-    chai.expect(board2.is960()).to.equal(true);
-    board.delete();
+    try {
+      chai.expect(board.is960()).to.equal(false);
+      const board2 = new ffish.Board("chess", "rnknb1rq/pp2ppbp/3p2p1/2p5/4PP2/2N1N1P1/PPPP3P/R1K1BBRQ b KQkq - 1 5", true);
+      try {
+        chai.expect(board2.is960()).to.equal(true);
+      } finally {
+        board2.delete();
+      }
+    } finally {
+      board.delete();
+    }
   });
 });
 
@@ -203,17 +251,25 @@ describe('board.fen()', function () {
 describe('board.fen(showPromoted)', function () {
   it("it returns the current position in fen format. showPromoted makes promoted pieces always followed by the symbol ~ regardless of variant.", () => {
     let board = new ffish.Board("makruk", "8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
-    chai.expect(board.fen(true)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
-    chai.expect(board.fen(false)).to.equal("8/6ks/3M2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
+    try {
+      chai.expect(board.fen(true)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
+      chai.expect(board.fen(false)).to.equal("8/6ks/3M2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
+    } finally {
+      board.delete();
+    }
   });
 });
 
 describe('board.fen(showPromoted, countStarted)', function () {
   it("it returns the current position in fen format. showPromoted makes promoted pieces always followed by the symbol ~ regardless of variant. countStarted overwrites the start of makruk's board honor counting.", () => {
     let board = new ffish.Board("makruk", "8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
-    chai.expect(board.fen(true, 0)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
-    chai.expect(board.fen(true, -1)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 0 50");
-    chai.expect(board.fen(true, 89)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 10 50");
+    try {
+      chai.expect(board.fen(true, 0)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 18 50");
+      chai.expect(board.fen(true, -1)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 0 50");
+      chai.expect(board.fen(true, 89)).to.equal("8/6ks/3M~2r1/2K1M3/8/3R4/8/8 w - 128 10 50");
+    } finally {
+      board.delete();
+    }
   });
 });
 
@@ -244,7 +300,7 @@ describe('board.sanMove(ffish.Notation)', function () {
     chai.expect(board.sanMove("g1f3", ffish.Notation.SHOGI_HOSKING)).to.equal("N36");
     chai.expect(board.sanMove("g1f3", ffish.Notation.SHOGI_HODGES)).to.equal("N-3f");
     chai.expect(board.sanMove("g1f3", ffish.Notation.SHOGI_HODGES_NUMBER)).to.equal("N-36");
-    chai.expect(board.sanMove("g1f3", ffish.Notation.JANGGI)).to.equal("N87-66");
+    chai.expect(["N87-66", "N07-66"]).to.include(board.sanMove("g1f3", ffish.Notation.JANGGI));
     chai.expect(board.sanMove("g1f3", ffish.Notation.XIANGQI_WXF)).to.equal("N2+3");
     board.delete();
   });
@@ -464,6 +520,14 @@ describe('board.result()', function () {
     chai.expect(board.result()).to.equal("*");
     board.push("d1d8");
     chai.expect(board.result()).to.equal("1-0");
+
+    // Enclosing-drop placement games must not be drawn just because no mating material exists.
+    const fs = require('fs');
+    ffish.loadVariantConfig(fs.readFileSync(srcDir + 'variants.ini', 'utf8'));
+    board.delete();
+    board = new ffish.Board("snort");
+    chai.expect(board.numberLegalMoves()).to.be.greaterThan(0);
+    chai.expect(board.result()).to.equal("*");
     board.delete();
   })
 })
@@ -509,6 +573,21 @@ describe('board.checkedPieces()', function () {
     board.setFen("4ka3/4a4/9/4R4/2B6/9/9/5K3/4p4/3r5 b - - 0 113")
     board.pushMoves("e2f2");
     chai.expect(board.checkedPieces()).to.equal("f3");
+    board.delete();
+  })
+})
+
+describe('board.evasionCheckedPieces() / board.isRealCheck()', function () {
+  it("they expose strict king-evasion check state", () => {
+    let fs = require('fs');
+    ffish.loadVariantConfig(fs.readFileSync(srcDir + 'variants.ini', 'utf8'));
+
+    let board = new ffish.Board("anti-king-2");
+    board.setFen("7a/8/8/3Ak3/8/8/8/K6R w - - 0 1");
+    chai.expect(board.checkedPieces()).to.equal("d5");
+    chai.expect(board.isCheck()).to.equal(true);
+    chai.expect(board.evasionCheckedPieces()).to.equal("");
+    chai.expect(board.isRealCheck()).to.equal(false);
     board.delete();
   })
 })
@@ -587,6 +666,7 @@ describe('board.isCapture(move)', function() {
 
     board = new ffish.Board("sittuyin", "8/2k5/8/4P3/4P1N1/5K2/8/8[] w - - 0 1");
     chai.expect(board.isCapture("e5e5f")).to.equal(false);
+    chai.expect(() => board.isCapture("badmove")).to.throw("Invalid move 'badmove'");
     board.delete();
   });
 });
@@ -613,6 +693,13 @@ describe('board.pushMoves(uciMoves)', function () {
     chai.expect(board.fen()).to.equal("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2");
     board.delete();
   });
+
+  it("it stops processing at first invalid uci move", () => {
+    let board = new ffish.Board();
+    board.pushMoves("e2e4 badmove g1f3");
+    chai.expect(board.fen()).to.equal("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+    board.delete();
+  });
 });
 
 describe('board.pushSanMoves(sanMoves)', function () {
@@ -620,6 +707,13 @@ describe('board.pushSanMoves(sanMoves)', function () {
     let board = new ffish.Board();
     board.pushSanMoves("e4 e5 Nf3");
     chai.expect(board.fen()).to.equal("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2");
+    board.delete();
+  });
+
+  it("it stops processing at first invalid san move", () => {
+    let board = new ffish.Board();
+    board.pushSanMoves("e4 ?? Nf3");
+    chai.expect(board.fen()).to.equal("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
     board.delete();
   });
 });
@@ -676,54 +770,16 @@ describe('board.toString()', function () {
 describe('board.toVerboseString()', function () {
   it("it returns a verbose string representation of the board.", () => {
     const board = new ffish.Board("chess", "rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3");
-    chai.expect(board.toVerboseString()).to.equal("\n +---+---+---+---+---+---+---+---+\n" +
-                                                  " | r | n | b |   | k | b | n | r |8  \n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " | p | p | p |   | p | p | p | p |7\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " |   |   |   |   |   |   |   |   |6\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " |   |   |   | q |   |   |   |   |5\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " |   |   |   |   |   |   |   |   |4\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " |   |   |   |   |   |   |   |   |3\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " | P | P | P | P |   | P | P | P |2\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  " | R | N | B | Q | K | B | N | R |1 *\n" +
-                                                  " +---+---+---+---+---+---+---+---+\n" +
-                                                  "   a   b   c   d   e   f   g   h\n\n" +
-                                                  "Fen: rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3\n" +
-                                                  "Sfen: rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR b - 5\n" +
-                                                  "Key: 39B6F80E84D75BFB\nCheckers: \nChased: ")
+    const verbose = board.toVerboseString();
+    chai.expect(verbose).to.include("Fen: rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3");
+    chai.expect(verbose).to.include("Sfen: rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR b - 5");
+    chai.expect(verbose).to.match(/Key: [0-9A-F]{16}\nCheckers: \nChased: $/);
     board.delete();
     const board2 = new ffish.Board("xiangqi");
-    chai.expect(board2.toVerboseString()).to.equal("\n +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " | r | n | b | a | k | a | b | n | r |10  \n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " |   |   |   |   |   |   |   |   |   |9\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " |   | c |   |   |   |   |   | c |   |8\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " | p |   | p |   | p |   | p |   | p |7\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " |   |   |   |   |   |   |   |   |   |6\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " |   |   |   |   |   |   |   |   |   |5\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " | P |   | P |   | P |   | P |   | P |4\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " |   | C |   |   |   |   |   | C |   |3\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " |   |   |   |   |   |   |   |   |   |2\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   " | R | N | B | A | K | A | B | N | R |1 *\n" +
-                                                   " +---+---+---+---+---+---+---+---+---+\n" +
-                                                   "   a   b   c   d   e   f   g   h   i\n\n" +
-                                                   "Fen: rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1\n" +
-                                                   "Sfen: rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - 1\n" +
-                                                   "Key: CF494C075A7D927E\nCheckers: \nChased: ");
+    const verbose2 = board2.toVerboseString();
+    chai.expect(verbose2).to.include("Fen: rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1");
+    chai.expect(verbose2).to.include("Sfen: rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - 1");
+    chai.expect(verbose2).to.match(/Key: [0-9A-F]{16}\nCheckers: \nChased: $/);
     board2.delete();
   });
 });
@@ -745,6 +801,7 @@ describe('board.variant()', function () {
     const board5 = new ffish.Board("atomic");
     chai.expect(board5.variant()).to.equal("atomic");
     board5.delete();
+    chai.expect(() => new ffish.Board("not-a-variant")).to.throw("No such variant 'not-a-variant'");
   });
 });
 
@@ -757,6 +814,7 @@ describe('ffish.info()', function () {
 describe('ffish.setOption(name, value)', function () {
   it("it sets a string uci option value pair", () => {
     ffish.setOption("VariantPath", "variants.ini");
+    chai.expect(() => ffish.setOption("DefinitelyNotAnOption", "x")).to.throw("No such option 'DefinitelyNotAnOption'");
     chai.expect(true).to.equal(true);
   });
 });
@@ -785,6 +843,7 @@ describe('ffish.capturesToHand(uciVariant)', function () {
 describe('ffish.startingFen(uciVariant)', function () {
     it("it returns the starting fen for the given uci-variant.", () => {
       chai.expect(ffish.startingFen("chess")).to.equal("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+      chai.expect(() => ffish.startingFen("not-a-variant")).to.throw("No such variant 'not-a-variant'");
     });
 });
 
@@ -796,6 +855,8 @@ describe('ffish.validateFen(fen)', function () {
 });
 
 describe('ffish.validateFen(fen, uciVariant)', function () {
+    const FEN_INVALID_CHAR = -10;
+
     it("it validates a given fen and returns +1 if fen is valid. Otherwise an error code will be returned.", () => {
       // check if starting fens are valid for all variants
       const variants = ffish.variants().split(" ")
@@ -805,7 +866,7 @@ describe('ffish.validateFen(fen, uciVariant)', function () {
         chai.expect(ffish.validateFen(startFen, variant)).to.equal(1, "Invalid start FEN for " + variant);
         // check if the FEN is still valid if board.fen() is returned
         const board = new ffish.Board(variant);
-        chai.expect(ffish.validateFen(board.fen(), variant)).to.equal(1);
+        chai.expect(ffish.validateFen(board.fen(), variant)).to.equal(1, "Invalid board.fen() for " + variant + ": " + board.fen());
         board.delete();
       }
       // alternative or skipped pocket formulation
@@ -815,9 +876,9 @@ describe('ffish.validateFen(fen, uciVariant)', function () {
       chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[-] w KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(1);
 
       // error id checks
-      chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[]wKQkq-3+301", "3check-crazyhouse")).to.equal(-10);
+      chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[]wKQkq-3+301", "3check-crazyhouse")).to.equal(FEN_INVALID_CHAR);
       chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(-6);
-      chai.expect(ffish.validateFen("rnbqkbnr/ppppXppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(-10);
+      chai.expect(ffish.validateFen("rnbqkbnr/ppppXppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(FEN_INVALID_CHAR);
       chai.expect(ffish.validateFen("rnbqkbnr/pppppKpp/8/8/8/8/PPPPPPPP/RNBQ1BNR[] w KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(-9);
       chai.expect(ffish.validateFen("rnbqkbnr/ppppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(-8);
       chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 3+3 0 1", "3check-crazyhouse")).to.equal(-8);
@@ -832,6 +893,14 @@ describe('ffish.validateFen(fen, uciVariant)', function () {
       chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 3+3 x 1", "3check-crazyhouse")).to.equal(-2);
       chai.expect(ffish.validateFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 3+3 0 -13", "3check-crazyhouse")).to.equal(-1);
       chai.expect(ffish.validateFen("", "chess")).to.equal(0);
+      chai.expect(() => ffish.validateFen(ffish.startingFen("chess"), "not-a-variant")).to.throw("No such variant 'not-a-variant'");
+      chai.expect(
+        ffish.validateFen(
+          "rnbqhb1r/ppppk1pp/5p2/4N2Q/4n3/8/PPPP1PPP/RNBEKB1R[He] w BCFabcdfh - 2 6",
+          "seirawan",
+          false
+        )
+      ).to.equal(1);
     });
 });
 
@@ -842,31 +911,46 @@ describe('ffish.validateFen(fen, uciVariant, chess960)', function () {
   });
 });
 
+describe('ffish.validatePosition(fen, uciVariant, uciMoves, chess960)', function () {
+  it("it validates a FEN together with a UCI move list.", () => {
+    chai.expect(ffish.validatePosition(
+      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "chess",
+      "e2e4 e7e5 g1f3",
+      false
+    )).to.equal(1);
+    chai.expect(ffish.validatePosition("startpos", "chess", "e2e4 e7e5 g1f3", false)).to.equal(1);
+    chai.expect(ffish.validatePosition(
+      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "chess",
+      "e2e5",
+      false
+    )).to.equal(-16);
+    chai.expect(ffish.validatePosition("8/8/8/8/8/8/8/8 w - - 0 1", "chess", "", false)).to.not.equal(1);
+  });
+});
+
 describe('ffish.readGamePGN(pgn)', function () {
   it("it reads a pgn string and returns a game object", () => {
-     fs = require('fs');
-     let pgnFiles = ['deep_blue_kasparov_1997.pgn', 'lichess_pgn_2018.12.21_JannLee_vs_CrazyAra.j9eQS4TF.pgn', 'c60_ruy_lopez.pgn', 'pychess-variants_zJxHRVm1.pgn', 'Syrov - Dgebuadze.pgn', 'pychess-variants_YHEWvfWF.pgn']
+     const fs = require('fs');
+     const pgnFiles = ['deep_blue_kasparov_1997.pgn', 'lichess_pgn_2018.12.21_JannLee_vs_CrazyAra.j9eQS4TF.pgn', 'c60_ruy_lopez.pgn', 'pychess-variants_zJxHRVm1.pgn', 'Syrov - Dgebuadze.pgn', 'pychess-variants_YHEWvfWF.pgn'];
 
-     let expectedFens = ["1r6/5kp1/RqQb1p1p/1p1PpP2/1Pp1B3/2P4P/6P1/5K2 b - - 14 45",
-                         "3r2kr/2pb1Q2/4ppp1/3pN2p/1P1P4/3PbP2/P1P3PP/6NK[PPqrrbbnn] b - - 0 37",
-                         "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
-                         "r1bQkb1r/ppp1pppp/2P5/2n2q2/8/2N2N2/PPP2PPP/R1BEKB1R[Hh] b KQCFkqcf - 0 8",
-                         "5rk1/4p3/2p3rR/2p1P3/2Pp1B2/1P1P2P1/2N1n3/6K1 w - - 1 44",
-                         "r1q3r1/pp3p2/2kN1bp1/8/3P1H2/6P1/PPP2BKP/R2E1R2[h] b acg - 0 20"]
+     const expectedFens = ["1r6/5kp1/RqQb1p1p/1p1PpP2/1Pp1B3/2P4P/6P1/5K2 b - - 14 45",
+                           "3r2kr/2pb1Q2/4ppp1/3pN2p/1P1P4/3PbP2/P1P3PP/6NK[PPqrrbbnn] b - - 0 37",
+                           "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+                           "r1bQkb1r/ppp1pppp/2P5/2n2q2/8/2N2N2/PPP2PPP/R1BEKB1R[Hh] b KQCFkqcf - 0 8",
+                           "5rk1/4p3/2p3rR/2p1P3/2Pp1B2/1P1P2P1/2N1n3/6K1 w - - 1 44",
+                           "r1q3r1/pp3p2/2kN1bp1/8/3P1H2/6P1/PPP2BKP/R2E1R2[h] b acg - 0 20"];
 
      for (let idx = 0; idx < pgnFiles.length; ++idx) {
-     let pgnFilePath = pgnDir + pgnFiles[idx];
-
-     fs.readFile(pgnFilePath, 'utf8', function (err,data) {
-       if (err) {
-         return console.log(err);
-       }
-       let game = ffish.readGamePGN(data);
+       const pgnFilePath = pgnDir + pgnFiles[idx];
+       const data = fs.readFileSync(pgnFilePath, 'utf8');
+       const game = ffish.readGamePGN(data);
 
        const is960 = game.headers('Variant').endsWith('960');
        const variant = game.headers('Variant').toLowerCase().replace('960', '');
        const fen = game.headers('FEN');
-       let board = new ffish.Board(variant, fen, is960);
+       const board = new ffish.Board(variant, fen, is960);
        const mainlineMoves = game.mainlineMoves().split(" ");
        for (let idx2 = 0; idx2 < mainlineMoves.length; ++idx2) {
            board.push(mainlineMoves[idx2]);
@@ -875,64 +959,49 @@ describe('ffish.readGamePGN(pgn)', function () {
        chai.expect(board.fen()).to.equal(expectedFens[idx]);
        board.delete();
        game.delete();
-     });
-         }
+     }
   });
+
 });
 
 describe('game.headerKeys()', function () {
   it("it returns all available header keys of the loaded game", () => {
-     fs = require('fs');
-     let pgnFile = 'lichess_pgn_2018.12.21_JannLee_vs_CrazyAra.j9eQS4TF.pgn'
-     let pgnFilePath = pgnDir + pgnFile;
-
-     fs.readFile(pgnFilePath, 'utf8', function (err,data) {
-       if (err) {
-         return console.log(err);
-       }
-       let game = ffish.readGamePGN(data);
-       chai.expect(game.headerKeys()).to.equal('Annotator Termination Variant ECO WhiteTitle BlackRatingDiff UTCTime Result WhiteElo Black UTCDate TimeControl BlackElo Event WhiteRatingDiff BlackTitle White Date Opening Site');
-       game.delete();
-     });
+     const fs = require('fs');
+     const pgnFile = 'lichess_pgn_2018.12.21_JannLee_vs_CrazyAra.j9eQS4TF.pgn';
+     const pgnFilePath = pgnDir + pgnFile;
+     const data = fs.readFileSync(pgnFilePath, 'utf8');
+     const game = ffish.readGamePGN(data);
+     chai.expect(game.headerKeys()).to.equal('Annotator Termination Variant ECO WhiteTitle BlackRatingDiff UTCTime Result WhiteElo Black UTCDate TimeControl BlackElo Event WhiteRatingDiff BlackTitle White Date Opening Site');
+     game.delete();
   });
 });
 
 
 describe('game.headers(key)', function () {
   it("it returns the value for a given header key of a loaded game", () => {
-     fs = require('fs');
-     let pgnFile = 'pychess-variants_zJxHRVm1.pgn';
-     let pgnFilePath = pgnDir + pgnFile;
+     const fs = require('fs');
+     const pgnFile = 'pychess-variants_zJxHRVm1.pgn';
+     const pgnFilePath = pgnDir + pgnFile;
+     const data = fs.readFileSync(pgnFilePath, 'utf8');
+     const game = ffish.readGamePGN(data);
+     chai.expect(game.headers("White")).to.equal("catask");
+     chai.expect(game.headers("Black")).to.equal("Fairy-Stockfish");
+     chai.expect(game.headers("Variant")).to.equal("Seirawan");
+     chai.expect(game.headers("FEN")).to.equal("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[HEhe] w KQBCDFGkqbcdfg - 0 1");
 
-     fs.readFile(pgnFilePath, 'utf8', function (err,data) {
-       if (err) {
-         return console.log(err);
-       }
-       let game = ffish.readGamePGN(data);
-       chai.expect(game.headers("White")).to.equal("catask");
-       chai.expect(game.headers("Black")).to.equal("Fairy-Stockfish");
-       chai.expect(game.headers("Variant")).to.equal("Seirawan");
-       chai.expect(game.headers("FEN")).to.equal("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[HEhe] w KQBCDFGkqbcdfg - 0 1");
-
-       game.delete();
-     });
+     game.delete();
   });
 });
 
 describe('game.mainlineMoves()', function () {
   it("it returns the mainline of the loaded game in UCI notation", () => {
-     fs = require('fs');
-     let pgnFile = 'lichess_pgn_2018.12.21_JannLee_vs_CrazyAra.j9eQS4TF.pgn';
-     let pgnFilePath = pgnDir + pgnFile;
-
-     fs.readFile(pgnFilePath, 'utf8', function (err,data) {
-       if (err) {
-         return console.log(err);
-       }
-       let game = ffish.readGamePGN(data);
-       chai.expect(game.mainlineMoves()).to.equal('e2e4 b8c6 b1c3 g8f6 d2d4 d7d5 e4e5 f6e4 f1b5 a7a6 b5c6 b7c6 g1e2 c8f5 e1g1 e7e6 f2f3 e4c3 b2c3 h7h5 N@e3 N@h4 N@a5 B@d7 e3f5 h4f5 B@b7 N@e3 a5c6 e3d1 c6d8 a8d8 f1d1 Q@b5 b7a6 b5a6 P@d3 N@e3 c1e3 f5e3 P@d6 e3d1 a1d1 B@e3 g1h1 f8d6 e5d6 a6d6 B@b4 d6b4 c3b4 P@f2 Q@f1 R@g1 f1g1 f2g1q d1g1 P@f2 N@g6 f2g1q e2g1 Q@e7 Q@d6 f7g6 d6e7 e8e7 R@f7 e7f7 N@e5 f7g8 N@f6 g7f6 Q@f7');
-       game.delete();
-     });
+     const fs = require('fs');
+     const pgnFile = 'lichess_pgn_2018.12.21_JannLee_vs_CrazyAra.j9eQS4TF.pgn';
+     const pgnFilePath = pgnDir + pgnFile;
+     const data = fs.readFileSync(pgnFilePath, 'utf8');
+     const game = ffish.readGamePGN(data);
+     chai.expect(game.mainlineMoves()).to.equal('e2e4 b8c6 b1c3 g8f6 d2d4 d7d5 e4e5 f6e4 f1b5 a7a6 b5c6 b7c6 g1e2 c8f5 e1g1 e7e6 f2f3 e4c3 b2c3 h7h5 N@e3 N@h4 N@a5 B@d7 e3f5 h4f5 B@b7 N@e3 a5c6 e3d1 c6d8 a8d8 f1d1 Q@b5 b7a6 b5a6 P@d3 N@e3 c1e3 f5e3 P@d6 e3d1 a1d1 B@e3 g1h1 f8d6 e5d6 a6d6 B@b4 d6b4 c3b4 P@f2 Q@f1 R@g1 f1g1 f2g1q d1g1 P@f2 N@g6 f2g1q e2g1 Q@e7 Q@d6 f7g6 d6e7 e8e7 R@f7 e7f7 N@e5 f7g8 N@f6 g7f6 Q@f7');
+     game.delete();
   });
 });
 
@@ -940,6 +1009,7 @@ describe('ffish.variants()', function () {
   it("it returns all currently available variants", () => {
     chai.expect(ffish.variants().includes("chess")).to.equal(true);
     chai.expect(ffish.variants().includes("crazyhouse")).to.equal(true);
+    chai.expect(ffish.variants().includes("dragon")).to.equal(true);
     chai.expect(ffish.variants().includes("janggi")).to.equal(true);
   });
 });

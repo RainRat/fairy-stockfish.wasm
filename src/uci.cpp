@@ -16,9 +16,11 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <cstdlib>
 #include <cassert>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -31,6 +33,7 @@
 #include "timeman.h"
 #include "tt.h"
 #include "uci.h"
+#include "apiutil.h"
 #include "xboard.h"
 #include "syzygy/tbprobe.h"
 
@@ -41,6 +44,18 @@ namespace Stockfish {
 extern vector<string> setup_bench(const Position&, istream&);
 
 namespace {
+
+  bool contains_case_insensitive(const std::string& haystack, const std::string& needle) {
+    if (needle.empty())
+        return true;
+
+    auto it = std::search(haystack.begin(), haystack.end(),
+                          needle.begin(), needle.end(),
+                          [](unsigned char a, unsigned char b) {
+                              return std::tolower(a) == std::tolower(b);
+                          });
+    return it != haystack.end();
+  }
 
   // position() is called when engine receives the "position" UCI command.
   // The function sets up the position described in the given FEN string ("fen")
@@ -85,7 +100,7 @@ namespace {
 
     StateListPtr states(new std::deque<StateInfo>(1));
     Position p;
-    p.set(pos.variant(), pos.fen(), Options["UCI_Chess960"], &states->back(), Threads.main());
+    p.set(pos.variant(), pos.fen(), pos.is_chess960(), &states->back(), Threads.main());
 
     Eval::NNUE::verify();
 
@@ -191,7 +206,7 @@ namespace {
     uint64_t num, nodes = 0, cnt = 1;
 
     vector<string> list = setup_bench(pos, args);
-    num = count_if(list.begin(), list.end(), [](string s) { return s.find("go ") == 0 || s.find("eval") == 0; });
+    num = count_if(list.begin(), list.end(), [](const string& s) { return s.find("go ") == 0 || s.find("eval") == 0; });
 
     TimePoint elapsed = now();
 
@@ -297,43 +312,124 @@ namespace {
 
     if (!v) return;
 
-    sync_cout << "\nVariant:  " << variantName
-              << "\nTemplate: " << v->variantTemplate
-              << "\nBoard:    " << v->maxFile + 1 << "x" << v->maxRank + 1
-              << (v->hexBoard ? " (hex)" : "")
-              << (v->cylindrical ? " (cylindrical)" : "")
-              << (v->toroidal ? " (toroidal)" : "")
-              << "\nPockets:  " << v->pocketSize
-              << "\nPieces:  ";
+    std::ostringstream oss;
+    oss << "\nVariant:  " << variantName
+        << "\nTemplate: " << v->variantTemplate
+        << "\nBoard:    " << v->maxFile + 1 << "x" << v->maxRank + 1
+        << (v->hexBoard ? " (hex)" : "")
+        << (v->cylindrical ? " (cylindrical)" : "")
+        << (v->toroidal ? " (toroidal)" : "")
+        << "\nPockets:  " << v->pocketSize
+        << "\nPieces:  ";
 
     for (PieceSet ps = v->pieceTypes; ps; )
     {
         PieceType pt = pop_lsb(ps);
         const PieceInfo* pi = pieceMap.get(pt);
-        sync_cout << " " << v->pieceToChar[make_piece(WHITE, pt)]
-                  << "(" << (pi ? pi->betza : "") << ")";
+        oss << " " << v->pieceToChar[make_piece(WHITE, pt)]
+            << "(" << (pi ? pi->betza : "") << ")";
     }
 
-    sync_cout << "\nRules:   ";
-    if (v->mustCapture[WHITE] || v->mustCapture[BLACK]) sync_cout << " mustCapture";
-    if (!v->checking)    sync_cout << " noChecking";
-    if (v->allowChecks)  sync_cout << " allowChecks";
-    if (v->castling)     sync_cout << " castling";
-    if (v->pieceDrops)   sync_cout << " pieceDrops";
-    if (v->gating)       sync_cout << " gating";
-    if (v->pass[WHITE] || v->pass[BLACK]) sync_cout << " pass";
-    if (v->checkCounting) sync_cout << " checkCounting";
-    if (v->pointsCounting) sync_cout << " pointsCounting";
-    if (v->potions)      sync_cout << " potions";
+    oss << "\nRules:   ";
+    if (v->mustCapture[WHITE] || v->mustCapture[BLACK]) oss << " mustCapture";
+    if (!v->checking)    oss << " noChecking";
+    if (v->allowChecks)  oss << " allowChecks";
+    if (v->castling)     oss << " castling";
+    if (v->pieceDrops)   oss << " pieceDrops";
+    if (v->gating)       oss << " gating";
+    if (v->pass[WHITE] || v->pass[BLACK]) oss << " pass";
+    if (v->checkCounting) oss << " checkCounting";
+    if (v->pointsCounting) oss << " pointsCounting";
+    if (v->potions)      oss << " potions";
 
-    sync_cout << "\nEndgame: ";
-    if (v->nMoveRule > 0) sync_cout << " " << v->nMoveRule << "-move-rule";
-    if (v->nFoldRule > 0) sync_cout << " " << v->nFoldRule << "-fold-repetition";
-    if (v->stalemateValue.global != VALUE_DRAW) sync_cout << " stalemate=" << (v->stalemateValue.global == -VALUE_MATE ? "lose" : (v->stalemateValue.global == VALUE_MATE ? "win" : std::to_string(int(v->stalemateValue.global))));
-    if (v->extinctionValue.global != VALUE_NONE) sync_cout << " extinction";
-    if (v->connectN > 0) sync_cout << " connect" << v->connectN;
+    oss << "\nEndgame: ";
+    if (v->nMoveRule > 0) oss << " " << v->nMoveRule << "-move-rule";
+    if (v->nFoldRule > 0) oss << " " << v->nFoldRule << "-fold-repetition";
+    if (v->stalemateValue.global != VALUE_DRAW) oss << " stalemate=" << (v->stalemateValue.global == -VALUE_MATE ? "lose" : (v->stalemateValue.global == VALUE_MATE ? "win" : std::to_string(int(v->stalemateValue.global))));
+    if (v->extinctionValue.global != VALUE_NONE) oss << " extinction";
+    if (v->connectN > 0) oss << " connect" << v->connectN;
 
-    sync_cout << sync_endl;
+    sync_cout << oss.str() << sync_endl;
+  }
+
+  // print_available_variants() prints a sorted list of all supported variants,
+  // optionally filtered by a search string.
+
+  void print_available_variants(const std::string& filter = "") {
+
+    std::vector<std::string> keys = variants.get_keys();
+    std::sort(keys.begin(), keys.end());
+
+    if (!filter.empty())
+    {
+        std::vector<std::string> filtered;
+        for (const auto& k : keys)
+            if (contains_case_insensitive(k, filter))
+                filtered.push_back(k);
+        keys = std::move(filtered);
+    }
+
+    if (keys.empty())
+    {
+        sync_cout << "No variants found matching '" << filter << "'." << sync_endl;
+        return;
+    }
+
+    sync_cout << "\nSupported Variants (" << keys.size() << "):" << sync_endl;
+
+    const int columns = 4;
+    const int width = 20;
+
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        sync_cout << std::left << std::setw(width) << keys[i];
+        if ((i + 1) % columns == 0 || i == keys.size() - 1)
+            sync_cout << sync_endl;
+    }
+
+    sync_cout << std::right;
+  }
+
+  // print_legal_moves() prints a sorted list of all legal moves in the current
+  // position using the specified notation (UCI or SAN).
+
+  void print_legal_moves(Position& pos, istringstream& is) {
+
+    string token;
+    is >> token;
+
+    Notation n = NOTATION_DEFAULT;
+
+    if (token == "san")
+        n = default_notation(pos.variant());
+    else if (token != "uci" && !token.empty())
+        sync_cout << "Unknown notation '" << token << "'; defaulting to UCI." << sync_endl;
+
+    std::vector<std::string> moves;
+    for (const auto& m : MoveList<LEGAL>(pos))
+        moves.push_back(n == NOTATION_DEFAULT ? UCI::move(pos, m) : SAN::move_to_san(pos, m, n));
+
+    std::sort(moves.begin(), moves.end());
+
+    if (moves.empty())
+    {
+        sync_cout << "No legal moves." << sync_endl;
+        return;
+    }
+
+    sync_cout << "\nLegal moves (" << moves.size() << "):" << sync_endl;
+
+    const int columns = 6;
+    const int width = 12;
+
+    for (size_t i = 0; i < moves.size(); ++i)
+    {
+        sync_cout << std::left << std::setw(width) << moves[i];
+        if ((i + 1) % columns == 0 || i == moves.size() - 1)
+            sync_cout << sync_endl;
+    }
+
+    sync_cout << std::right;
   }
 
 } // namespace
@@ -451,6 +547,9 @@ void UCI::loop(int argc, char* argv[]) {
                     << "\n  eval                        Show static evaluation of the position"
                     << "\n  bench                       Run internal performance tests"
                     << "\n  compiler                    Show information about the compiler"
+                    << "\n  export_net [file]           Export the currently loaded NNUE net"
+                    << "\n  legal [uci|san]             List all legal moves in the current position"
+                    << "\n  variants [filter]           Show supported variants, optionally filtered"
                     << "\n  load [file|<<EOF]           Load variant rules from a file or text"
                     << "\n  check [file|<<EOF]          Validate a variant configuration"
                     << "\n  flip                        Flip the board perspective"
@@ -466,6 +565,14 @@ void UCI::loop(int argc, char* argv[]) {
           const std::string variantName = Options["UCI_Variant"];
           print_variant_info(variants.get(variantName), variantName);
       }
+      else if (token == "variants")
+      {
+          std::string filter;
+          is >> filter;
+          print_available_variants(filter);
+      }
+      else if (token == "legal")
+          print_legal_moves(pos, is);
       else if (token == "eval")     trace_eval(pos);
       else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
       else if (token == "export_net")
@@ -612,10 +719,30 @@ string UCI::move(const Position& pos, Move m) {
   if (m == MOVE_NONE)
       return CurrentProtocol == USI ? "resign" : "(none)";
 
+  if (pos.in_opening_self_removal_phase() && is_pass(m))
+      return UCI::square(pos, from) + UCI::square(pos, to);
+
   if (is_pass(m) && CurrentProtocol == XBOARD)
       return "@@@@";
   if (is_pass(m))
       return "0000";
+
+  if (is_laser_fire(m))
+  {
+      std::string fire = UCI::square(pos, from) + UCI::square(pos, to);
+      if (is_gating(m))
+      {
+          fire += ":" + std::to_string(rotation_value(m));
+          if (rotation_square(m) != from)
+              fire += UCI::square(pos, rotation_square(m));
+      }
+      return fire + "f";
+  }
+
+  bool is_wall_only = wallMove && type_of(m) == SPECIAL && from == to;
+  if (is_wall_only)
+      return (CurrentProtocol == XBOARD ? "@@@@," : "0000,") + UCI::square(pos, gating_square(m));
+
   if (is_self_destruct(m))
       return UCI::square(pos, from) + UCI::square(pos, to) + "x";
 
@@ -625,26 +752,42 @@ string UCI::move(const Position& pos, Move m) {
   bool potionMove = false;
   std::string potionPrefix;
 
-  if (pos.potions_enabled() && is_gating(m))
-      for (int idx = 0; idx < Variant::POTION_TYPE_NB; ++idx)
+  if (pos.potions_enabled())
+  {
+      if (type_of(m) == PROMOTION_POTION)
       {
-          PieceType potionPiece = pos.potion_piece(static_cast<Variant::PotionType>(idx));
-          if (!potionMove && potionPiece != NO_PIECE_TYPE
-              && gating_type(m) == potionPiece)
+          Variant::PotionType pot = static_cast<Variant::PotionType>(potion_type(m));
+          PieceType potionPiece = pos.potion_piece(pot);
+          if (potionPiece != NO_PIECE_TYPE)
           {
               potionMove = true;
-              potionPrefix = pos.piece_symbol(make_piece(BLACK, gating_type(m)))
-                             + "@" + UCI::square(pos, gating_square(m));
+              potionPrefix = pos.piece_symbol(make_piece(BLACK, potionPiece))
+                             + "@" + UCI::square(pos, potion_target_square(m));
           }
       }
+      else if (is_gating(m))
+      {
+          for (int idx = 0; idx < Variant::POTION_TYPE_NB; ++idx)
+          {
+              PieceType potionPiece = pos.potion_piece(static_cast<Variant::PotionType>(idx));
+              if (!potionMove && potionPiece != NO_PIECE_TYPE
+                  && gating_type(m) == potionPiece)
+              {
+                  potionMove = true;
+                  potionPrefix = pos.piece_symbol(make_piece(BLACK, gating_type(m)))
+                                 + "@" + UCI::square(pos, gating_square(m));
+              }
+          }
+      }
+  }
 
-  if (is_gating(m) && gating_square(m) == to && !potionMove)
+  if (is_gating(m) && gating_square(m) == to && !potionMove && !pos.laser_game())
       from = to_sq(m), to = from_sq(m);
   else if (type_of(m) == CASTLING && !pos.is_chess960())
   {
       to = make_square(to > from ? pos.castling_kingside_file() : pos.castling_queenside_file(), rank_of(from));
       // If the castling move is ambiguous with a normal king move, switch to 960 notation
-      if (pos.pseudo_legal(make_move(from, to)))
+      if (from != to && pos.pseudo_legal(make_move(from, to)))
           to = to_sq(m);
   }
 
@@ -653,21 +796,53 @@ string UCI::move(const Position& pos, Move m) {
           : UCI::square(pos, from))
                   + UCI::square(pos, to);
 
+  auto appendWall = [&] {
+      move += "," + UCI::square(pos, to) + UCI::square(pos, gating_square(m));
+  };
+
   // Wall square.
   // Keep the legacy "<base>,<to><gate>" form on output for GUI compatibility.
   if (wallMove && CurrentProtocol == XBOARD)
-      move += "," + UCI::square(pos, to) + UCI::square(pos, gating_square(m));
+      appendWall();
 
-  if (type_of(m) == PROMOTION)
-      move += pos.piece_symbol(make_piece(BLACK, promotion_type(m)));
+  if (type_of(m) == PROMOTION || type_of(m) == PROMOTION_POTION)
+  {
+      PieceType pt = promotion_type(m);
+      if (pos.laser_game() && pos.is_oriented(pt))
+      {
+          move += pos.piece_symbol(make_piece(BLACK, pt));
+          int orient = pos.variant()->hasLaserPromotionOrientation[pos.side_to_move()][pt]
+                     ? pos.variant()->laserPromotionOrientation[pos.side_to_move()][pt] : 0;
+          if (orient > 0)
+              move += ":" + std::to_string(orient);
+      }
+      else
+          move += pos.piece_symbol(make_piece(BLACK, pt));
+      if (is_gating(m) && pos.laser_game())
+          move += "," + UCI::square(pos, gating_square(m));
+  }
   else if (type_of(m) == PIECE_PROMOTION)
+  {
       move += '+';
+      if (is_gating(m) && pos.laser_game())
+          move += "," + UCI::square(pos, gating_square(m));
+  }
   else if (type_of(m) == PIECE_DEMOTION)
+      move += '-';
+  else if (is_stack_move(m))
+      move += '+';
+  else if (is_unstack_move(m))
       move += '-';
   else if (is_gating(m) && !potionMove && !pos.walling(pos.side_to_move()))
   {
-      move += pos.piece_symbol(make_piece(BLACK, gating_type(m)));
-      if (gating_square(m) != from)
+      if (pos.laser_game())
+      {
+          move += ":" + std::to_string(rotation_value(m));
+      }
+      else
+          move += pos.piece_symbol(make_piece(BLACK, gating_type(m)));
+
+      if (gating_square(m) != from && (!pos.laser_game() || from != to))
           move += UCI::square(pos, gating_square(m));
   }
   else if (cloneMove)
@@ -685,7 +860,7 @@ string UCI::move(const Position& pos, Move m) {
   // Wall square.
   // Keep the legacy "<base>,<to><gate>" form on output for GUI compatibility.
   if (wallMove && CurrentProtocol != XBOARD)
-      move += "," + UCI::square(pos, to) + UCI::square(pos, gating_square(m));
+      appendWall();
 
   if (potionMove)
       move = potionPrefix + "," + move;

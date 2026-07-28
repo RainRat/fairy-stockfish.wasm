@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <sstream>
 #include <math.h>
+#include <cstring>
 
 #include "bitboard.h"
 #include "types.h"
@@ -35,6 +36,47 @@ namespace Stockfish {
 
 Value EvalPieceValue[PHASE_NB][PIECE_NB];
 Value CapturePieceValue[PHASE_NB][PIECE_NB];
+
+const Value BasePieceValue[PHASE_NB][PIECE_NB] = {
+  {
+    VALUE_ZERO, PawnValueMg, KnightValueMg, BishopValueMg, RookValueMg, QueenValueMg, FersValueMg, AlfilValueMg,
+    FersAlfilValueMg, SilverValueMg, AiwokValueMg, BersValueMg, ArchbishopValueMg, ChancellorValueMg, AmazonValueMg, KnibisValueMg,
+    BiskniValueMg, KnirooValueMg, RookniValueMg, ShogiPawnValueMg, LanceValueMg, ShogiKnightValueMg, GoldValueMg, DragonHorseValueMg,
+    ClobberPieceValueMg, BreakthroughPieceValueMg, ImmobilePieceValueMg, CannonPieceValueMg, JanggiCannonPieceValueMg, SoldierValueMg, HorseValueMg, ElephantValueMg,
+    JanggiElephantValueMg, BannerValueMg, WazirValueMg, CommonerValueMg, CentaurValueMg, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+
+    VALUE_ZERO, PawnValueMg, KnightValueMg, BishopValueMg, RookValueMg, QueenValueMg, FersValueMg, AlfilValueMg,
+    FersAlfilValueMg, SilverValueMg, AiwokValueMg, BersValueMg, ArchbishopValueMg, ChancellorValueMg, AmazonValueMg, KnibisValueMg,
+    BiskniValueMg, KnirooValueMg, RookniValueMg, ShogiPawnValueMg, LanceValueMg, ShogiKnightValueMg, GoldValueMg, DragonHorseValueMg,
+    ClobberPieceValueMg, BreakthroughPieceValueMg, ImmobilePieceValueMg, CannonPieceValueMg, JanggiCannonPieceValueMg, SoldierValueMg, HorseValueMg, ElephantValueMg,
+    JanggiElephantValueMg, BannerValueMg, WazirValueMg, CommonerValueMg, CentaurValueMg, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+  },
+  {
+    VALUE_ZERO, PawnValueEg, KnightValueEg, BishopValueEg, RookValueEg, QueenValueEg, FersValueEg, AlfilValueEg,
+    FersAlfilValueEg, SilverValueEg, AiwokValueEg, BersValueEg, ArchbishopValueEg, ChancellorValueEg, AmazonValueEg, KnibisValueEg,
+    BiskniValueEg, KnirooValueEg, RookniValueEg, ShogiPawnValueEg, LanceValueEg, ShogiKnightValueEg, GoldValueEg, DragonHorseValueEg,
+    ClobberPieceValueEg, BreakthroughPieceValueEg, ImmobilePieceValueEg, CannonPieceValueEg, JanggiCannonPieceValueEg, SoldierValueEg, HorseValueEg, ElephantValueEg,
+    JanggiElephantValueEg, BannerValueEg, WazirValueEg, CommonerValueEg, CentaurValueEg, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+
+    VALUE_ZERO, PawnValueEg, KnightValueEg, BishopValueEg, RookValueEg, QueenValueEg, FersValueEg, AlfilValueEg,
+    FersAlfilValueEg, SilverValueEg, AiwokValueEg, BersValueEg, ArchbishopValueEg, ChancellorValueEg, AmazonValueEg, KnibisValueEg,
+    BiskniValueEg, KnirooValueEg, RookniValueEg, ShogiPawnValueEg, LanceValueEg, ShogiKnightValueEg, GoldValueEg, DragonHorseValueEg,
+    ClobberPieceValueEg, BreakthroughPieceValueEg, ImmobilePieceValueEg, CannonPieceValueEg, JanggiCannonPieceValueEg, SoldierValueEg, HorseValueEg, ElephantValueEg,
+    JanggiElephantValueEg, BannerValueEg, WazirValueEg, CommonerValueEg, CentaurValueEg, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+    VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO, VALUE_ZERO,
+  },
+};
 
 Value PieceValue[PHASE_NB][PIECE_NB] = {
   {
@@ -189,6 +231,10 @@ Score psq[PIECE_NB][SQUARE_NB + 1];
 // copied from Bonus[] and PBonus[], adding the piece value, then the black halves of
 // the tables are initialized by flipping and changing the sign of the white scores.
 void init(const Variant* v) {
+
+  std::memcpy(PieceValue, BasePieceValue, sizeof(PieceValue));
+  std::memset(CapturePieceValue, 0, sizeof(CapturePieceValue));
+  std::memset(EvalPieceValue, 0, sizeof(EvalPieceValue));
 
   PieceType strongestPiece = NO_PIECE_TYPE;
   for (PieceSet ps = v->pieceTypes; ps;)
@@ -373,6 +419,45 @@ void init(const Variant* v) {
       // Pieces in hand
       psq[ pc][SQ_NONE] = score + make_score(35, 10) * (1 + !isSlider);
       psq[~pc][SQ_NONE] = -psq[pc][SQ_NONE];
+  }
+
+  // A configured stacked result is an ordinary piece. Unless its value is
+  // overridden explicitly, retain the material represented by both bases.
+  for (PieceType base = PAWN; base < PIECE_TYPE_NB; ++base)
+  {
+      PieceType result = v->stackedPieceType[base];
+      if (result == NO_PIECE_TYPE)
+          continue;
+
+      Piece basePc = make_piece(WHITE, base);
+      Piece resultPc = make_piece(WHITE, result);
+      Value desiredMg = v->pieceValue[MG][result] ? EvalPieceValue[MG][resultPc]
+                                                  : 2 * EvalPieceValue[MG][basePc];
+      Value desiredEg = v->pieceValue[EG][result] ? EvalPieceValue[EG][resultPc]
+                                                  : 2 * EvalPieceValue[EG][basePc];
+      Score delta = make_score(desiredMg - EvalPieceValue[MG][resultPc],
+                               desiredEg - EvalPieceValue[EG][resultPc]);
+
+      for (Square s = SQ_A1; s <= SQ_MAX; ++s)
+      {
+          psq[resultPc][s] += delta;
+          psq[~resultPc][s] -= delta;
+      }
+      psq[resultPc][SQ_NONE] += delta;
+      psq[~resultPc][SQ_NONE] -= delta;
+
+      if (!v->pieceValue[MG][result])
+      {
+          PieceValue[MG][resultPc] = PieceValue[MG][~resultPc] = 2 * PieceValue[MG][basePc];
+          CapturePieceValue[MG][resultPc] = CapturePieceValue[MG][~resultPc] = 2 * CapturePieceValue[MG][basePc];
+          EvalPieceValue[MG][resultPc] = EvalPieceValue[MG][~resultPc] = desiredMg;
+      }
+      if (!v->pieceValue[EG][result])
+      {
+          PieceValue[EG][resultPc] = PieceValue[EG][~resultPc] = 2 * PieceValue[EG][basePc];
+          CapturePieceValue[EG][resultPc] = CapturePieceValue[EG][~resultPc] = 2 * CapturePieceValue[EG][basePc];
+          EvalPieceValue[EG][resultPc] = EvalPieceValue[EG][~resultPc] = desiredEg;
+      }
   }
 }
 

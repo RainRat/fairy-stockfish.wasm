@@ -66,7 +66,11 @@ template<GenType>
 ExtMove* generate_without_potions(const Position& pos, ExtMove* moveList);
 
 template<GenType>
-ExtMove* append_potions(const Position& pos, ExtMove* listBegin, ExtMove* baseEnd);
+ExtMove* append_potions(const Position& pos, ExtMove* listBegin, ExtMove* baseEnd,
+                        bool pruneUseless = false);
+
+// Validate one encoded potion move without expanding the complete potion list.
+bool potion_move_pseudo_legal(const Position& pos, Move move);
 
 // Some variant-specific generators (potions, exchanges) can exceed MAX_MOVES.
 // Keep a larger shared capacity so move lists stay in-bounds.

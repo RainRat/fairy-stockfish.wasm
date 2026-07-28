@@ -19,6 +19,7 @@
 #include <cassert>
 
 #include <algorithm> // For std::count
+#include <unordered_map>
 #include "movegen.h"
 #include "partner.h"
 #include "search.h"
@@ -31,6 +32,30 @@
 namespace Stockfish {
 
 ThreadPool Threads; // Global object
+
+namespace {
+
+StateListPtr copy_state_list_with_relinked_history(const StateListPtr& states) {
+  auto snapshot = std::make_unique<std::deque<StateInfo>>(*states);
+  std::unordered_map<const StateInfo*, StateInfo*> copiedStates;
+
+  auto original = states->begin();
+  auto copied = snapshot->begin();
+  for (; original != states->end(); ++original, ++copied)
+      copiedStates.emplace(&*original, &*copied);
+
+  original = states->begin();
+  copied = snapshot->begin();
+  for (; original != states->end(); ++original, ++copied)
+  {
+      const auto previous = copiedStates.find(original->previous);
+      copied->previous = previous == copiedStates.end() ? nullptr : previous->second;
+  }
+
+  return snapshot;
+}
+
+} // namespace
 
 
 
@@ -192,10 +217,13 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
   Search::Limits = limits;
   Search::RootMoves rootMoves;
 
+  const bool filterLaserRotations = limits.perft == 0;
+  pos.set_search_laser_rotation_filter(filterLaserRotations);
   for (const auto& m : MoveList<LEGAL>(pos))
       if (   (limits.searchmoves.empty() || std::count(limits.searchmoves.begin(), limits.searchmoves.end(), m))
           && (limits.banmoves.empty() || !std::count(limits.banmoves.begin(), limits.banmoves.end(), m)))
           rootMoves.emplace_back(m);
+  pos.set_search_laser_rotation_filter(false);
 
   // Add virtual drops
   if (pos.two_boards() && pos.virtual_drops() && Partner.opptime && limits.time[pos.side_to_move()] > Partner.opptime + 1000)
@@ -223,10 +251,37 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
 
   const std::string rootFen = pos.fen();
 
-  if (states.get())
-      setupStates = std::move(states); // Ownership transfer, states is now empty
+  // XBoard takes this state chain back after search so it can continue making
+  // and unmaking moves. UCI callers may issue repeated `go` commands for the
+  // same position, so retain their chain and give search a read-only snapshot.
+  if (CurrentProtocol == XBOARD)
+  {
+      setupStates = std::move(states);
+      setupStateOwner = nullptr;
+      setupStateSource = nullptr;
+  }
+  else if (states.get())
+  {
+      const bool reusable = setupStates
+                         && setupStateOwner == &states
+                         && setupStateSource == states.get()
+                         && setupStateSize == states->size()
+                         && setupStateKey == states->back().key;
+      if (!reusable)
+      {
+          setupStates = copy_state_list_with_relinked_history(states);
+          setupStateOwner = &states;
+          setupStateSource = states.get();
+          setupStateSize = states->size();
+          setupStateKey = states->back().key;
+      }
+  }
   else
+  {
       setupStates.reset();
+      setupStateOwner = nullptr;
+      setupStateSource = nullptr;
+  }
 
   // We use Position::set() to set root position across threads. But there are
   // some StateInfo fields (previous, pliesFromNull, capturedPiece) that cannot
@@ -239,6 +294,7 @@ void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
       th->rootDepth = th->completedDepth = 0;
       th->rootMoves = rootMoves;
       th->rootPos.set(pos.variant(), rootFen, pos.is_chess960(), &th->rootState, th);
+      th->rootPos.set_search_laser_rotation_filter(filterLaserRotations);
       if (setupStates && !setupStates->empty())
           th->rootState = setupStates->back();
   }

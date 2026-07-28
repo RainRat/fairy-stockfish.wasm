@@ -14,13 +14,14 @@ else:
 
 args.extend(["-DLARGEBOARDS", "-DALLVARS", "-DPRECOMPUTED_MAGICS", "-DNNUE_EMBEDDING_OFF"])
 
-if "64bit" in platform.architecture():
+if "64bit" in platform.architecture() and not platform.python_compiler().startswith("MSC"):
     args.append("-DIS_64BIT")
 
 CLASSIFIERS = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
     "Operating System :: OS Independent",
 ]
 
@@ -29,11 +30,11 @@ with io.open("README.md", "r", encoding="utf8") as fh:
 
 sources = glob("src/*.cpp") + glob("src/syzygy/*.cpp") + glob("src/nnue/*.cpp") + glob("src/nnue/features/*.cpp")
 headers = glob("src/*.h") + glob("src/syzygy/*.h") + glob("src/nnue/*.h") + glob("src/nnue/features/*.h")
-ffish_source_file = os.path.normcase("src/ffishjs.cpp")
-try:
-    sources.remove(ffish_source_file)
-except ValueError:
-    print(f"ffish_source_file {ffish_source_file} was not found in sources {sources}.")
+for f in ["src/ffishjs.cpp", "src/main.cpp", "src/ffishdll.cpp"]:
+    try:
+        sources.remove(os.path.normcase(f))
+    except ValueError:
+        pass
 
 pyffish_module = Extension(
     "pyffish",
@@ -50,7 +51,7 @@ setup(name="pyffish", version="0.0.88",
       license="GPL3",
       classifiers=CLASSIFIERS,
       url="https://github.com/gbtami/Fairy-Stockfish",
-      python_requires=">=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*",
+      python_requires=">=3.9",
       ext_modules=[pyffish_module],
       data_files=[("", ["pyffish.pyi"])]
       )

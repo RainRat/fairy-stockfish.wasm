@@ -42,6 +42,7 @@ typedef BOOL (WINAPI *fun3_t)(HANDLE, CONST GROUP_AFFINITY*, PGROUP_AFFINITY);
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <vector>
 #include <cstdlib>
@@ -89,17 +90,21 @@ struct Tie: public streambuf { // MSVC requires split streambuf for cin and cout
   int overflow(int c) override {
     if (traits_type::eq_int_type(c, traits_type::eof()))
         return traits_type::not_eof(c);
-    return log(buf->sputc(traits_type::to_char_type(c)), "<< ");
+    const int result = buf->sputc(traits_type::to_char_type(c));
+    log(result, "<< ");
+    return result;
   }
   int underflow() override { return buf->sgetc(); }
   int uflow() override {
     int c = buf->sbumpc();
-    return traits_type::eq_int_type(c, traits_type::eof()) ? c : log(c, ">> ");
+    if (!traits_type::eq_int_type(c, traits_type::eof()))
+        log(c, ">> ");
+    return c;
   }
 
   streambuf *buf, *logBuf;
 
-  int log(int c, const char* prefix) {
+  void log(int c, const char* prefix) {
 
     static std::mutex logMutex;
     static int last = '\n'; // Single log file
@@ -108,7 +113,7 @@ struct Tie: public streambuf { // MSVC requires split streambuf for cin and cout
     if (last == '\n')
         logBuf->sputn(prefix, 3);
 
-    return last = logBuf->sputc(traits_type::to_char_type(c));
+    last = logBuf->sputc(traits_type::to_char_type(c));
   }
 };
 
@@ -380,14 +385,25 @@ void prefetch(void* addr) {
 /// does not guarantee the availability of aligned_alloc(). Memory allocated with
 /// std_aligned_alloc() must be freed with std_aligned_free().
 
+namespace {
+bool round_up_to_multiple(size_t size, size_t alignment, size_t& rounded) {
+    if (alignment == 0)
+        return false;
+    if (size > std::numeric_limits<size_t>::max() - (alignment - 1))
+        return false;
+    rounded = (size + alignment - 1) / alignment * alignment;
+    return true;
+}
+}
+
 void* std_aligned_alloc(size_t alignment, size_t size) {
 
   if (alignment == 0 || (alignment & (alignment - 1)) != 0)
       return nullptr;
 
-  size_t roundedSize = size;
-  if (roundedSize % alignment)
-      roundedSize += alignment - (roundedSize % alignment);
+  size_t roundedSize;
+  if (!round_up_to_multiple(size, alignment, roundedSize))
+      return nullptr;
 
 #if defined(POSIXALIGNEDALLOC)
   void *mem;
@@ -449,7 +465,10 @@ static void* aligned_large_pages_alloc_windows(size_t allocSize) {
           GetLastError() == ERROR_SUCCESS)
       {
           // Round up size to full pages and allocate
-          allocSize = (allocSize + largePageSize - 1) & ~size_t(largePageSize - 1);
+          size_t roundedSize;
+          if (!round_up_to_multiple(allocSize, largePageSize, roundedSize))
+              return nullptr;
+          allocSize = roundedSize;
           mem = VirtualAlloc(
               NULL, allocSize, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
 
@@ -488,7 +507,9 @@ void* aligned_large_pages_alloc(size_t allocSize) {
 #endif
 
   // round up to multiples of alignment
-  size_t size = ((allocSize + alignment - 1) / alignment) * alignment;
+  size_t size;
+  if (!round_up_to_multiple(allocSize, alignment, size))
+      return nullptr;
   void *mem = std_aligned_alloc(alignment, size);
 #if defined(MADV_HUGEPAGE)
   if (mem)
@@ -533,103 +554,55 @@ void bindThisThread(size_t) {}
 
 #else
 
-/// best_group() retrieves logical processor information using Windows specific
-/// API and returns the best group id for the thread with index idx. Original
-/// code from Texel by Peter Österlund.
-
-int best_group(size_t idx) {
-
-  int threads = 0;
-  int nodes = 0;
-  int cores = 0;
-  DWORD returnLength = 0;
-  DWORD byteOffset = 0;
-
-  // Early exit if the needed API is not available at runtime
-  HMODULE k32 = GetModuleHandle("Kernel32.dll");
-  auto fun1 = reinterpret_cast<fun1_t>(GetProcAddress(k32, "GetLogicalProcessorInformationEx"));
-  if (!fun1)
-      return -1;
-
-  // First call to get returnLength. We expect it to fail due to null buffer
-  if (fun1(RelationAll, nullptr, &returnLength))
-      return -1;
-
-  // Once we know returnLength, allocate the buffer
-  SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buffer, *ptr;
-  ptr = buffer = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)malloc(returnLength);
-  if (!buffer)
-      return -1;
-
-  // Second call, now we expect to succeed
-  if (!fun1(RelationAll, buffer, &returnLength))
-  {
-      free(buffer);
-      return -1;
-  }
-
-  while (byteOffset < returnLength)
-  {
-      if (ptr->Relationship == RelationNumaNode)
-          nodes++;
-
-      else if (ptr->Relationship == RelationProcessorCore)
-      {
-          cores++;
-          threads += (ptr->Processor.Flags == LTP_PC_SMT) ? 2 : 1;
-      }
-
-      assert(ptr->Size);
-      byteOffset += ptr->Size;
-      ptr = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(((char*)ptr) + ptr->Size);
-  }
-
-  free(buffer);
-
-  if (nodes <= 0)
-      return -1;
-
-  std::vector<int> groups;
-
-  // Run as many threads as possible on the same node until core limit is
-  // reached, then move on filling the next node.
-  for (int n = 0; n < nodes; n++)
-      for (int i = 0; i < cores / nodes; i++)
-          groups.push_back(n);
-
-  // In case a core has more than one logical processor (we assume 2) and we
-  // have still threads to allocate, then spread them evenly across available
-  // nodes.
-  for (int t = 0; t < threads - cores; t++)
-      groups.push_back(t % nodes);
-
-  // If we still have more threads than the total number of logical processors
-  // then return -1 and let the OS to decide what to do.
-  return idx < groups.size() ? groups[idx] : -1;
-}
-
-
-/// bindThisThread() set the group affinity of the current thread
+/// bindThisThread() retrieves logical processor information using Windows specific
+/// API and binds the thread with index idx to the corresponding processor group.
 
 void bindThisThread(size_t idx) {
 
-  // Use only local variables to be thread-safe
-  int group = best_group(idx);
-
-  if (group == -1)
-      return;
-
-  // Early exit if the needed API are not available at runtime
-  HMODULE k32 = GetModuleHandle("Kernel32.dll");
-  auto fun2 = reinterpret_cast<fun2_t>(GetProcAddress(k32, "GetNumaNodeProcessorMaskEx"));
+  HMODULE k32 = GetModuleHandleA("Kernel32.dll");
+  auto fun1 = reinterpret_cast<fun1_t>(GetProcAddress(k32, "GetLogicalProcessorInformationEx"));
   auto fun3 = reinterpret_cast<fun3_t>(GetProcAddress(k32, "SetThreadGroupAffinity"));
 
-  if (!fun2 || !fun3)
+  if (!fun1 || !fun3)
       return;
 
-  GROUP_AFFINITY affinity;
-  if (fun2(group, &affinity))
-      fun3(GetCurrentThread(), &affinity, nullptr);
+  DWORD returnLength = 0;
+  if (fun1(RelationAll, nullptr, &returnLength) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+      return;
+
+  char* buffer = (char*)malloc(returnLength);
+  if (!buffer)
+      return;
+
+  if (fun1(RelationAll, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buffer, &returnLength))
+  {
+      DWORD byteOffset = 0;
+      int threads = 0;
+      while (byteOffset < returnLength)
+      {
+          auto* ptr = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buffer + byteOffset);
+          if (ptr->Relationship == RelationGroup)
+          {
+              for (WORD g = 0; g < ptr->Group.ActiveGroupCount; ++g)
+              {
+                  int processors = ptr->Group.GroupInfo[g].ActiveProcessorCount;
+                  if (idx < size_t(threads + processors))
+                  {
+                      GROUP_AFFINITY affinity = {};
+                      affinity.Group = g;
+                      affinity.Mask = (KAFFINITY)1 << (idx - threads);
+                      fun3(GetCurrentThread(), &affinity, nullptr);
+                      byteOffset = returnLength; // break outer loop
+                      break;
+                  }
+                  threads += processors;
+              }
+          }
+          byteOffset += ptr->Size;
+      }
+  }
+
+  free(buffer);
 }
 
 #endif
@@ -651,11 +624,10 @@ string binaryDirectory;  // path of the executable directory
 string workingDirectory; // path of the working directory
 
 void init(int argc, char* argv[]) {
-    (void)argc;
     string pathSeparator;
 
     // extract the path+name of the executable binary
-    argv0 = argv[0];
+    argv0 = argc > 0 && argv && argv[0] ? argv[0] : "";
 
 #ifdef _WIN32
     pathSeparator = "\\";
@@ -686,7 +658,7 @@ void init(int argc, char* argv[]) {
         binaryDirectory.resize(pos + 1);
 
     // pattern replacement: "./" at the start of path is replaced by the working directory
-    if (binaryDirectory.find("." + pathSeparator) == 0)
+    if (!workingDirectory.empty() && binaryDirectory.find("." + pathSeparator) == 0)
         binaryDirectory.replace(0, 1, workingDirectory);
 }
 

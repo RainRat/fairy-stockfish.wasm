@@ -11,6 +11,7 @@ src/.depend
 # Built binary
 src/stockfish*
 src/-lstdc++.res
+/stockfish
 
 # Neural network for the NNUE evaluation
 **/*.nnue
@@ -29,7 +30,7 @@ ffish.js
 venv
 *.so
 pyffish.egg-info
-__pycache__
+__pycache__/
 *.pyc
 
 # test artifacts
@@ -37,10 +38,9 @@ tests/*.exp
 src/*.log
 src/*.epd
 src/*.txt
+.local/
 
 # IDEs
 .vscode
 .idea
-
-# Local tooling for Fairyground compatibility helper
-/node_modules
+.antigravitycli/

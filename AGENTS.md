@@ -1,183 +1,194 @@
-# Fairy-Stockfish Development Guide
+# AGENTS.md — Fairy-Stockfish-X Guide
 
-## Repository Overview
+Fairy-Stockfish-X is a Fairy-Stockfish fork for testing experimental chess variants. Prefer `src/variants.ini` settings over one-off C++ variant hacks.
 
-**Fairy-Stockfish** is a chess variant engine derived from Stockfish, designed to support numerous chess variants and protocols. Written primarily in C++17, it includes Python and JavaScript bindings for library use.
+## Goals
+* Prefer configurable rules that compose across variants.
+* Keep changes small, local, portable, and compatible with existing `.ini` files.
+* Preserve engine invariants before adding new behavior.
+* Avoid extra dependencies, noisy abstractions, and hot-loop checks for impossible states.
+* If behavior is unclear, prefer documented rules, then the intuitive rule, then the natural existing code path.
 
-**Repository Statistics:**
-- **Languages:** C++17 (primary), Python, JavaScript, Shell scripts
-- **Architecture:** Multi-protocol chess engine (UCI, UCCI, USI, XBoard/CECP)
-- **Target Platforms:** Windows, Linux, macOS, Android, WebAssembly
-- **Supported Variants:** 90+ chess variants including regional, historical, and modern variants
+## Where changes go
+* Variant definitions: `src/variants.ini`
+* Variant fields/parsing: `variant.h`, `parser.cpp`
+* Position accessors/state logic: `position.h`, `position.cpp`
+* Move generation/gating: `movegen.cpp`
+* Betza and movement: `piece.cpp`, `piece.h`, `bitboard.cpp`
+* Tests: `tests/`, especially `tests/run.sh`, `tests/suites/`, and `tests/python/`
+* Add settings end-to-end: `.ini` → parser → `Variant` field → `Position` getter → gameplay logic → tests → `variants.ini` docs.
+* Keep upstream Fairy-Stockfish keys working when replacing or generalizing a setting. FSX-only experimental keys may make a clean break before the first stable release.
 
-## Build System & Requirements
+## Variant config compatibility
+* Diagnose unknown keys, but do not reject an otherwise usable variant solely because an older engine does not recognize a newer setting.
+* Never silently reinterpret an unknown key or substitute a default behavior for it.
+* Reject malformed syntax and known settings with impossible, unsafe, or always-invalid values.
 
-### Prerequisites
-- **Compiler:** GCC, Clang, or MSVC with C++17 support
-- **Build Tool:** GNU Make (required for C++ engine)
-- **Python:** 3.7+ (for Python bindings)
-- **Node.js:** (for JavaScript bindings)
-- **Additional Tools:** expect utility (for testing)
+## Build
+By default, compiling can be very verbose (especially under LTO). Prefer using the clean build wrapper from the root directory:
 
-### Core Build Process
-
-Note: Run engine and test commands from the `src/` directory unless specified otherwise.
-
-#### Basic Build Commands
-```bash
-# Standard release build (recommended for most users)
-make -j2 ARCH=x86-64 build
-
-# Debug build (for development)
-make -j2 ARCH=x86-64 debug=yes build
-
-# All variants including ones with large boards (up to 12x10) and large branching factor (all)
-make -j2 ARCH=x86-64 largeboards=yes all=yes build
+```sh
+tests/build.sh ARCH=x86-64-modern
+tests/build.sh ARCH=x86-64-modern largeboards=yes
+tests/build.sh ARCH=x86-64-modern verylargeboards=yes
+tests/build.sh ARCH=x86-64-modern debug=yes optimize=no
+tests/build.sh COMP=mingw
 ```
 
-### Python Bindings (pyffish)
-```bash
-# Build Python bindings (from repository root)
-python3 setup.py install
+Use `largeboards=yes` for normal large-board variants. Use `verylargeboards=yes` only beyond that matrix. When switching board macro families, run `make clean`.
 
-# Alternative: Install from PyPI
-pip install pyffish
+For named binaries used by regression scripts:
+
+```sh
+tests/build.sh ARCH=x86-64-modern largeboards=yes EXE=stockfish-large
+tests/build.sh ARCH=x86-64-modern verylargeboards=yes EXE=stockfish-vlb
+tests/build.sh ARCH=x86-64-modern all=yes EXE=stockfish-allvars
 ```
 
-### JavaScript Bindings (ffish.js)
-Also see the `tests/js/README.md`.
-```bash
-cd src/
+If you prefer standard make, compile from `src/` using `make -j build ...`.
 
-# Build JavaScript bindings (requires emscripten)
+## Running the engine
+Use `src/stockfish`; do not rely on a stale repo-root `./stockfish`.
+
+```uci
+setoption name VariantPath value variants.ini
+setoption name UCI_Variant value <variant>
+setoption name Verbosity value 0
+position startpos moves e2e4 e7e5
+go depth 8
+d
+quit
+```
+
+Drops use `@`, for example `P@b2`. Promotions use a trailing piece letter, not `=`.
+
+## Required checks
+From the repository root:
+
+```sh
+src/stockfish check src/variants.ini
+bash tests/fast-regression.sh src/stockfish
+tests/protocol.sh
+tests/perft.sh all src/stockfish-large
+```
+
+Run large-board tests against a `largeboards=yes` binary. For Python-facing changes, run `python3 setup.py build_ext --inplace` and `python3 tests/python/test_pyffish_api.py`.
+
+### Focused test selection
+
+| Changed area | Minimum focused command |
+| --- | --- |
+| `variant.h`, `parser.cpp`, or validation | `tests/run.sh suite config variants-smoke src/stockfish-large` |
+| `src/variants.ini` only | config plus `variants-smoke`; also JS tests when serialized FEN, pockets, drops, or `startFen` change |
+| royal, checking, evasion, extinction, or castling legality | `tests/run.sh suite royal-legality src/stockfish-large` |
+| `movegen.cpp` or general legality | `tests/run.sh suite movement royal-legality src/stockfish-large` |
+| Betza, riders, hoppers, regions, or topology | `tests/run.sh suite movement src/stockfish-large` |
+| capture effects, blast, rifle, pulling, or swapping | `tests/run.sh suite captures-effects state-transitions src/stockfish-large` |
+| promotions, hands, prisons, gating, or drops | `tests/run.sh suite promotion-drops state-transitions src/stockfish-large` |
+| `StateInfo`, keys, do/undo, or repetition | `tests/run.sh suite state-transitions src/stockfish-large` |
+| notation, FEN, UCI, or XBoard | `tests/run.sh suite notation-protocol src/stockfish-large` |
+| search or evaluation | `tests/run.sh suite search-evaluation src/stockfish-large` |
+| spell chess | `tests/run.sh suite spells src/stockfish-large` |
+| `src/pyffish.cpp`, `apiutil`, or Python signatures | build the extension, then run `tests/python/test_pyffish_api.py` |
+| broad/shared change before submission | `tests/run.sh fast`, followed by the detached full regression when warranted |
+
+For JavaScript/wasm-facing changes, including `src/variants.ini` changes that affect `startFen`, pockets, `freeDrops`, or serialized FENs:
+
+```sh
+cd src
 make -f Makefile_js build
-
-# Alternative: Install from npm
-npm install ffish
+cd ../tests/js
+npm test
 ```
 
-### Browser Engine Artifacts for Fairyground
-Fairyground's in-browser search engine is copied from `src/emscripten/public`. Build it from `src/` before syncing:
+For very-large-board JavaScript/ffish work, build the ffish artifacts explicitly with very-large-board support:
 
-```bash
-make emscripten_clean ARCH=wasm
-make emscripten_build ARCH=wasm
+```sh
+cd src
+make -f Makefile_js clean
+make -f Makefile_js build verylargeboards=yes es6=yes
 ```
 
-For very-large-board Fairyground testing, include the build flag:
+The generated files used by Fairyground are `tests/js/ffish.js` and `tests/js/ffish.wasm`. Fairyground can sync and wrap them without hardcoded paths:
 
-```bash
-make emscripten_clean ARCH=wasm
-make emscripten_build ARCH=wasm verylargeboards=yes
-```
-
-After building, sync from the Fairyground checkout without committing local paths:
-
-```bash
+```sh
+cd /path/to/fairyground
 FAIRY_WASM_REPO=/path/to/fairy-stockfish.wasm \
 FAIRY_FSX_REPO=/path/to/Fairy-Stockfish-X \
 npm run sync-fsx-browser-stack
+npm run debug-build
 ```
 
-This repo provides only the browser engine artifacts in that workflow. The ffish rules helper can come from Fairy-Stockfish-X so Fairyground's board logic matches the experimental FSX variants. After syncing and `npm run debug-build` in Fairyground, the advanced page should show the runtime browser-stack fingerprint and the engine banner should report `VLB` for `verylargeboards=yes` builds.
+When diagnosing browser adjudication or move-generation bugs, compare native FSX/pyffish behavior against browser ffish before changing Fairyground UI logic. If native FSX and FSX-built ffish return legal moves and `result="*"`, the bug is likely in artifact provenance or browser wiring, not adjudication policy.
 
-## Testing & Validation
+For parser, movegen, legality, promotion, topology, variant-switching, or shared-state changes, run upstream checks when available:
 
-All test commands below assume the current directory is `src/`.
-
-### Core Engine Tests
-```bash
-# Basic functionality test
-./stockfish bench
-
-# Variant-specific benchmarks
-./stockfish bench xiangqi
-./stockfish bench shogi
-./stockfish bench capablanca
-
-# Validate variants configuration
-./stockfish check variants.ini
+```sh
+python3 tests/upstream_reference.py src/stockfish "$UPSTREAM_ENGINE"
+python3 tests/upstream_movecount_baseline.py src/stockfish "$UPSTREAM_ENGINE"
 ```
 
-### Comprehensive Test Suite
-```bash
-# Protocol compliance tests
-../tests/protocol.sh
+Only regenerate upstream baselines intentionally. Do not refresh fixtures to hide regressions.
 
-# Move generation validation
-../tests/perft.sh all
-../tests/perft.sh chess      # Chess only
-../tests/perft.sh largeboard # Large board variants only
+## Full local regression
+Build the named binaries first. Use the regression runner for long checks; it keeps
+the full output in one log while reporting concise status and an estimate based on
+recent successful runs:
 
-# Regression testing
-../tests/regression.sh
-
-# Reproducible search test
-../tests/reprosearch.sh
-
-# Build signature verification  
-../tests/signature.sh
+```sh
+tests/regression-runner.sh start src/stockfish-large
+tests/regression-runner.sh status
+tests/regression-runner.sh wait
 ```
 
+`status` reports a check-in interval and remaining-time estimate from recent runs.
+`wait` monitors the detached process and prints only the final result; use it instead
+of repeatedly polling a command session. On failure it also prints the relevant log
+tail. `tests/regression-runner.sh log` shows the latest log tail on demand. The runner
+rejects stale named binaries before launching; rebuild the reported binary rather
+than spending a full run testing old code.
 
-## Project Architecture
+The fast and full suites preserve signature-based artifacts under `.local/build`.
+Do not clear that directory for a normal rerun. Test setup and cases are quiet on
+success and print their captured output on failure. Use `VERBOSE=1` with
+`tests/run.sh` or a compatibility wrapper to stream successful output. Special C++
+harnesses rebuild their required object family when run directly, while the fast
+suite prepares that family once and shares it between harnesses.
 
-### Directory Structure
-```
-src/                  # Core C++ engine source
-tests/                # Test scripts and data
-.github/workflows/    # CI/CD configurations
-```
+## CI Mapping
+* `Stockfish`: native engine build, perft, search, and sanitizer-style checks.
+* `fairy`: variant configuration, focused regression, protocol, and variant perft checks.
+* `ffishjs`: wasm build from `src/Makefile_js` plus `tests/js` `npm test`.
+* `Wheels`: Python package/wheel builds; run Python binding checks for Python-facing changes.
+* `Release`: packaging/release build smoke checks.
 
-### Configuration Files
-- **`src/variants.ini`**: Defines examples for configuration of chess variants
-- **`setup.py`**: Python package build configuration
-- **`tests/js/package.json`**: JavaScript bindings configuration
+## Coding style
+* C++17; follow surrounding style.
+* Code is generally compact. Do not rename existing variables unless needed.
+* Comments are for experienced engine developers.
+* Do not update copyright years casually.
+* Avoid broad wrappers, single-use helpers that hide logic, and redundant validation.
+* In hot paths, do not paper over impossible states. Prefer parse-time rejection, debug assertions, or a clean crash.
 
-### Key Source Files in `src/`
-- **`variant.h`**: Variant rule properties
-- **`variant.cpp`**: Variant-specific game rules
-- **`variant.ini`**: Variant rule configuration examples and documentation of variant properties
-- **`position.h`**: Position representation
-- **`position.cpp`**: Board logic
-- **`movegen.cpp`**: Move generation logic
-- **`parser.cpp`**: Variant rule configuration parsing
-- **`piece.cpp`**: Piece type definitions and behavior
-- **`pyffish.cpp`**: Python bindings
-- **`ffishjs.cpp`**: JavaScript bindings
+## Important invariants
+* `checking` and `allowChecks` are not interchangeable.
+* No-check variants must keep their king-safety legality and state path active.
+* Preserve FSX's split between broad royal danger and evasion-required check state.
+* Use cached forced-jump continuation state when preconditions are already established.
+* Spell context RAII must be nest-safe: save and restore prior context.
+* Alternate repetition keys must be updated in every state transition, including null moves.
+* Reserve-aware keys must keep hand and prison buckets as separate XOR terms.
+* Tuple Betza atoms use `PieceInfo::tupleSteps`; do not route long tuple leapers through `Direction` decoding.
+* Betza `U` is the unrestricted universal leaper. Braced `{...}` parameters configure universal hoppers; keep the two concepts and their storage paths distinct.
 
-## Continuous Integration
+## Performance and pitfalls
+* Benchmark affected non-chess variants when relevant; prefer `checkers` and `janggi`.
+* Use swapped-order A/B runs for performance claims.
+* Test feature optimizations on a variant that actually uses the feature.
+* For spell-chess movegen, test both `spell-chess` and baseline chess.
+* Watch for missing kings, wrong castling assumptions, large-board tests on non-largeboard builds, malformed `.ini` fallback, undocumented settings, and raw `PieceSet` bit-flag mistakes.
 
-### GitHub Actions Workflows
-- **`fairy.yml`**: Core engine testing (perft, protocols, variants)
-- **`stockfish.yml`**: Standard Stockfish compatibility tests
-- **`release.yml`**: Binary releases for multiple platforms
-- **`wheels.yml`**: Python package builds
-- **`ffishjs.yml`**: JavaScript binding builds
-
-## Common Development Patterns
-
-### Making Engine Changes
-1. **Always test basic functionality:** `./stockfish bench` after changes
-2. **Validate variant compatibility:** `./stockfish check variants.ini`  
-3. **Run relevant tests:** `../tests/perft.sh all` for move generation changes
-
-### Adding New Configurable Variants
-1. **Edit `src/variants.ini`**: Add variant configuration
-2. **Test parsing:** `./stockfish check variants.ini`
-
-### Relevant websites for researching chess variant rules
-- [Chess Variants on Wikipedia](https://en.wikipedia.org/wiki/List_of_chess_variants)
-- [Chess Variants Wiki](https://www.chessvariants.com/)
-- [Variant Chess on BoardGameGeek](https://boardgamegeek.com/boardgamefamily/4024/traditional-games-chess)
-- [PyChess Variants](https://www.pychess.org/variants)
-- [Ludii](https://ludii.games/library.php)
-- [Lichess.org Variants](https://lichess.org/variant)
-- [Greenchess](https://greenchess.net/variants.php)
-- [Chess Variants on Chess.com](https://www.chess.com/variants)
-
-### Development Best Practices
-* Make sure to only stage and commit changes that were changed as part of the task, do not simply add all changes.
-* Keep changes minimal and focused on the task at hand.
-* After applying changes make sure that all places related to the task have been identified.
-* Stay consistent with the existing code style and conventions.
+## PR checklist
+* Config parses; changed rules are documented; old keys remain compatible where practical.
+* Positions load and search; relevant perft, protocol, regression, and upstream checks pass.
+* Performance-sensitive changes have before/after notes; only intended files are staged.

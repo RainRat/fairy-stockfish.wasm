@@ -18,11 +18,12 @@
 
 #include <emscripten.h>
 #include <emscripten/bind.h>
-#include <vector>
-#include <string>
-#include <sstream>
-#include <iostream>
 #include <atomic>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "misc.h"
 #include "types.h"
@@ -43,8 +44,20 @@ using namespace emscripten;
 
 using namespace Stockfish;
 
+void initialize_stockfish();
+
 namespace {
 std::atomic<bool> logReadGamePgnMoves{false};
+std::once_flag stockfish_init_flag;
+std::mutex variant_state_mutex;
+
+void ensure_stockfish_initialized() {
+  std::call_once(stockfish_init_flag, []() { initialize_stockfish(); });
+}
+
+[[noreturn]] void throw_js_error(const std::string& message) {
+  val::global("Error").new_(message).throw_();
+}
 }
 
 void initialize_stockfish() {
@@ -69,17 +82,13 @@ const Variant* get_variant(const std::string& uciVariant) {
     return variants.get("chess");
   if (const Variant* v = variants.get(uciVariant))
     return v;
-  return variants.get("chess");
+  throw_js_error("No such variant '" + uciVariant + "'");
 }
 
 template <bool isUCI>
-inline bool is_move_none(Move move, const std::string& strMove, const Position& pos) {
-  if (move == MOVE_NONE) {
-    std::cerr << "The given ";
-    isUCI ? std::cerr << "uciMove" : std::cerr << "sanMove";
-    std::cerr << " '" << strMove << "' for position '" << pos.fen() << "' is invalid." << std::endl;
+inline bool is_move_none(Move move, const std::string&, const Position&) {
+  if (move == MOVE_NONE)
     return true;
-  }
   return false;
 }
 
@@ -94,7 +103,7 @@ private:
   bool is960;
 
 public:
-  static bool sfInitialized;
+  static std::atomic<bool> sfInitialized;
 
   Board():
     Board("chess", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" , false) {
@@ -202,7 +211,7 @@ public:
     resetStates();
     moveStack.clear();
     moveStackUCI.clear();
-    pos.set(v, fen, is960, &states->back(), Threads.main());
+    pos.set(v, fen, is960, &states->back(), Threads.empty() ? nullptr : Threads.main());
   }
 
   // note: const identifier for pos not possible due to SAN::move_to_san()
@@ -394,7 +403,10 @@ public:
   }
 
   bool is_capture(std::string uciMove) const {
-    return pos.capture(UCI::to_move(pos, uciMove));
+    Move move = UCI::to_move(pos, uciMove);
+    if (move == MOVE_NONE)
+      throw_js_error("Invalid move '" + uciMove + "'");
+    return pos.capture(move);
   }
 
   std::string move_stack() const {
@@ -473,13 +485,16 @@ public:
   }
 
   std::string variant() {
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     // Iterate through the variants map
     for (auto it = variants.begin(); it != variants.end(); ++it)
       if (it->second == v)
         return it->first;
-
-    std::cerr << "Current variant is not registered." << std::endl;
     return "unknown";
+  }
+
+  bool potions_enabled() const {
+    return v->potions;
   }
 
 private:
@@ -494,21 +509,20 @@ private:
   }
 
   void init(std::string uciVariant, std::string fen, bool is960) {
-    if (!Board::sfInitialized) {
-      initialize_stockfish();
-      Board::sfInitialized = true;
-    }
+    ensure_stockfish_initialized();
+    Board::sfInitialized.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     v = get_variant(uciVariant);
     UCI::init_variant(v);
     this->resetStates();
     if (fen == "")
       fen = v->startFen;
-    this->pos.set(this->v, fen, is960, &this->states->back(), Threads.main());
+    this->pos.set(this->v, fen, is960, &this->states->back(), Threads.empty() ? nullptr : Threads.main());
     this->is960 = is960;
   }
 };
 
-bool Board::sfInitialized = false;
+std::atomic<bool> Board::sfInitialized{false};
 
 namespace ffish {
   // returns the version of the Fairy-Stockfish binary
@@ -518,15 +532,18 @@ namespace ffish {
 
   template <typename T>
   void set_option(std::string name, T value) {
+    ensure_stockfish_initialized();
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
+    if (!Options.count(name))
+      throw_js_error("No such option '" + name + "'");
     Options[name] = value;
-    Board::sfInitialized = false;
+    Board::sfInitialized.store(false, std::memory_order_relaxed);
   }
 
   std::string available_variants() {
-    if (!Board::sfInitialized) {
-      initialize_stockfish();
-      Board::sfInitialized = true;
-    }
+    ensure_stockfish_initialized();
+    Board::sfInitialized.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     std::string availableVariants;
     for (std::string variant : variants.get_keys()) {
       availableVariants += variant;
@@ -538,29 +555,37 @@ namespace ffish {
 
   void load_variant_config(std::string variantInitContent) {
     std::stringstream ss(variantInitContent);
-    if (!Board::sfInitialized)
-      initialize_stockfish();
+    ensure_stockfish_initialized();
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     variants.parse_istream<false>(ss);
     Options["UCI_Variant"].set_combo(variants.get_keys());
-    Board::sfInitialized = true;
+    Board::sfInitialized.store(true, std::memory_order_relaxed);
   }
 
   bool captures_to_hand(std::string uciVariant) {
+    ensure_stockfish_initialized();
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     const Variant* v = get_variant(uciVariant);
     return v->captureType != MOVE_OUT;
   }
 
   std::string starting_fen(std::string uciVariant) {
+    ensure_stockfish_initialized();
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     const Variant* v = get_variant(uciVariant);
     return v->startFen;
   }
 
   int validate_fen(std::string fen, std::string uciVariant, bool chess960) {
+    ensure_stockfish_initialized();
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     const Variant* v = get_variant(uciVariant);
     return FEN::validate_fen(fen, v, chess960);
   }
 
   int validate_position(std::string fen, std::string uciVariant, std::string uciMoves, bool chess960) {
+    ensure_stockfish_initialized();
+    std::lock_guard<std::mutex> lock(variant_state_mutex);
     const Variant* v = get_variant(uciVariant);
     std::stringstream ss(uciMoves);
     std::string token;
@@ -619,10 +644,8 @@ public:
 
 bool skip_comment(const std::string& pgn, size_t& curIdx, size_t& lineEnd) {
   curIdx = pgn.find('}', curIdx);
-  if (curIdx == std::string::npos) {
-    std::cerr << "Missing '}' for move comment while reading pgn." << std::endl;
+  if (curIdx == std::string::npos)
     return false;
-  }
   if (curIdx > lineEnd)
   {
     lineEnd = pgn.find('\n', curIdx);
@@ -846,7 +869,8 @@ EMSCRIPTEN_BINDINGS(ffish_js) {
     .function("pocket", &Board::pocket)
     .function("toString", &Board::to_string)
     .function("toVerboseString", &Board::to_verbose_string)
-    .function("variant", &Board::variant);
+    .function("variant", &Board::variant)
+    .function("potionsEnabled", &Board::potions_enabled);
   class_<Game>("Game")
     .function("headerKeys", &Game::header_keys)
     .function("headers", &Game::headers)

@@ -1,8 +1,0 @@
-{
-  "scripts": {
-    "build-ffish-compat": "node tools/build_ffish_compat.mjs"
-  },
-  "dependencies": {
-    "esbuild": "^0.28.0"
-  }
-}

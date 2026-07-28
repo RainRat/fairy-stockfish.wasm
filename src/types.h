@@ -435,6 +435,8 @@ constexpr size_t PIECE_TYPE_COUNT = 26;
 //For example, piece A is related to boardlist[0], piece B is related to boardlist[1], etc.
 struct PieceTypeBitboardGroup
 {
+    static_assert(PIECE_TYPE_COUNT <= 32, "PieceTypeBitboardGroup presence mask is too small");
+
     PieceTypeBitboardGroup() = default;
     PieceTypeBitboardGroup(Bitboard b) : fallback(b) {}
     PieceTypeBitboardGroup(const PieceTypeBitboardGroup& other) = default;
@@ -456,13 +458,13 @@ struct PieceTypeBitboardGroup
     {
         if (ptc == '*') return fallback;
         if (ptc < 'A' || ptc > 'Z') return Bitboard(0);
-        return isSet[ptc - 'A'] ? boardlist[ptc - 'A'] : fallback;
+        return (setMask & (uint32_t(1) << (ptc - 'A'))) ? boardlist[ptc - 'A'] : fallback;
     }
 
     Bitboard explicitBoardOfPiece(const char ptc) const
     {
         if (ptc < 'A' || ptc > 'Z') return Bitboard(0);
-        return isSet[ptc - 'A'] ? boardlist[ptc - 'A'] : Bitboard(0);
+        return (setMask & (uint32_t(1) << (ptc - 'A'))) ? boardlist[ptc - 'A'] : Bitboard(0);
     }
 
     // Set the bitboard of a piece type.
@@ -473,28 +475,35 @@ struct PieceTypeBitboardGroup
         if (ptc == '*') { fallback = board; return; }
         if (ptc < 'A' || ptc > 'Z') return;
         boardlist[ptc - 'A'] = board;
-        isSet[ptc - 'A'] = true;
+        setMask |= uint32_t(1) << (ptc - 'A');
     }
 
     PieceTypeBitboardGroup& operator|=(Bitboard b) {
         fallback |= b;
-        for (size_t i = 0; i < PIECE_TYPE_COUNT; ++i)
-            if (isSet[i]) boardlist[i] |= b;
+        uint32_t mask = setMask;
+        while (mask)
+        {
+#if defined(__GNUC__) || defined(__clang__)
+            const int i = __builtin_ctz(mask);
+#else
+            int i = 0;
+            while (!(mask & (uint32_t(1) << i))) ++i;
+#endif
+            boardlist[i] |= b;
+            mask &= mask - 1;
+        }
         return *this;
     }
 
     explicit operator bool() const { return fallback || anySet(); }
     operator Bitboard() const { return fallback; }
 
-    bool anySet() const {
-        for (size_t i = 0; i < PIECE_TYPE_COUNT; ++i) if (isSet[i]) return true;
-        return false;
-    }
+    bool anySet() const { return setMask != 0; }
 
     Bitboard fallback = 0;
 private:
     Bitboard boardlist[PIECE_TYPE_COUNT] = {0};
-    bool isSet[PIECE_TYPE_COUNT] = {false};
+    uint32_t setMask = 0;
 };
 
 //When defined, move list will be stored in heap. Delete this if you want to use stack to store move list. Using stack can cause overflow (Segmentation Fault) when the search is too deep.
@@ -515,7 +524,11 @@ constexpr int MAX_PLY = 60;
 #endif
 /// endif USE_HEAP_INSTEAD_OF_STACK_FOR_MOVE_LIST
 #else
+#if defined(VERY_LARGE_BOARDS)
+constexpr int MAX_MOVES = 16384;
+#else
 constexpr int MAX_MOVES = 4096;
+#endif
 constexpr int MAX_PLY = 246;
 #endif
 /// endif ALLVARS
@@ -557,11 +570,16 @@ enum MoveType : int {
   PULL               = 10 << (2 * SQUARE_BITS),
   SWAP               = 11 << (2 * SQUARE_BITS),
   PROMOTION_POTION   = 12 << (2 * SQUARE_BITS),
+  STACK              = 13 << (2 * SQUARE_BITS),
+  UNSTACK            = 14 << (2 * SQUARE_BITS),
+  LASER_FIRE         = 15 << (2 * SQUARE_BITS),
 };
 
 enum MoveModality {MODALITY_QUIET, MODALITY_CAPTURE, MOVE_MODALITY_NB};
 
 constexpr int MOVE_TYPE_BITS = 4;
+static_assert((LASER_FIRE >> (2 * SQUARE_BITS)) < (1 << MOVE_TYPE_BITS),
+              "MoveType exceeds its encoded field");
 
 enum Color {
   WHITE, BLACK, COLOR_NB = 2
@@ -1174,7 +1192,8 @@ constexpr Square to_sq(Move m) {
 }
 
 constexpr Square from_sq(Move m) {
-  return type_of(m) == DROP ? SQ_NONE : Square((m >> SQUARE_BITS) & SQUARE_BIT_MASK);
+  Square raw_from = Square((m >> SQUARE_BITS) & SQUARE_BIT_MASK);
+  return type_of(m) == DROP ? SQ_NONE : raw_from;
 }
 
 inline int from_to(Move m) {
@@ -1221,6 +1240,15 @@ inline Square gating_square(Move m) {
   return SQ_NONE;
 }
 
+inline Square rotation_square(Move m) {
+  return gating_square(m);
+}
+
+inline int rotation_value(Move m) {
+  assert(gating_type(m) >= PieceType(1) && gating_type(m) <= PieceType(4));
+  return int(gating_type(m)) - 1;
+}
+
 inline Square pull_square(Move m) {
   if (type_of(m) != PULL)
       return SQ_NONE;
@@ -1234,10 +1262,17 @@ inline Square swap_square(Move m) {
   return type_of(m) == SWAP ? to_sq(m) : SQ_NONE;
 }
 
+inline bool is_stack_move(Move m) { return type_of(m) == STACK; }
+inline bool is_unstack_move(Move m) { return type_of(m) == UNSTACK; }
+inline bool is_laser_fire(Move m) { return type_of(m) == LASER_FIRE; }
+
 inline bool is_gating(Move m) {
+  if ((static_cast<uint64_t>(m) >> (2 * SQUARE_BITS + MOVE_TYPE_BITS)) == 0)
+      return false;
+
   const MoveType mt = type_of(m);
   constexpr uint64_t SquareFieldMask = (uint64_t(SQUARE_BIT_MASK) << 1) | 1;
-  if (mt == SPECIAL)
+  if (mt == SPECIAL || mt == LASER_FIRE)
       return ((m >> (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS)) & SquareFieldMask) != 0;
   if (mt == NORMAL || mt == CASTLING)
       return gating_type(m) != NO_PIECE_TYPE
@@ -1247,7 +1282,8 @@ inline bool is_gating(Move m) {
 }
 
 inline bool is_drop_move(Move m) {
-  return type_of(m) == DROP || type_of(m) == DROP2 || type_of(m) == INSERT;
+  MoveType mt = type_of(m);
+  return mt == DROP || mt == DROP2 || mt == INSERT;
 }
 
 inline bool is_insert_move(Move m) {
@@ -1335,6 +1371,13 @@ constexpr Move make_gating(Square from, Square to, PieceType pt, Square gate) {
             + static_cast<uint64_t>(to));
 }
 
+template<MoveType T>
+constexpr Move make_rotation(Square from, Square to, int orientation, Square rotate) {
+  assert(T != PROMOTION && T != PIECE_PROMOTION);
+  assert(orientation >= 0 && orientation < 4);
+  return make_gating<T>(from, to, PieceType(orientation + 1), rotate);
+}
+
 constexpr Move make_pull(Square from, Square to, Square pullFrom) {
   return Move((static_cast<uint64_t>(pullFrom + 1) << (2 * SQUARE_BITS + MOVE_TYPE_BITS + PIECE_TYPE_BITS))
             + static_cast<uint64_t>(PULL)
@@ -1372,6 +1415,8 @@ inline bool is_custom(PieceType pt) {
 
 inline bool is_ok(Move m) {
   return from_sq(m) != to_sq(m)
+      || is_gating(m)
+      || is_laser_fire(m)
       || type_of(m) == PROMOTION
       || type_of(m) == SPECIAL
       || type_of(m) == CASTLING

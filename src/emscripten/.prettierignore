@@ -1,5 +1,0 @@
-node_modules
-package-lock.json
-public/stockfish.js
-public/stockfish.wasm
-public/stockfish.worker.js
