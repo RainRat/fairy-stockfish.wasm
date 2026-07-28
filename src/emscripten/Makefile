@@ -18,10 +18,10 @@ EM_LDFLAGS += \
 	-s MODULARIZE=1 -s EXPORT_NAME="Stockfish" -s ENVIRONMENT=web,worker,node \
 	-s STRICT=1 \
 	-s ASYNCIFY=1 -s 'ASYNCIFY_IMPORTS=["emscripten_utils_getline_impl"]' \
-	-s USE_PTHREADS=1 \
+	-pthread \
 	-s PROXY_TO_PTHREAD=1 \
 	-s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=$$((1 << 27)) -s MAXIMUM_MEMORY=$$((1 << 31)) \
-	-s FILESYSTEM=1 -s EXTRA_EXPORTED_RUNTIME_METHODS=["FS"] \
+	-s FILESYSTEM=1 -s EXPORTED_RUNTIME_METHODS=["FS"] \
 	-s ALLOW_UNIMPLEMENTED_SYSCALLS
 
 ifeq ($(minify_js),yes)
@@ -48,11 +48,11 @@ else
 endif
 
 EM_COMMIT = $(shell git rev-parse --short HEAD)
-EM_UPSTREAM = $(shell git rev-parse --short $$(git merge-base HEAD upstream/master))
+EM_UPSTREAM = $(shell git rev-parse --short $$(git merge-base HEAD upstream/master 2>/dev/null) 2>/dev/null || echo unknown)
 EM_EMSCRIPTEN = $(shell emsdk list | grep INSTALLED | head -n 1 | awk '{ print $$1 }')
 
 EXTRACXXFLAGS += \
-	-DUSE_POPCNT $(EM_CXXFLAGS) \
+	-DUSE_POPCNT -pthread $(EM_CXXFLAGS) \
 	-DEM_COMMIT=$(EM_COMMIT) \
 	-DEM_UPSTREAM=$(EM_UPSTREAM) \
 	-DEM_EMSCRIPTEN=$(EM_EMSCRIPTEN)
@@ -72,7 +72,11 @@ endif
 
 emscripten_copy_files:
 	cp -f ../AUTHORS ../Copying.txt stockfish.js stockfish.wasm emscripten/public
-	cat stockfish.worker.js emscripten/worker-postamble.js > emscripten/public/stockfish.worker.js
+	if test -f stockfish.worker.js; then \
+		cat stockfish.worker.js emscripten/worker-postamble.js > emscripten/public/stockfish.worker.js; \
+	else \
+		cp -f emscripten/worker-postamble.js emscripten/public/stockfish.worker.js; \
+	fi
 
 emscripten_build: build emscripten_copy_files
 
